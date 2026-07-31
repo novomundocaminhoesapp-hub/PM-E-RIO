@@ -42,32 +42,45 @@ from flask import Flask, redirect, render_template_string, request, session, url
 from flask import send_from_directory
 import os
 
-@app.route('/logo.png')
-def serve_logo():
-    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
-
-@app.route('manifest.json')
-def serve_manifest():
-    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'manifest.json')
-
-app = Flask(__name__)
-app.secret_key = "chave_secreta_pm_rio"
-
-
-
+Python
+1
 from flask import Flask, send_from_directory
+2
 import os
-
-app = Flask(__name__)  # <--- ESSA LINHA PRECISA VIR ANTES DE QUALQUER '@app.route'
-
+3
+ 
+4
+app = Flask(__name__)
+5
+app.secret_key = "chave_secreta_pm_rio"
+6
+ 
+7
 @app.route('/logo.png')
+8
 def serve_logo():
-    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
-
+9
+return send_from_directory(
+10
+os.path.dirname(os.path.abspath(__file__)),
+11
+'logo.png'
+12
+)
+13
+ 
+14
 @app.route('/manifest.json')
+15
 def serve_manifest():
-    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'manifest.json')
-# ----------------------------------------
+16
+return send_from_directory(
+17
+os.path.dirname(os.path.abspath(__file__)),
+18
+'manifest.json'
+19
+)
 
 MESES_PT = {
     1: "janeiro",

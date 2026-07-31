@@ -60,11 +60,11 @@ import os
 
 app = Flask(__name__)  # <--- ESSA LINHA PRECISA VIR ANTES DE QUALQUER '@app.route'
 
-@app.route('/static/logo.png')
+@app.route('/logo.png')
 def serve_logo():
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
 
-@app.route('/static/manifest.json')
+@app.route('/manifest.json')
 def serve_manifest():
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'manifest.json')
 # ----------------------------------------

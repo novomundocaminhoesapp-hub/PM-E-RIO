@@ -39,6 +39,17 @@ import gspread
 from google.oauth2.service_account import Credentials
 from flask import Flask, redirect, render_template_string, request, session, url_for
 
+from flask import send_from_directory
+import os
+
+@app.route('/static/logo.png')
+def serve_logo():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+
+@app.route('/static/manifest.json')
+def serve_manifest():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'manifest.json')
+
 app = Flask(__name__)
 app.secret_key = "chave_secreta_pm_rio"
 

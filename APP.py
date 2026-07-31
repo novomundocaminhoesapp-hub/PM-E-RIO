@@ -53,6 +53,21 @@ def serve_manifest():
 app = Flask(__name__)
 app.secret_key = "chave_secreta_pm_rio"
 
+from flask import Flask, send_from_directory
+import os
+
+app = Flask(__name__)  # O 'app' nasce aqui
+
+# --- Cole as rotas logo abaixo daqui ---
+@app.route('/static/logo.png')
+def serve_logo():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'logo.png')
+
+@app.route('/static/manifest.json')
+def serve_manifest():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'manifest.json')
+# ----------------------------------------
+
 MESES_PT = {
     1: "janeiro",
     2: "fevereiro",

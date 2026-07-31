@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Sistema PM e RIO - Novo Mundo</title>
+    
+    <!-- Linha que conecta o seu arquivo manifest.json -->
+    <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+    
+    <!-- Cor da barra do navegador no celular -->
+    <meta name="theme-color" content="#1a252f">
+</head>
+<body>
+    <div style="background-color: #1a252f; padding: 20px; text-align: center;">
+        <!-- Tag da Logo puxando da pasta static -->
+       <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo Novo Mundo" style="max-width: 150px; height: auto;">
+    </div>
+
+    <h1>Bem-vindo ao Sistema PM e RIO</h1>
+    <!-- O restante do conteúdo e dos formulários da sua aplicação entram aqui -->
+</body>
+</html>

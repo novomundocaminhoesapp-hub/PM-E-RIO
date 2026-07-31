@@ -573,7 +573,7 @@ TEMPLATE_HTML = """
     {% if not session.get('logado') %}
         <div class="card-login">
             <div class="logo-container">
-                <img src="{{ url_for('static', filename='NM branca.png') }}" alt="Logo Novo Mundo" class="logo">
+                <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo Novo Mundo" class="logo">
             </div>
             <h2>Acesso Restrito</h2>
             {% if erro %}
@@ -596,7 +596,7 @@ TEMPLATE_HTML = """
             <div class="sidebar">
                 <div>
                     <div class="sidebar-header">
-                        <img src="{{ url_for('static', filename='NM branca.png') }}" alt="Logo Novo Mundo" class="logo-sidebar">
+                        <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo Novo Mundo" class="logo-sidebar">
                         <div class="user-mini-info">
                             <b>{{ session.get('nome') }}</b><br>
                             Perfil: {{ session.get('perfil') }}

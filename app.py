@@ -471,12 +471,12 @@ TEMPLATE_HTML = """
             <div class="content-area">
                 {% if conteudo_modulo %}
                     {{ conteudo_modulo | safe }}
-                {% else %}
-                    <div style="display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100%; text-align: center; color: #718096; padding: 20px;">
-                        <h2 style="color: #1a202c; margin-bottom: 8px;">Painel de Inteligência Comercial</h2>
-                        <p style="font-size: 14px; max-width: 400px; line-height: 1.5;">Toque nas abas do menu superior para alternar rapidamente entre os módulos.</p>
-                    </div>
-                {% endif %}
+               {% else %}
+            <div style="display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100%; text-align: center; padding: 20px;">
+                <img src="/static/logo.png" alt="Novo Mundo" style="max-width: 220px; width: 100%; height: auto; margin-bottom: 15px;">
+                <p style="font-size: 15px; font-weight: 500; color: #4a5568; margin: 0;">Escolha as opções do menu</p>
+            </div>
+        {% endif %}
 
                 <div class="mobile-logout-container">
                     <form action="/logout" method="POST" style="margin: 0;">

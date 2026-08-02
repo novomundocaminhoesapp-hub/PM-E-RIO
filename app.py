@@ -106,7 +106,13 @@ TEMPLATE_HTML = """
     <meta name="theme-color" content="#1a252f">
 
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+     * { 
+    box-sizing: border-box; 
+    margin: 0; 
+    padding: 0; 
+    -webkit-tap-highlight-color: transparent; 
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; 
+}
      /* --- AJUSTE DO MENU PARA CELULAR (MOBILE) --- */
         @media (max-width: 768px) {
             /* Permite rolar os botões na horizontal no celular */

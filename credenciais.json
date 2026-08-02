@@ -1,13 +1,1 @@
-{
-  "type": "service_account",
-  "project_id": "pm-e-rio",
-  "private_key_id": "330c61704bf385f27a5b2a02f750a59a8990592e",
-  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDMDzgvDH6j+TSO\nA//5B5D8GiM5SbKO/mhvEjaqS3NyQSDxp5GEk4VHQIRimc9kwEiJpzfultia95D9\nhrz6B2OyAX+is517UVWV3akooUGFICPHqM+nUGT1W89kUUgzoHyvRI43Q6kCxE/T\nmaYnFuAwi0aKhvYUjzzEBKYLv/EWspRHRwwPaG6k0gG7mmRDzJw/R7pIPpkVqSVN\nszsWwipeS2c5e8PW0LR5LyX/i42hs4IGFmAK4d0aUEd2GSgNulFje+eTZxqpJosK\nc1F4oaTy6G/3x0Y96/qTfvlbF/Z0wZfS/ks3Np9a3FA/xUJlzIK9ZCASNHlTUK7c\nKZ1xkaPVAgMBAAECggEABY/kCc5D1NLdKc82M5kov8jNM6//t+uVBUAGsVLpd7bX\ncv0zCqoEH9c3mvUGOBp3CUxMSnEEpvBMD+KgdVbTUuQ9EL5OGT3A9DSMrZP8DfWi\n3AiZkZeWPn5zgCooamkIgc6zBKxP567zqqwdVG/u1ovmG8g5d85+sZLoQ4ygDoY6\nBOvj6T7BtR1xBWw2l8kGOsslE6GnSRIVjWvHxL0KDxQNhIL5RPGuJJd2ZNQVpFEa\nZJlfQqBfLcZA1EvdTy6yChqOVDzBP3CzZKc9kBIWHXOoM1E+3sNqxHbJntyawfGr\niCiliZj1AED7OTUmb9eQ14aGsbfpSPQ+nAD/UxovgQKBgQDtxab28g4MRGg0Cz8Y\nLxD6kwM+xvFRAKcsIxPEu3QPMQUcwTY9MMHiCQApT5dfld0SZHelfMfCryE1G5cm\nfCW6swxGgsMupfY+4giL8MOxmmOYw0JCTccgJR/06aORlvkSTzhMOl+2NQHF1iqA\n/WMwCPZ9SoEOBO8OYdQb6U4QgQKBgQDbs/JoqKHsevnLjwhIgXHVGpymgE0zSNNP\nACuKi9QSYApEOgT3z1+6nfv8R7px5yE4b4Cybf8EXS2RAL9FGKfWzHB0pbhESp8I\n41gwdYmzhlpmPQS0mdaEIhgf5rpcoimslXQjdBZybdyfNU7ERnCMUsvjKZSBxlr7\niV+RwUGpVQKBgCFjlw2ocgaQ+J0OUz7fJSA60sLXBv4b/F27U0RWGncjqBcgnrA7\nD47hOq+SaKxYjCHQD+kiO58AHsapaDFUT6wHBptEM4pybcDo1tBn7+MZzhCeoshS\nybqe2/z1bi28qJ9ElqBFtjkM+oHAkFlqu6n8KDjx5GuGj9dSL4n32imBAoGAVIXV\nI5iEuxLQmRSM7kAGiCK104SWrr08ti7tkV6cFvml2Xusv52jSYtQD02VGA8Ag9K5\n42tX6djjF97+ttl2cLe0J9w9mOBQcL3uBq6hbFSq4Jxm/AgXNDxdpaBBYDPu7nuM\n87rMi/diIkoC5JXo5MNRtzIe9RJXnF/MSanc1gUCgYAgeGFggckHVER4njNmAVvx\n/Eic4YvovGTgc/5GYWzHZbpavZBJuKXkIEEYguPpSUnIeVI3VnCMoo/BWvcI2O1f\neKCTSNUGwC9UHQBnLd2BDHxL7iL7Gy2lnKccXmGTvNDR4iXY6fxfRDfbZw9wlDSK\nKa+6NvridTA8QY1+ImWQow==\n-----END PRIVATE KEY-----\n",
-  "client_email": "robopmrio@pm-e-rio.iam.gserviceaccount.com",
-  "client_id": "117948204973060234099",
-  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-  "token_uri": "https://oauth2.googleapis.com/token",
-  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/robopmrio%40pm-e-rio.iam.gserviceaccount.com",
-  "universe_domain": "googleapis.com"
-}
+{}

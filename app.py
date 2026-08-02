@@ -107,36 +107,36 @@ TEMPLATE_HTML = """
 
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-      /* --- FORÇAR MENU NO RODAPÉ EM DISPOSITIVOS MÓVEIS --- */
+     /* --- AJUSTE DO MENU PARA CELULAR (MOBILE) --- */
         @media (max-width: 768px) {
-            .user-info, .profile-section, .sidebar-header, .btn-logout {
-                display: none !important;
-            }
-
-            .app-container, body, html {
-                flex-direction: column !important;
-                overflow-x: hidden !important;
-            }
-
-            div[class*="sidebar"], nav, .menu-container, .nav-tabs {
-                position: fixed !important;
-                bottom: 0 !important;
-                top: auto !important;
-                left: 0 !important;
-                right: 0 !important;
-                width: 100% !important;
-                height: 60px !important;
-                min-height: 60px !important;
-                z-index: 99999 !important;
-                background-color: #1a252f !important;
+            /* Permite rolar os botões na horizontal no celular */
+            .nav, .nav-tabs, .navbar-nav, .menu-container, div[class*="sidebar"] {
                 display: flex !important;
                 flex-direction: row !important;
-                justify-content: space-around !important;
-                align-items: center !important;
-                padding: 0 !important;
-                margin: 0 !important;
-                box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.3) !important;
-                border: none !important;
+                overflow-x: auto !important;
+                white-space: nowrap !important;
+                -webkit-overflow-scrolling: touch !important;
+                width: 100% !important;
+                padding: 8px 5px !important;
+                background-color: #1a252f !important;
+            }
+
+            /* Garante que os botões fiquem alinhados e visíveis */
+            .nav-link, .nav-item, .btn-menu, div[class*="sidebar"] a {
+                display: inline-block !important;
+                flex: 0 0 auto !important;
+                font-size: 13px !important;
+                padding: 8px 14px !important;
+                margin: 0 3px !important;
+                color: #ffffff !important;
+                text-decoration: none !important;
+            }
+
+            /* Esconde apenas a barra cinza fixa no rodapé caso tenha sobrado */
+            div[class*="sidebar"] .sidebar-header, .user-info {
+                display: none !important;
+            }
+        }
             }
 
             div[class*="sidebar"] a, div[class*="sidebar"] button, nav a, .nav-link, .btn-menu {

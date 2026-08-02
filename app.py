@@ -17,6 +17,15 @@ MESES_PT = {
     9: "setembro", 10: "outubro", 11: "novembro", 12: "dezembro"
 }
 
+# Mapeamento para garantir que o nome da Topbar corresponda exatamente ao Menu
+NOMES_MODULOS = {
+    "rio": "Telemetria RIO",
+    "pm": "Plano de Manutenção",
+    "valores": "Tabela de Valores",
+    "informes": "Informes e Circulares",
+    "argumentos": "Argumentos de Venda"
+}
+
 escopos = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -103,80 +112,28 @@ TEMPLATE_HTML = """
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="PM e RIO">
     <meta name="mobile-web-app-capable" content="yes">
-    <meta name="theme-color" content="#1a252f">
+    <meta name="theme-color" content="#002244">
 
     <style>
-     * { 
-    box-sizing: border-box; 
-    margin: 0; 
-    padding: 0; 
-    -webkit-tap-highlight-color: transparent; 
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; 
-}
-     /* --- AJUSTE DO MENU PARA CELULAR (MOBILE) --- */
-        @media (max-width: 768px) {
-            /* Permite rolar os botões na horizontal no celular */
-            .nav, .nav-tabs, .navbar-nav, .menu-container, div[class*="sidebar"] {
-                display: flex !important;
-                flex-direction: row !important;
-                overflow-x: auto !important;
-                white-space: nowrap !important;
-                -webkit-overflow-scrolling: touch !important;
-                width: 100% !important;
-                padding: 8px 5px !important;
-                background-color: #1a252f !important;
-            }
-
-            /* Garante que os botões fiquem alinhados e visíveis */
-            .nav-link, .nav-item, .btn-menu, div[class*="sidebar"] a {
-                display: inline-block !important;
-                flex: 0 0 auto !important;
-                font-size: 13px !important;
-                padding: 8px 14px !important;
-                margin: 0 3px !important;
-                color: #ffffff !important;
-                text-decoration: none !important;
-            }
-
-            /* Esconde apenas a barra cinza fixa no rodapé caso tenha sobrado */
-            div[class*="sidebar"] .sidebar-header, .user-info {
-                display: none !important;
-            }
-        }
-            }
-
-            div[class*="sidebar"] a, div[class*="sidebar"] button, nav a, .nav-link, .btn-menu {
-                font-size: 11px !important;
-                padding: 8px 2px !important;
-                margin: 0 !important;
-                text-align: center !important;
-                color: #ffffff !important;
-                flex: 1 !important;
-                display: flex !important;
-                flex-direction: column !important;
-                align-items: center !important;
-                justify-content: center !important;
-                white-space: nowrap !important;
-                border-radius: 0 !important;
-            }
-
-            .main-content, .content, body {
-                padding-bottom: 80px !important;
-                margin-bottom: 0 !important;
-                width: 100% !important;
-            }
-        }
-        }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; 
-            background: #f0f2f5;
-            display: flex; 
-            justify-content: center; 
-            align-items: center; 
-            min-height: 100vh;
-            padding: 0;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
         
+        body { 
+            background: #f4f6f9;
+            color: #333;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* CARD LOGIN */
+        .login-wrapper {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 15px;
+            background: #f4f6f9;
+        }
         .card-login { 
             background: #ffffff; 
             padding: 30px 20px; 
@@ -185,83 +142,227 @@ TEMPLATE_HTML = """
             width: 100%; 
             max-width: 380px; 
             text-align: center; 
-            border-top: 4px solid #1e3c72;
-            margin: 15px;
+            border-top: 4px solid #002244;
         }
+        .logo-container { margin-bottom: 20px; display: flex; justify-content: center; }
+        .logo { max-width: 220px; height: auto; }
+        .input-group { text-align: left; margin-bottom: 15px; }
+        label { display: block; font-weight: 600; font-size: 11px; color: #4a5568; margin-bottom: 5px; text-transform: uppercase; }
+        input { width: 100%; padding: 12px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 16px; background-color: #f7fafc; color: #2d3748; }
+        input:focus { border-color: #0066cc; background-color: #fff; outline: none; }
+        button.btn-login { background-color: #002244; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 15px; font-weight: 600; }
+        .error { background-color: #fff5f5; color: #c53030; padding: 12px; border-radius: 6px; font-size: 13px; margin-bottom: 15px; border: 1px solid #feb2b2; line-height: 1.4; font-weight: 500; }
 
-        .app-container {
-            display: flex;
-            background: #ffffff;
-            width: 100%;
-            height: 100vh;
-            max-width: 100%;
-            border-radius: 0;
-            box-shadow: none;
-            overflow: hidden;
-            border: none;
-        }
-
-        .sidebar {
-            width: 100%;
-            background: #1a252f;
+        /* BARRA SUPERIOR (TOPBAR) */
+        .topbar {
+            height: 56px;
+            background-color: #002244;
             color: #ffffff;
             display: flex;
-            flex-direction: row;
             align-items: center;
             justify-content: space-between;
-            padding: 10px 15px;
-            flex-shrink: 0;
+            padding: 0 16px;
             position: fixed;
             top: 0;
             left: 0;
-            z-index: 1000;
-            height: 60px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            right: 0;
+            z-index: 100;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
         }
-        .sidebar-header { display: flex; align-items: center; gap: 10px; }
-        .logo-sidebar { max-width: 145px; height: auto; display: block; }
-        .user-mini-info { display: none; }
+        .topbar-left { display: flex; align-items: center; gap: 16px; }
+        .menu-hamburger { background: none; border: none; color: #fff; font-size: 24px; cursor: pointer; padding: 4px; display: flex; align-items: center; }
+        .topbar-title { font-size: 17px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        .topbar-right button { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; }
 
-        .menu-nav {
-            display: flex;
-            flex-direction: row;
-            gap: 6px;
-            overflow-x: auto;
-            white-space: nowrap;
-            -webkit-overflow-scrolling: touch;
-            scrollbar-width: none;
-        }
-        .menu-nav::-webkit-scrollbar { display: none; }
-
-        .menu-item {
-            display: inline-flex;
-            align-items: center;
-            padding: 8px 12px;
-            background: rgba(255, 255, 255, 0.08);
-            border-radius: 6px;
-            text-decoration: none;
-            color: #cbd5e0;
-            font-weight: 500;
-            font-size: 13px;
-        }
-        .menu-item.active { background: #0066cc; color: white; font-weight: 600; }
-        
-        .content-area {
-            flex-grow: 1;
-            padding: 20px 15px 15px 15px;
-            background: #ffffff;
-            overflow-y: auto;
-            margin-top: 60px;
+        /* OVERLAY DO DRAWER (MOBILE) */
+        .drawer-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
             width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 998;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s ease;
+        }
+        .drawer-overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        /* DRAWER LATERAL (MENU SLIDE / DESKTOP FIXO) */
+        .drawer {
+            position: fixed;
+            top: 0;
+            left: -310px;
+            width: 280px;
+            height: 100%;
+            background: #ffffff;
+            z-index: 999;
+            transition: all 0.3s ease;
+            overflow-y: auto;
             display: flex;
             flex-direction: column;
+            box-shadow: 3px 0 15px rgba(0,0,0,0.15);
+            border-right: 1px solid #e2e8f0;
+        }
+        .drawer.open {
+            left: 0;
         }
 
+        /* COMPORTAMENTO DESKTOP (TELA > 992px) */
+        @media (min-width: 992px) {
+            .menu-hamburger { display: none !important; }
+            .drawer-overlay { display: none !important; }
+            .drawer {
+                left: 0 !important;
+                box-shadow: none;
+                z-index: 90;
+            }
+            .topbar {
+                left: 280px;
+                width: calc(100% - 280px);
+            }
+            .main-content {
+                margin-left: 280px !important;
+                max-width: 1200px !important;
+            }
+        }
+
+        /* HEADER INTERNO DO MENU LATERAL */
+        .drawer-header {
+            background: #002244;
+            color: white;
+            padding: 22px 20px;
+            text-align: center;
+            border-bottom: 3px solid #0066cc;
+        }
+        .drawer-header img {
+            max-width: 160px;
+            height: auto;
+            margin-bottom: 4px;
+        }
+
+        /* PROFILE CARD DENTRO DO MENU */
+        .drawer-profile {
+            padding: 16px 20px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e2e8f0;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .avatar-box {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: #002244;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            font-weight: bold;
+            flex-shrink: 0;
+        }
+        .user-details h3 { font-size: 14px; color: #002244; font-weight: 700; }
+        .user-details p { font-size: 11px; color: #718096; }
+
+        /* ITENS NAVEGAÇÃO */
+        .drawer-menu {
+            list-style: none;
+            padding: 10px 0;
+            margin: 0;
+            flex-grow: 1;
+        }
+        .drawer-item a, .drawer-item button {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 14px 20px;
+            text-decoration: none;
+            color: #2d3748;
+            font-size: 14px;
+            font-weight: 600;
+            border: none;
+            background: none;
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .drawer-item a:hover, .drawer-item.active a {
+            background-color: #ebf8ff;
+            color: #0066cc;
+            border-left: 4px solid #0066cc;
+        }
+        .drawer-icon { font-size: 18px; width: 22px; text-align: center; color: #002244; }
+
+        /* CARROSSEL / ROLO DE SUBMÓDULOS SUPERIOR */
+        .submodulo-nav-container {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 8px 12px;
+            margin-bottom: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+        }
+        .submodulo-nav-label {
+            font-size: 10px;
+            font-weight: 700;
+            color: #718096;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+        .submodulo-nav-scroll {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+            -webkit-overflow-scrolling: touch;
+        }
+        .submodulo-nav-scroll::-webkit-scrollbar { height: 4px; }
+        .submodulo-nav-scroll::-webkit-scrollbar-thumb { background: #cbd5e0; border-radius: 4px; }
+
+        .submodulo-pill {
+            white-space: nowrap;
+            padding: 8px 14px;
+            background: #f7fafc;
+            border: 1px solid #cbd5e0;
+            border-radius: 20px;
+            text-decoration: none;
+            color: #2d3748;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+        .submodulo-pill:hover { background: #edf2f7; color: #002244; }
+        .submodulo-pill.active {
+            background: #002244;
+            color: #ffffff;
+            border-color: #002244;
+            box-shadow: 0 2px 4px rgba(0,34,68,0.25);
+        }
+
+        /* CONTEÚDO DA PÁGINA */
+        .main-content {
+            margin-top: 56px;
+            padding: 16px;
+            flex-grow: 1;
+            width: 100%;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        /* COMPONENTES DOS MÓDULOS */
         .submenus-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
         .submenu-btn {
             background: #ffffff;
             border: 1px solid #cbd5e0;
-            border-left: 4px solid #0066cc;
+            border-left: 4px solid #002244;
             padding: 14px 16px;
             border-radius: 8px;
             text-decoration: none;
@@ -278,19 +379,18 @@ TEMPLATE_HTML = """
         .submenu-btn::after { content: '›'; font-size: 18px; color: #a0aec0; }
 
         .produto-detalhe-card {
-            background: #f8fafc;
+            background: #ffffff;
             border: 1px solid #e2e8f0;
             border-radius: 10px;
-            padding: 16px;
-            margin-top: 5px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.02);
+            padding: 18px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.03);
         }
 
         .detalhe-linha { margin-bottom: 12px; border-bottom: 1px solid #edf2f7; padding-bottom: 10px; }
         .detalhe-label { font-size: 11px; font-weight: 700; color: #4a5568; text-transform: uppercase; margin-bottom: 3px; }
         .detalhe-valor { font-size: 14px; color: #1a202c; }
-        .detalhe-produto-nome { font-size: 16px; font-weight: 700; color: #1e3c72; }
-        .detalhe-preco { font-size: 16px; font-weight: 700; color: #2f855a; }
+        .detalhe-produto-nome { font-size: 17px; font-weight: 700; color: #002244; }
+        .detalhe-preco { font-size: 17px; font-weight: 700; color: #2f855a; }
 
         .acoes-produto { display: flex; gap: 8px; margin-top: 12px; }
         .btn-acao {
@@ -298,8 +398,8 @@ TEMPLATE_HTML = """
             text-align: center; text-decoration: none; display: inline-flex; justify-content: center;
             align-items: center; cursor: pointer; border: none; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
         }
-        .btn-video { background-color: #2b6cb0; color: #ffffff; }
-        .btn-video:hover { background-color: #2c5282; }
+        .btn-video { background-color: #002244; color: #ffffff; }
+        .btn-video:hover { background-color: #001529; }
         .btn-whatsapp { background-color: #2f855a; color: #ffffff; }
         .btn-whatsapp:hover { background-color: #276749; }
 
@@ -319,7 +419,7 @@ TEMPLATE_HTML = """
         .grid-planos { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
         .card-plano {
             background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px;
-            padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); border-left: 4px solid #0066cc;
+            padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); border-left: 4px solid #002244;
         }
         .card-plano.max { border-left-color: #d69e2e; }
         .card-plano.plus { border-left-color: #2f855a; }
@@ -331,19 +431,13 @@ TEMPLATE_HTML = """
         .plano-linha-tripla { display: flex; gap: 8px; margin-bottom: 8px; }
         .plano-col { flex: 1; background: #f7fafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #edf2f7; }
 
-        .btn-voltar {
-            display: inline-block; background: #e2e8f0; color: #4a5568; padding: 6px 12px;
-            border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; margin-bottom: 12px;
-        }
-        .btn-voltar:hover { background: #cbd5e0; }
-
         .acoes-ficha-tecnica { display: flex; gap: 8px; margin-top: 8px; }
         .btn-acao-ficha {
             flex: 1; padding: 10px; border-radius: 6px; font-size: 13px; font-weight: 600;
             text-align: center; text-decoration: none; display: inline-block; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
         }
-        .btn-abrir-pdf { background-color: #2b6cb0; color: #ffffff; }
-        .btn-abrir-pdf:hover { background-color: #2c5282; }
+        .btn-abrir-pdf { background-color: #002244; color: #ffffff; }
+        .btn-abrir-pdf:hover { background-color: #001529; }
         .btn-wpp-pdf { background-color: #2f855a; color: #ffffff; }
         .btn-wpp-pdf:hover { background-color: #276749; }
 
@@ -359,42 +453,27 @@ TEMPLATE_HTML = """
         }
         .modal-video-header {
             display: flex; justify-content: space-between; align-items: center;
-            background: #1a252f; color: #ffffff; padding: 12px 16px; font-size: 14px; font-weight: 600;
+            background: #002244; color: #ffffff; padding: 12px 16px; font-size: 14px; font-weight: 600;
         }
         .btn-fechar-modal { background: transparent; border: none; color: #ffffff; font-size: 24px; cursor: pointer; line-height: 1; padding: 0 4px; }
         .iframe-container { position: relative; width: 100%; padding-bottom: 56.25%; height: 0; background: #000; }
         .iframe-container iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 0; }
-
-        .logo-container { margin-bottom: 20px; display: flex; justify-content: center; }
-        .logo { max-width: 220px; height: auto; }
-        h2 { color: #1a202c; font-size: 17px; margin-bottom: 12px; font-weight: 600; }
-        .input-group { text-align: left; margin-bottom: 15px; }
-        label { display: block; font-weight: 600; font-size: 11px; color: #4a5568; margin-bottom: 5px; text-transform: uppercase; }
-        input { width: 100%; padding: 12px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 16px; background-color: #f7fafc; color: #2d3748; }
-        input:focus { border-color: #0066cc; background-color: #fff; outline: none; }
-        button { background-color: #0066cc; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 15px; font-weight: 600; }
-        .error { background-color: #fff5f5; color: #c53030; padding: 12px; border-radius: 6px; font-size: 13px; margin-bottom: 15px; border: 1px solid #feb2b2; line-height: 1.4; font-weight: 500; }
-        
-        .desktop-logout { display: none; }
-        .mobile-logout-container { display: block; margin-top: 30px; padding-top: 15px; border-top: 1px solid #edf2f7; }
-
-        @media (min-width: 768px) {
-            body { padding: 15px; align-items: center; }
-            .card-login { max-width: 400px; padding: 40px 30px; }
-            .app-container { max-width: 1200px; height: 90vh; border-radius: 12px; border: 1px solid #e1e4e8; }
-            .sidebar { position: relative; width: 260px; height: 100%; flex-direction: column; align-items: stretch; justify-content: space-between; padding: 24px 16px; top: auto; left: auto; }
-            .sidebar-header { flex-direction: column; align-items: center; text-align: center; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 16px; margin-bottom: 20px; }
-            .logo-sidebar { max-width: 170px; margin: 0 auto; }
-            .user-mini-info { display: block; font-size: 12px; color: #a0aec0; margin-top: 10px; }
-            .menu-nav { flex-direction: column; gap: 6px; overflow-x: visible; }
-            .menu-item { display: flex; padding: 12px 14px; font-size: 14px; }
-            .content-area { margin-top: 0; padding: 40px; }
-            .mobile-logout-container { display: none; }
-            .desktop-logout { display: block; background-color: #2d3748; color: #cbd5e0; width: 100%; padding: 10px; font-size: 13px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); cursor: pointer; }
-            .desktop-logout:hover { background-color: #e53e3e; color: #fff; }
-        }
     </style>
     <script>
+        function toggleDrawer() {
+            var drawer = document.getElementById('drawerMenu');
+            var overlay = document.getElementById('drawerOverlay');
+            drawer.classList.toggle('open');
+            overlay.classList.toggle('active');
+        }
+
+        function closeDrawer() {
+            var drawer = document.getElementById('drawerMenu');
+            var overlay = document.getElementById('drawerOverlay');
+            drawer.classList.remove('open');
+            overlay.classList.remove('active');
+        }
+
         function toggleCobertura() {
             var conteudo = document.getElementById('cobertura-conteudo');
             var seta = document.getElementById('cobertura-seta');
@@ -425,72 +504,93 @@ TEMPLATE_HTML = """
 <body>
 
     {% if not session.get('logado') %}
-        <div class="card-login">
-            <div class="logo-container">
-                <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo Novo Mundo" class="logo">
+        <div class="login-wrapper">
+            <div class="card-login">
+                <div class="logo-container">
+                    <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo Novo Mundo" class="logo">
+                </div>
+                
+                <h2 style="font-size: 18px; color: #002244; margin-bottom: 15px;">Acesso Restrito</h2>
+                {% if erro %}
+                    <div class="error">{{ erro }}</div>
+                {% endif %}
+                <form method="POST">
+                    <div class="input-group">
+                        <label>E-mail Corporativo</label>
+                        <input type="email" name="email" placeholder="seu.email@novomundo.com" required autocapitalize="none">
+                    </div>
+                    <div class="input-group">
+                        <label>Senha</label>
+                        <input type="password" name="senha" placeholder="••••••••" required>
+                    </div>
+                    <button type="submit" class="btn-login">Entrar no Sistema</button>
+                </form>
             </div>
-            
-            <h2>Acesso Restrito</h2>
-            {% if erro %}
-                <div class="error">{{ erro }}</div>
-            {% endif %}
-            <form method="POST">
-                <div class="input-group">
-                    <label>E-mail Corporativo</label>
-                    <input type="email" name="email" placeholder="seu.email@novomundo.com" required autocapitalize="none">
-                </div>
-                <div class="input-group">
-                    <label>Senha</label>
-                    <input type="password" name="senha" placeholder="••••••••" required>
-                </div>
-                <button type="submit">Entrar no Sistema</button>
-            </form>
         </div>
     {% else %}
-        <div class="app-container">
-            <div class="sidebar">
-                <div>
-                    <div class="sidebar-header">
-                        <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo Novo Mundo" class="logo-sidebar">
-                        <div class="user-mini-info">
-                            <b>{{ session.get('nome') }}</b><br>
-                            Perfil: {{ session.get('perfil') }}
-                        </div>
-                    </div>
+        <!-- BARRA SUPERIOR -->
+        <header class="topbar">
+            <div class="topbar-left">
+                <button class="menu-hamburger" onclick="toggleDrawer()">☰</button>
+                <div class="topbar-title">{{ modulo_titulo }}</div>
+            </div>
+            <div class="topbar-right">
+                <button onclick="window.location.reload();" title="Atualizar">↻</button>
+            </div>
+        </header>
 
-                    <div class="menu-nav">
-                        <a href="/modulo/rio" class="menu-item {% if modulo_ativo == 'rio' %}active{% endif %}">RIO</a>
-                        <a href="/modulo/pm" class="menu-item {% if modulo_ativo == 'pm' %}active{% endif %}">PM</a>
-                        <a href="/modulo/valores" class="menu-item {% if modulo_ativo == 'valores' %}active{% endif %}">VALORES</a>
-                        <a href="/modulo/informes" class="menu-item {% if modulo_ativo == 'informes' %}active{% endif %}">INFORMES</a>
-                        <a href="/modulo/argumentos" class="menu-item {% if modulo_ativo == 'argumentos' %}active{% endif %}">ARGUMENTOS</a>
-                    </div>
+        <!-- OVERLAY DE FECHAMENTO (MOBILE) -->
+        <div class="drawer-overlay" id="drawerOverlay" onclick="closeDrawer()"></div>
+
+        <!-- DRAWER / SIDEBAR MENU LATERAL -->
+        <aside class="drawer" id="drawerMenu">
+            <div class="drawer-header">
+                <img src="{{ url_for('static', filename='logo.png') }}" alt="Novo Mundo">
+            </div>
+
+            <div class="drawer-profile">
+                <div class="avatar-box">👤</div>
+                <div class="user-details">
+                    <h3>{{ session.get('nome', 'Usuário') }}</h3>
+                    <p>{{ session.get('perfil', 'Colaborador') }}</p>
                 </div>
+            </div>
 
-                <div>
-                    <form action="/logout" method="POST" style="margin: 0;">
-                        <button type="submit" class="desktop-logout">Encerrar Sessão</button>
+            <ul class="drawer-menu">
+                <li class="drawer-item {% if modulo_ativo == 'rio' %}active{% endif %}">
+                    <a href="/modulo/rio" onclick="closeDrawer()"><span class="drawer-icon">📡</span> Telemetria RIO</a>
+                </li>
+                <li class="drawer-item {% if modulo_ativo == 'pm' %}active{% endif %}">
+                    <a href="/modulo/pm" onclick="closeDrawer()"><span class="drawer-icon">🛠</span> Plano de Manutenção</a>
+                </li>
+                <li class="drawer-item {% if modulo_ativo == 'valores' %}active{% endif %}">
+                    <a href="/modulo/valores" onclick="closeDrawer()"><span class="drawer-icon">💲</span> Tabela de Valores</a>
+                </li>
+                <li class="drawer-item {% if modulo_ativo == 'informes' %}active{% endif %}">
+                    <a href="/modulo/informes" onclick="closeDrawer()"><span class="drawer-icon">📢</span> Informes e Circulares</a>
+                </li>
+                <li class="drawer-item {% if modulo_ativo == 'argumentos' %}active{% endif %}">
+                    <a href="/modulo/argumentos" onclick="closeDrawer()"><span class="drawer-icon">💡</span> Argumentos de Venda</a>
+                </li>
+                <li class="drawer-item" style="margin-top: 20px; border-top: 1px solid #edf2f7;">
+                    <form action="/logout" method="POST" style="margin: 0; width: 100%;">
+                        <button type="submit"><span class="drawer-icon">🚪</span> Sair da Conta</button>
                     </form>
-                </div>
-            </div>
+                </li>
+            </ul>
+        </aside>
 
-            <div class="content-area">
-                {% if conteudo_modulo %}
-                    {{ conteudo_modulo | safe }}
-               {% else %}
-            <div style="display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100%; text-align: center; padding: 20px;">
-                <img src="/static/logo.png" alt="Novo Mundo" style="max-width: 220px; width: 100%; height: auto; margin-bottom: 15px;">
-                <p style="font-size: 15px; font-weight: 500; color: #4a5568; margin: 0;">Escolha as opções do menu</p>
-            </div>
-        {% endif %}
-
-                <div class="mobile-logout-container">
-                    <form action="/logout" method="POST" style="margin: 0;">
-                        <button type="submit" style="background-color: #e53e3e; color: white; padding: 12px; font-size: 14px;">Sair do Sistema</button>
-                    </form>
+        <!-- CONTEÚDO PRINCIPAL DA TELA -->
+        <main class="main-content">
+            {% if conteudo_modulo %}
+                {{ conteudo_modulo | safe }}
+            {% else %}
+                <div style="display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 60vh; text-align: center; padding: 20px;">
+                    <img src="{{ url_for('static', filename='logo.png') }}" alt="Novo Mundo" style="max-width: 200px; width: 100%; height: auto; margin-bottom: 15px;">
+                    <p style="font-size: 15px; font-weight: 500; color: #4a5568; margin: 0;">Selecione um dos módulos no menu para começar.</p>
                 </div>
-            </div>
-        </div>
+            {% endif %}
+        </main>
 
         <!-- MODAL DE VÍDEO -->
         <div id="modalVideo" class="modal-video-overlay" onclick="fecharVideoModal()">
@@ -560,6 +660,7 @@ def acessar_modulo(nome_modulo):
         return redirect(url_for("login"))
 
     conteudo = ""
+    modulo_titulo = NOMES_MODULOS.get(nome_modulo, "Início")
 
     if nome_modulo == "rio":
         produto_selecionado = request.args.get("produto")
@@ -568,6 +669,20 @@ def acessar_modulo(nome_modulo):
             planilha = conectar_google_sheets()
             aba_rio = planilha.worksheet("RIO")
             produtos_rio = aba_rio.get_all_records()
+
+            pilulas_rio = []
+            for item in produtos_rio:
+                p_nome = item.get("PRODUTO", "")
+                if p_nome:
+                    active_cls = "active" if p_nome == produto_selecionado else ""
+                    pilulas_rio.append(f'<a href="/modulo/rio?produto={urllib.parse.quote(p_nome)}" class="submodulo-pill {active_cls}">{p_nome}</a>')
+            
+            nav_superior_html = f"""
+            <div class="submodulo-nav-container">
+                <div class="submodulo-nav-label">Navegação Rápida — Telemetria RIO</div>
+                <div class="submodulo-nav-scroll">{"".join(pilulas_rio)}</div>
+            </div>
+            """
 
             if produto_selecionado:
                 item_escolhido = next((item for item in produtos_rio if str(item.get("PRODUTO", "")) == produto_selecionado), None)
@@ -612,8 +727,8 @@ def acessar_modulo(nome_modulo):
 
                     conteudo = f"""
                     <div>
-                        <a href="/modulo/rio" class="btn-voltar">‹ Voltar para os Produtos RIO</a>
-                        <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes do Produto</h2>
+                        {nav_superior_html}
+                        <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes do Produto</h2>
                         
                         <div class="produto-detalhe-card">
                             <div class="detalhe-linha">
@@ -647,12 +762,12 @@ def acessar_modulo(nome_modulo):
                     </div>
                     """
                 else:
-                    conteudo = '<div><a href="/modulo/rio" class="btn-voltar">‹ Voltar</a><p style="color: #c53030;">Produto não encontrado.</p></div>'
+                    conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Produto não encontrado.</p></div>'
             else:
                 botoes_produtos = "".join([f'<a href="/modulo/rio?produto={item.get("PRODUTO", "")}" class="submenu-btn">{item.get("PRODUTO", "")}</a>' for item in produtos_rio if item.get("PRODUTO")])
                 conteudo = f"""
                 <div>
-                    <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Módulo RIO — Selecione um Produto</h2>
+                    <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Telemetria RIO — Selecione um Produto</h2>
                     <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Escolha abaixo o produto para ver os detalhes, foco, descrição, valor e acionar as ferramentas:</p>
                     <div class="submenus-grid">{botoes_produtos}</div>
                 </div>
@@ -667,6 +782,20 @@ def acessar_modulo(nome_modulo):
             planilha = conectar_google_sheets()
             aba_pm = planilha.worksheet("PM")
             produtos_pm = aba_pm.get_all_records()
+
+            pilulas_pm = []
+            for item in produtos_pm:
+                p_nome = item.get("PRODUTO", "")
+                if p_nome:
+                    active_cls = "active" if p_nome == produto_selecionado else ""
+                    pilulas_pm.append(f'<a href="/modulo/pm?produto={urllib.parse.quote(p_nome)}" class="submodulo-pill {active_cls}">{p_nome}</a>')
+            
+            nav_superior_html = f"""
+            <div class="submodulo-nav-container">
+                <div class="submodulo-nav-label">Navegação Rápida — Planos de Manutenção</div>
+                <div class="submodulo-nav-scroll">{"".join(pilulas_pm)}</div>
+            </div>
+            """
 
             if produto_selecionado:
                 item_escolhido = next((item for item in produtos_pm if str(item.get("PRODUTO", "")) == produto_selecionado), None)
@@ -726,8 +855,8 @@ def acessar_modulo(nome_modulo):
 
                     conteudo = f"""
                     <div>
-                        <a href="/modulo/pm" class="btn-voltar">‹ Voltar para os Planos de Manutenção</a>
-                        <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes do Plano</h2>
+                        {nav_superior_html}
+                        <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes do Plano</h2>
                         
                         <div class="produto-detalhe-card">
                             <div class="detalhe-linha">
@@ -758,12 +887,12 @@ def acessar_modulo(nome_modulo):
                     </div>
                     """
                 else:
-                    conteudo = '<div><a href="/modulo/pm" class="btn-voltar">‹ Voltar</a><p style="color: #c53030;">Plano não encontrado.</p></div>'
+                    conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Plano não encontrado.</p></div>'
             else:
                 botoes_produtos = "".join([f'<a href="/modulo/pm?produto={item.get("PRODUTO", "")}" class="submenu-btn">{item.get("PRODUTO", "")}</a>' for item in produtos_pm if item.get("PRODUTO")])
                 conteudo = f"""
                 <div>
-                    <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Módulo P. Manutenção — Selecione um Plano</h2>
+                    <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Plano de Manutenção — Selecione um Plano</h2>
                     <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Escolha abaixo o plano de manutenção para ver os detalhes, foco, descrição, coberturas e ferramentas:</p>
                     <div class="submenus-grid">{botoes_produtos}</div>
                 </div>
@@ -797,6 +926,20 @@ def acessar_modulo(nome_modulo):
             else:
                 dados_precos = []
 
+            pilulas_valores = []
+            for item in dados_precos:
+                v_nome = item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO") or ""
+                if v_nome:
+                    active_cls = "active" if v_nome == produto_selecionado else ""
+                    pilulas_valores.append(f'<a href="/modulo/valores?produto={urllib.parse.quote(v_nome)}" class="submodulo-pill {active_cls}">{v_nome}</a>')
+
+            nav_superior_html = f"""
+            <div class="submodulo-nav-container">
+                <div class="submodulo-nav-label">Navegação Rápida — Modelos</div>
+                <div class="submodulo-nav-scroll">{"".join(pilulas_valores)}</div>
+            </div>
+            """
+
             if produto_selecionado:
                 item_escolhido = next((item for item in dados_precos if (item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO") or "") == produto_selecionado), None)
 
@@ -828,7 +971,7 @@ def acessar_modulo(nome_modulo):
 
                         bloco_ficha_tecnica_html = f"""
                         <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 12px; margin-bottom: 14px;">
-                            <div class="detalhe-label" style="color: #1e3c72; margin-bottom: 6px;">Ficha Técnica (PDF)</div>
+                            <div class="detalhe-label" style="color: #002244; margin-bottom: 6px;">Ficha Técnica (PDF)</div>
                             <div class="acoes-ficha-tecnica">
                                 <a href="{link_ficha_tecnica}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📂 ABRIR PDF</a>
                                 <a href="{link_wpp_ficha}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-wpp-pdf">📤 ENVIAR VIA WHATSAPP</a>
@@ -927,13 +1070,13 @@ def acessar_modulo(nome_modulo):
 
                     conteudo = f"""
                     <div>
-                        <a href="/modulo/valores" class="btn-voltar">‹ Voltar para a lista de Valores</a>
-                        <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes de Valores</h2>
+                        {nav_superior_html}
+                        <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes de Valores</h2>
                         
                         <div class="produto-detalhe-card">
                             <div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; margin-bottom: 14px;">
                                 <div style="margin-bottom: 8px;">
-                                    <div class="detalhe-label" style="color: #1e3c72; margin-bottom: 2px;">Modelo / Item</div>
+                                    <div class="detalhe-label" style="color: #002244; margin-bottom: 2px;">Modelo / Item</div>
                                     <div class="detalhe-valor detalhe-produto-nome" style="font-size: 19px; color: #1a202c;">{titulo_principal}</div>
                                 </div>
                                 
@@ -962,12 +1105,12 @@ def acessar_modulo(nome_modulo):
                     </div>
                     """
                 else:
-                    conteudo = '<div><a href="/modulo/valores" class="btn-voltar">‹ Voltar</a><p style="color: #c53030;">Item não encontrado.</p></div>'
+                    conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Item não encontrado.</p></div>'
             else:
                 botoes_itens = "".join([f'<a href="/modulo/valores?produto={item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO")}" class="submenu-btn">{item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO")}</a>' for item in dados_precos if (item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO"))])
                 conteudo = f"""
                 <div>
-                    <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Módulo VALORES — Selecione um Modelo</h2>
+                    <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Tabela de Valores — Selecione um Modelo</h2>
                     <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Escolha abaixo o modelo ou item para consultar os preços e informações detalhadas:</p>
                     <div class="submenus-grid">{botoes_itens}</div>
                 </div>
@@ -983,6 +1126,20 @@ def acessar_modulo(nome_modulo):
             aba_informes = planilha.worksheet("Informes")
             dados_informes = aba_informes.get_all_records()
 
+            pilulas_informes = []
+            for item in dados_informes:
+                inf_nome = item.get("ASSUNTO", "")
+                if inf_nome:
+                    active_cls = "active" if inf_nome == informe_selecionado else ""
+                    pilulas_informes.append(f'<a href="/modulo/informes?item={urllib.parse.quote(inf_nome)}" class="submodulo-pill {active_cls}">{inf_nome}</a>')
+
+            nav_superior_html = f"""
+            <div class="submodulo-nav-container">
+                <div class="submodulo-nav-label">Navegação Rápida — Comunicados</div>
+                <div class="submodulo-nav-scroll">{"".join(pilulas_informes)}</div>
+            </div>
+            """
+
             if informe_selecionado:
                 item_escolhido = next((item for item in dados_informes if str(item.get("ASSUNTO", "")) == informe_selecionado), None)
 
@@ -995,7 +1152,7 @@ def acessar_modulo(nome_modulo):
                     if circular_val:
                         bloco_circular_html = f"""
                         <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 12px; margin-top: 14px;">
-                            <div class="detalhe-label" style="color: #1e3c72; margin-bottom: 6px;">Circular Oficial</div>
+                            <div class="detalhe-label" style="color: #002244; margin-bottom: 6px;">Circular Oficial</div>
                             <div class="acoes-ficha-tecnica">
                                 <a href="{circular_val}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📄 ABRIR CIRCULAR (PDF)</a>
                             </div>
@@ -1004,13 +1161,13 @@ def acessar_modulo(nome_modulo):
 
                     conteudo = f"""
                     <div>
-                        <a href="/modulo/informes" class="btn-voltar">‹ Voltar para os Informes</a>
-                        <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes do Comunicado</h2>
+                        {nav_superior_html}
+                        <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Detalhes do Comunicado</h2>
                         
                         <div class="produto-detalhe-card">
                             <div class="detalhe-linha">
                                 <div class="detalhe-label">Assunto</div>
-                                <div class="detalhe-valor detalhe-produto-nome" style="color: #1e3c72;">{assunto_val}</div>
+                                <div class="detalhe-valor detalhe-produto-nome" style="color: #002244;">{assunto_val}</div>
                             </div>
                             
                             <div class="detalhe-linha" style="border-bottom: none; margin-bottom: 0; padding-bottom: 0;">
@@ -1023,12 +1180,12 @@ def acessar_modulo(nome_modulo):
                     </div>
                     """
                 else:
-                    conteudo = '<div><a href="/modulo/informes" class="btn-voltar">‹ Voltar</a><p style="color: #c53030;">Informe não encontrado.</p></div>'
+                    conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Informe não encontrado.</p></div>'
             else:
                 botoes_informes = "".join([f'<a href="/modulo/informes?item={item.get("ASSUNTO", "")}" class="submenu-btn">{item.get("ASSUNTO", "")}</a>' for item in dados_informes if item.get("ASSUNTO")])
                 conteudo = f"""
                 <div>
-                    <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Módulo INFORMES — Avisos e Comunicados</h2>
+                    <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Informes e Circulares — Avisos e Comunicados</h2>
                     <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Selecione abaixo um comunicado para visualizar a explicação detalhada e acessar a circular oficial:</p>
                     <div class="submenus-grid">{botoes_informes}</div>
                 </div>
@@ -1043,6 +1200,20 @@ def acessar_modulo(nome_modulo):
             planilha = conectar_google_sheets()
             aba_argumentos = planilha.worksheet("Argumentos")
             dados_argumentos = aba_argumentos.get_all_records()
+
+            pilulas_argumentos = []
+            for item in dados_argumentos:
+                arg_nome = item.get("QUESTIONAMENTO", "")
+                if arg_nome:
+                    active_cls = "active" if arg_nome == argumento_selecionado else ""
+                    pilulas_argumentos.append(f'<a href="/modulo/argumentos?item={urllib.parse.quote(arg_nome)}" class="submodulo-pill {active_cls}">{arg_nome}</a>')
+
+            nav_superior_html = f"""
+            <div class="submodulo-nav-container">
+                <div class="submodulo-nav-label">Navegação Rápida — Objeções / Dúvidas</div>
+                <div class="submodulo-nav-scroll">{"".join(pilulas_argumentos)}</div>
+            </div>
+            """
 
             if argumento_selecionado:
                 item_escolhido = next((item for item in dados_argumentos if str(item.get("QUESTIONAMENTO", "")) == argumento_selecionado), None)
@@ -1065,8 +1236,8 @@ def acessar_modulo(nome_modulo):
 
                     conteudo = f"""
                     <div>
-                        <a href="/modulo/argumentos" class="btn-voltar">‹ Voltar para os Argumentos</a>
-                        <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Argumentário Comercial</h2>
+                        {nav_superior_html}
+                        <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Argumentos de Venda</h2>
                         
                         <div class="produto-detalhe-card">
                             <div class="detalhe-linha">
@@ -1084,12 +1255,12 @@ def acessar_modulo(nome_modulo):
                     </div>
                     """
                 else:
-                    conteudo = '<div><a href="/modulo/argumentos" class="btn-voltar">‹ Voltar</a><p style="color: #c53030;">Argumento não encontrado.</p></div>'
+                    conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Argumento não encontrado.</p></div>'
             else:
                 botoes_argumentos = "".join([f'<a href="/modulo/argumentos?item={item.get("QUESTIONAMENTO", "")}" class="submenu-btn">{item.get("QUESTIONAMENTO", "")}</a>' for item in dados_argumentos if item.get("QUESTIONAMENTO")])
                 conteudo = f"""
                 <div>
-                    <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Módulo ARGUMENTOS — Objeções e Respostas</h2>
+                    <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Argumentos de Venda — Objeções e Respostas</h2>
                     <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Selecione abaixo a dúvida ou objeção do cliente para visualizar a melhor linha de argumentação:</p>
                     <div class="submenus-grid">{botoes_argumentos}</div>
                 </div>
@@ -1098,10 +1269,9 @@ def acessar_modulo(nome_modulo):
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar os dados da aba Argumentos:</b> {e}</div>'
 
     else:
-        titulo_atual = f"Módulo {nome_modulo.upper()}"
         conteudo = f"""
         <div>
-            <h2 style="color: #1a202c; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">{titulo_atual}</h2>
+            <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">{modulo_titulo}</h2>
             <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px;">
                 <p style="color: #4a5568; font-size: 14px; line-height: 1.6;">Conteúdo em desenvolvimento para este módulo.</p>
             </div>
@@ -1109,7 +1279,10 @@ def acessar_modulo(nome_modulo):
         """
 
     return render_template_string(
-        TEMPLATE_HTML, conteudo_modulo=conteudo, modulo_ativo=nome_modulo
+        TEMPLATE_HTML, 
+        conteudo_modulo=conteudo, 
+        modulo_ativo=nome_modulo,
+        modulo_titulo=modulo_titulo
     )
 
 @app.route("/logout", methods=["POST"])

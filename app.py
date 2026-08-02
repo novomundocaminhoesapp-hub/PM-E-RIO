@@ -107,36 +107,59 @@ TEMPLATE_HTML = """
 
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-        /* --- ESTILO MENU FIXO NO RODAPÉ (MOBILE) --- */
+      /* --- FORÇAR MENU NO RODAPÉ EM DISPOSITIVOS MÓVEIS --- */
         @media (max-width: 768px) {
-            .nav, .nav-tabs, .navbar-nav, .menu-container {
+            .user-info, .profile-section, .sidebar-header, .btn-logout {
+                display: none !important;
+            }
+
+            .app-container, body, html {
+                flex-direction: column !important;
+                overflow-x: hidden !important;
+            }
+
+            div[class*="sidebar"], nav, .menu-container, .nav-tabs {
                 position: fixed !important;
                 bottom: 0 !important;
+                top: auto !important;
                 left: 0 !important;
                 right: 0 !important;
-                top: auto !important;
-                z-index: 9999 !important;
+                width: 100% !important;
+                height: 60px !important;
+                min-height: 60px !important;
+                z-index: 99999 !important;
                 background-color: #1a252f !important;
                 display: flex !important;
+                flex-direction: row !important;
                 justify-content: space-around !important;
                 align-items: center !important;
-                padding: 6px 0 !important;
+                padding: 0 !important;
                 margin: 0 !important;
-                box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.2) !important;
+                box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.3) !important;
                 border: none !important;
             }
 
-            .nav-link, .nav-item, .btn-menu {
+            div[class*="sidebar"] a, div[class*="sidebar"] button, nav a, .nav-link, .btn-menu {
                 font-size: 11px !important;
-                padding: 8px 4px !important;
+                padding: 8px 2px !important;
+                margin: 0 !important;
                 text-align: center !important;
                 color: #ffffff !important;
                 flex: 1 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                align-items: center !important;
+                justify-content: center !important;
+                white-space: nowrap !important;
+                border-radius: 0 !important;
             }
 
-            body {
-                padding-bottom: 70px !important;
+            .main-content, .content, body {
+                padding-bottom: 80px !important;
+                margin-bottom: 0 !important;
+                width: 100% !important;
             }
+        }
         }
         body { 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; 

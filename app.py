@@ -17,7 +17,6 @@ MESES_PT = {
     9: "setembro", 10: "outubro", 11: "novembro", 12: "dezembro"
 }
 
-# Mapeamento para garantir que o nome da Topbar corresponda exatamente ao Menu
 NOMES_MODULOS = {
     "rio": "Telemetria RIO",
     "pm": "Plano de Manutenção",
@@ -31,6 +30,23 @@ escopos = [
     "https://www.googleapis.com/auth/drive"
 ]
 
+def validar_cpf(cpf_input):
+    """Valida formato e dígitos verificadores. Aceita tratar zeros à esquerda."""
+    cpf = re.sub(r'\D', '', str(cpf_input))
+    if len(cpf) < 11:
+        cpf = cpf.zfill(11)
+        
+    if len(cpf) != 11 or cpf == cpf[0] * 11:
+        return False
+        
+    for i in range(9, 11):
+        soma = sum(int(cpf[num]) * ((i + 1) - num) for num in range(0, i))
+        digito = ((soma * 10) % 11) % 10
+        if digito != int(cpf[i]):
+            return False
+            
+    return True
+
 def conectar_google_sheets():
     if 'GOOGLE_CREDENTIALS' in os.environ:
         credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
@@ -42,7 +58,6 @@ def conectar_google_sheets():
     return cliente.open("PM e RIO Novo")
 
 def converter_para_embed(url):
-    """Converte links normais do YouTube ou Drive para o formato embed de reprodução interna."""
     if not url:
         return ""
     url = str(url).strip()
@@ -125,7 +140,6 @@ TEMPLATE_HTML = """
             flex-direction: column;
         }
 
-        /* CARD LOGIN */
         .login-wrapper {
             display: flex;
             justify-content: center;
@@ -152,8 +166,8 @@ TEMPLATE_HTML = """
         input:focus { border-color: #0066cc; background-color: #fff; outline: none; }
         button.btn-login { background-color: #002244; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 15px; font-weight: 600; }
         .error { background-color: #fff5f5; color: #c53030; padding: 12px; border-radius: 6px; font-size: 13px; margin-bottom: 15px; border: 1px solid #feb2b2; line-height: 1.4; font-weight: 500; }
+        .sucesso { background-color: #f0fff4; color: #276749; padding: 12px; border-radius: 6px; font-size: 13px; margin-bottom: 15px; border: 1px solid #9ae6b4; line-height: 1.4; font-weight: 500; }
 
-        /* BARRA SUPERIOR (TOPBAR) */
         .topbar {
             height: 56px;
             background-color: #002244;
@@ -174,218 +188,56 @@ TEMPLATE_HTML = """
         .topbar-title { font-size: 17px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
         .topbar-right button { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; }
 
-        /* OVERLAY DO DRAWER (MOBILE) */
         .drawer-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 998;
-            opacity: 0;
-            visibility: hidden;
-            transition: all 0.3s ease;
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5); z-index: 998; opacity: 0; visibility: hidden; transition: all 0.3s ease;
         }
-        .drawer-overlay.active {
-            opacity: 1;
-            visibility: visible;
-        }
+        .drawer-overlay.active { opacity: 1; visibility: visible; }
 
-        /* DRAWER LATERAL (MENU SLIDE / DESKTOP FIXO) */
         .drawer {
-            position: fixed;
-            top: 0;
-            left: -310px;
-            width: 280px;
-            height: 100%;
-            background: #ffffff;
-            z-index: 999;
-            transition: all 0.3s ease;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            box-shadow: 3px 0 15px rgba(0,0,0,0.15);
-            border-right: 1px solid #e2e8f0;
+            position: fixed; top: 0; left: -310px; width: 280px; height: 100%;
+            background: #ffffff; z-index: 999; transition: all 0.3s ease; overflow-y: auto;
+            display: flex; flex-direction: column; box-shadow: 3px 0 15px rgba(0,0,0,0.15); border-right: 1px solid #e2e8f0;
         }
-        .drawer.open {
-            left: 0;
-        }
+        .drawer.open { left: 0; }
 
-        /* COMPORTAMENTO DESKTOP (TELA > 992px) */
         @media (min-width: 992px) {
             .menu-hamburger { display: none !important; }
             .drawer-overlay { display: none !important; }
-            .drawer {
-                left: 0 !important;
-                box-shadow: none;
-                z-index: 90;
-            }
-            .topbar {
-                left: 280px;
-                width: calc(100% - 280px);
-            }
-            .main-content {
-                margin-left: 280px !important;
-                max-width: 1200px !important;
-            }
+            .drawer { left: 0 !important; box-shadow: none; z-index: 90; }
+            .topbar { left: 280px; width: calc(100% - 280px); }
+            .main-content { margin-left: 280px !important; max-width: 1200px !important; }
         }
 
-        /* HEADER INTERNO DO MENU LATERAL */
-        .drawer-header {
-            background: #002244;
-            color: white;
-            padding: 22px 20px;
-            text-align: center;
-            border-bottom: 3px solid #0066cc;
-        }
-        .drawer-header img {
-            max-width: 160px;
-            height: auto;
-            margin-bottom: 4px;
-        }
-
-        /* PROFILE CARD DENTRO DO MENU */
-        .drawer-profile {
-            padding: 16px 20px;
-            background: #f8fafc;
-            border-bottom: 1px solid #e2e8f0;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .avatar-box {
-            width: 44px;
-            height: 44px;
-            border-radius: 50%;
-            background: #002244;
-            color: #fff;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 18px;
-            font-weight: bold;
-            flex-shrink: 0;
-        }
+        .drawer-header { background: #002244; color: white; padding: 22px 20px; text-align: center; border-bottom: 3px solid #0066cc; }
+        .drawer-header img { max-width: 160px; height: auto; margin-bottom: 4px; }
+        .drawer-profile { padding: 16px 20px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; align-items: center; gap: 12px; }
+        .avatar-box { width: 44px; height: 44px; border-radius: 50%; background: #002244; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: bold; flex-shrink: 0; }
         .user-details h3 { font-size: 14px; color: #002244; font-weight: 700; }
         .user-details p { font-size: 11px; color: #718096; }
 
-        /* ITENS NAVEGAÇÃO */
-        .drawer-menu {
-            list-style: none;
-            padding: 10px 0;
-            margin: 0;
-            flex-grow: 1;
-        }
-        .drawer-item a, .drawer-item button {
-            display: flex;
-            align-items: center;
-            gap: 14px;
-            padding: 14px 20px;
-            text-decoration: none;
-            color: #2d3748;
-            font-size: 14px;
-            font-weight: 600;
-            border: none;
-            background: none;
-            width: 100%;
-            text-align: left;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .drawer-item a:hover, .drawer-item.active a {
-            background-color: #ebf8ff;
-            color: #0066cc;
-            border-left: 4px solid #0066cc;
-        }
+        .drawer-menu { list-style: none; padding: 10px 0; margin: 0; flex-grow: 1; }
+        .drawer-item a, .drawer-item button { display: flex; align-items: center; gap: 14px; padding: 14px 20px; text-decoration: none; color: #2d3748; font-size: 14px; font-weight: 600; border: none; background: none; width: 100%; text-align: left; cursor: pointer; transition: all 0.2s; }
+        .drawer-item a:hover, .drawer-item.active a { background-color: #ebf8ff; color: #0066cc; border-left: 4px solid #0066cc; }
         .drawer-icon { font-size: 18px; width: 22px; text-align: center; color: #002244; }
 
-        /* CARROSSEL / ROLO DE SUBMÓDULOS SUPERIOR */
-        .submodulo-nav-container {
-            background: #ffffff;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            padding: 8px 12px;
-            margin-bottom: 16px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-        }
-        .submodulo-nav-label {
-            font-size: 10px;
-            font-weight: 700;
-            color: #718096;
-            text-transform: uppercase;
-            margin-bottom: 6px;
-        }
-        .submodulo-nav-scroll {
-            display: flex;
-            gap: 8px;
-            overflow-x: auto;
-            padding-bottom: 4px;
-            -webkit-overflow-scrolling: touch;
-        }
+        .submodulo-nav-container { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 12px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
+        .submodulo-nav-label { font-size: 10px; font-weight: 700; color: #718096; text-transform: uppercase; margin-bottom: 6px; }
+        .submodulo-nav-scroll { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
         .submodulo-nav-scroll::-webkit-scrollbar { height: 4px; }
         .submodulo-nav-scroll::-webkit-scrollbar-thumb { background: #cbd5e0; border-radius: 4px; }
 
-        .submodulo-pill {
-            white-space: nowrap;
-            padding: 8px 14px;
-            background: #f7fafc;
-            border: 1px solid #cbd5e0;
-            border-radius: 20px;
-            text-decoration: none;
-            color: #2d3748;
-            font-size: 13px;
-            font-weight: 600;
-            transition: all 0.2s;
-            flex-shrink: 0;
-        }
+        .submodulo-pill { white-space: nowrap; padding: 8px 14px; background: #f7fafc; border: 1px solid #cbd5e0; border-radius: 20px; text-decoration: none; color: #2d3748; font-size: 13px; font-weight: 600; transition: all 0.2s; flex-shrink: 0; }
         .submodulo-pill:hover { background: #edf2f7; color: #002244; }
-        .submodulo-pill.active {
-            background: #002244;
-            color: #ffffff;
-            border-color: #002244;
-            box-shadow: 0 2px 4px rgba(0,34,68,0.25);
-        }
+        .submodulo-pill.active { background: #002244; color: #ffffff; border-color: #002244; box-shadow: 0 2px 4px rgba(0,34,68,0.25); }
 
-        /* CONTEÚDO DA PÁGINA */
-        .main-content {
-            margin-top: 56px;
-            padding: 16px;
-            flex-grow: 1;
-            width: 100%;
-            margin-left: auto;
-            margin-right: auto;
-        }
-
-        /* COMPONENTES DOS MÓDULOS */
+        .main-content { margin-top: 56px; padding: 16px; flex-grow: 1; width: 100%; margin-left: auto; margin-right: auto; }
         .submenus-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
-        .submenu-btn {
-            background: #ffffff;
-            border: 1px solid #cbd5e0;
-            border-left: 4px solid #002244;
-            padding: 14px 16px;
-            border-radius: 8px;
-            text-decoration: none;
-            color: #1a202c;
-            font-weight: 600;
-            font-size: 15px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: all 0.2s;
-        }
+        .submenu-btn { background: #ffffff; border: 1px solid #cbd5e0; border-left: 4px solid #002244; padding: 14px 16px; border-radius: 8px; text-decoration: none; color: #1a202c; font-weight: 600; font-size: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); display: flex; justify-content: space-between; align-items: center; transition: all 0.2s; }
         .submenu-btn:hover { background: #f7fafc; border-color: #0066cc; }
         .submenu-btn::after { content: '›'; font-size: 18px; color: #a0aec0; }
 
-        .produto-detalhe-card {
-            background: #ffffff;
-            border: 1px solid #e2e8f0;
-            border-radius: 10px;
-            padding: 18px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.03);
-        }
-
+        .produto-detalhe-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 18px; box-shadow: 0 2px 5px rgba(0,0,0,0.03); }
         .detalhe-linha { margin-bottom: 12px; border-bottom: 1px solid #edf2f7; padding-bottom: 10px; }
         .detalhe-label { font-size: 11px; font-weight: 700; color: #4a5568; text-transform: uppercase; margin-bottom: 3px; }
         .detalhe-valor { font-size: 14px; color: #1a202c; }
@@ -393,68 +245,35 @@ TEMPLATE_HTML = """
         .detalhe-preco { font-size: 17px; font-weight: 700; color: #2f855a; }
 
         .acoes-produto { display: flex; gap: 8px; margin-top: 12px; }
-        .btn-acao {
-            flex: 1; padding: 12px 10px; border-radius: 6px; font-size: 13px; font-weight: 600;
-            text-align: center; text-decoration: none; display: inline-flex; justify-content: center;
-            align-items: center; cursor: pointer; border: none; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-        }
+        .btn-acao { flex: 1; padding: 12px 10px; border-radius: 6px; font-size: 13px; font-weight: 600; text-align: center; text-decoration: none; display: inline-flex; justify-content: center; align-items: center; cursor: pointer; border: none; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
         .btn-video { background-color: #002244; color: #ffffff; }
         .btn-video:hover { background-color: #001529; }
         .btn-whatsapp { background-color: #2f855a; color: #ffffff; }
         .btn-whatsapp:hover { background-color: #276749; }
 
-        .btn-toggle-cobertura {
-            background-color: #edf2f7; color: #2d3748; border: 1px solid #cbd5e0;
-            padding: 10px 14px; border-radius: 6px; font-size: 13px; font-weight: 600;
-            cursor: pointer; width: 100%; text-align: left; display: flex;
-            justify-content: space-between; align-items: center; margin-top: 4px;
-        }
+        .btn-toggle-cobertura { background-color: #edf2f7; color: #2d3748; border: 1px solid #cbd5e0; padding: 10px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: center; margin-top: 4px; }
         .btn-toggle-cobertura:hover { background-color: #e2e8f0; }
-        .conteudo-cobertura {
-            display: none; background: #ffffff; border: 1px solid #e2e8f0;
-            border-radius: 6px; padding: 12px; margin-top: 6px; font-size: 13px;
-            color: #2d3748; white-space: pre-line;
-        }
+        .conteudo-cobertura { display: none; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; margin-top: 6px; font-size: 13px; color: #2d3748; white-space: pre-line; }
 
         .grid-planos { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
-        .card-plano {
-            background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px;
-            padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); border-left: 4px solid #002244;
-        }
+        .card-plano { background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); border-left: 4px solid #002244; }
         .card-plano.max { border-left-color: #d69e2e; }
         .card-plano.plus { border-left-color: #2f855a; }
 
-        .plano-titulo {
-            font-size: 14px; font-weight: 700; color: #1a202c; margin-bottom: 10px;
-            text-transform: uppercase; border-bottom: 1px solid #edf2f7; padding-bottom: 6px;
-        }
+        .plano-titulo { font-size: 14px; font-weight: 700; color: #1a202c; margin-bottom: 10px; text-transform: uppercase; border-bottom: 1px solid #edf2f7; padding-bottom: 6px; }
         .plano-linha-tripla { display: flex; gap: 8px; margin-bottom: 8px; }
         .plano-col { flex: 1; background: #f7fafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #edf2f7; }
 
         .acoes-ficha-tecnica { display: flex; gap: 8px; margin-top: 8px; }
-        .btn-acao-ficha {
-            flex: 1; padding: 10px; border-radius: 6px; font-size: 13px; font-weight: 600;
-            text-align: center; text-decoration: none; display: inline-block; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-        }
+        .btn-acao-ficha { flex: 1; padding: 10px; border-radius: 6px; font-size: 13px; font-weight: 600; text-align: center; text-decoration: none; display: inline-block; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
         .btn-abrir-pdf { background-color: #002244; color: #ffffff; }
         .btn-abrir-pdf:hover { background-color: #001529; }
         .btn-wpp-pdf { background-color: #2f855a; color: #ffffff; }
         .btn-wpp-pdf:hover { background-color: #276749; }
 
-        .modal-video-overlay {
-            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0, 0, 0, 0.85); z-index: 2000; justify-content: center;
-            align-items: center; padding: 15px;
-        }
-        .modal-video-content {
-            background: #000000; width: 100%; max-width: 720px; border-radius: 12px;
-            overflow: hidden; position: relative; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-            display: flex; flex-direction: column;
-        }
-        .modal-video-header {
-            display: flex; justify-content: space-between; align-items: center;
-            background: #002244; color: #ffffff; padding: 12px 16px; font-size: 14px; font-weight: 600;
-        }
+        .modal-video-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.85); z-index: 2000; justify-content: center; align-items: center; padding: 15px; }
+        .modal-video-content { background: #000000; width: 100%; max-width: 720px; border-radius: 12px; overflow: hidden; position: relative; box-shadow: 0 10px 30px rgba(0,0,0,0.5); display: flex; flex-direction: column; }
+        .modal-video-header { display: flex; justify-content: space-between; align-items: center; background: #002244; color: #ffffff; padding: 12px 16px; font-size: 14px; font-weight: 600; }
         .btn-fechar-modal { background: transparent; border: none; color: #ffffff; font-size: 24px; cursor: pointer; line-height: 1; padding: 0 4px; }
         .iframe-container { position: relative; width: 100%; padding-bottom: 56.25%; height: 0; background: #000; }
         .iframe-container iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 0; }
@@ -510,21 +329,48 @@ TEMPLATE_HTML = """
                     <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo Novo Mundo" class="logo">
                 </div>
                 
-                <h2 style="font-size: 18px; color: #002244; margin-bottom: 15px;">Acesso Restrito</h2>
-                {% if erro %}
-                    <div class="error">{{ erro }}</div>
+                {% if modulo_reset %}
+                    <h2 style="font-size: 18px; color: #002244; margin-bottom: 15px;">Redefinir Senha</h2>
+                    {% if erro %}
+                        <div class="error">{{ erro }}</div>
+                    {% endif %}
+                    <form method="POST">
+                        <input type="hidden" name="acao" value="redefinir">
+                        <div class="input-group">
+                            <label>E-mail Corporativo</label>
+                            <input type="email" name="email" value="{{ email_tentativa }}" readonly style="background-color: #edf2f7;">
+                        </div>
+                        <div class="input-group">
+                            <label>CPF (apenas números)</label>
+                            <input type="text" name="cpf" placeholder="Digite seu CPF (11 dígitos)" maxlength="14" required autofocus>
+                        </div>
+                        <div class="input-group">
+                            <label>Nova Senha</label>
+                            <input type="password" name="nova_senha" placeholder="Nova Senha" required>
+                        </div>
+                        <button type="submit" class="btn-login">Salvar Nova Senha</button>
+                    </form>
+                {% else %}
+                    <h2 style="font-size: 18px; color: #002244; margin-bottom: 15px;">Acesso Restrito</h2>
+                    {% if erro %}
+                        <div class="error">{{ erro }}</div>
+                    {% endif %}
+                    {% if sucesso %}
+                        <div class="sucesso">{{ sucesso }}</div>
+                    {% endif %}
+                    <form method="POST">
+                        <input type="hidden" name="acao" value="login">
+                        <div class="input-group">
+                            <label>E-mail Corporativo</label>
+                            <input type="email" name="email" value="{{ email_tentativa }}" placeholder="seu.email@novomundo.com" required autocapitalize="none">
+                        </div>
+                        <div class="input-group">
+                            <label>Senha</label>
+                            <input type="password" name="senha" placeholder="••••••••" required>
+                        </div>
+                        <button type="submit" class="btn-login">Entrar no Sistema</button>
+                    </form>
                 {% endif %}
-                <form method="POST">
-                    <div class="input-group">
-                        <label>E-mail Corporativo</label>
-                        <input type="email" name="email" placeholder="seu.email@novomundo.com" required autocapitalize="none">
-                    </div>
-                    <div class="input-group">
-                        <label>Senha</label>
-                        <input type="password" name="senha" placeholder="••••••••" required>
-                    </div>
-                    <button type="submit" class="btn-login">Entrar no Sistema</button>
-                </form>
             </div>
         </div>
     {% else %}
@@ -539,10 +385,8 @@ TEMPLATE_HTML = """
             </div>
         </header>
 
-        <!-- OVERLAY DE FECHAMENTO (MOBILE) -->
         <div class="drawer-overlay" id="drawerOverlay" onclick="closeDrawer()"></div>
 
-        <!-- DRAWER / SIDEBAR MENU LATERAL -->
         <aside class="drawer" id="drawerMenu">
             <div class="drawer-header">
                 <img src="{{ url_for('static', filename='logo.png') }}" alt="Novo Mundo">
@@ -580,7 +424,6 @@ TEMPLATE_HTML = """
             </ul>
         </aside>
 
-        <!-- CONTEÚDO PRINCIPAL DA TELA -->
         <main class="main-content">
             {% if conteudo_modulo %}
                 {{ conteudo_modulo | safe }}
@@ -592,7 +435,6 @@ TEMPLATE_HTML = """
             {% endif %}
         </main>
 
-        <!-- MODAL DE VÍDEO -->
         <div id="modalVideo" class="modal-video-overlay" onclick="fecharVideoModal()">
             <div class="modal-video-content" onclick="event.stopPropagation()">
                 <div class="modal-video-header">
@@ -613,45 +455,116 @@ TEMPLATE_HTML = """
 @app.route("/", methods=["GET", "POST"])
 def login():
     erro = None
+    sucesso = None
+    modulo_reset = False
+    email_tentativa = session.get("email_bloqueado", "")
 
     if request.method == "POST":
-        input_email = request.form.get("email", "").strip().lower()
-        input_senha = request.form.get("senha")
+        acao = request.form.get("acao", "login")
 
-        try:
-            planilha = conectar_google_sheets()
-            aba_usuarios = planilha.worksheet("Usuarios")
-            usuarios = aba_usuarios.get_all_records()
+        if acao == "login":
+            input_email = request.form.get("email", "").strip().lower()
+            input_senha = request.form.get("senha")
+            session["email_bloqueado"] = input_email
+            email_tentativa = input_email
 
-            usuario_encontrado = None
+            try:
+                planilha = conectar_google_sheets()
+                aba_usuarios = planilha.worksheet("Usuarios")
+                usuarios = aba_usuarios.get_all_records()
 
-            for u in usuarios:
-                if str(u.get("EMAIL", "")).strip().lower() == input_email:
-                    usuario_encontrado = u
-                    break
+                usuario_encontrado = None
 
-            if usuario_encontrado and str(usuario_encontrado.get("SENHA", "")) == input_senha:
-                session.pop("tentativas_erro", None)
+                for u in usuarios:
+                    if str(u.get("EMAIL", "")).strip().lower() == input_email:
+                        usuario_encontrado = u
+                        break
 
-                session["logado"] = True
-                session["nome"] = usuario_encontrado.get("NOME")
-                session["perfil"] = usuario_encontrado.get("PERFIL")
-                return redirect(url_for("acessar_modulo", nome_modulo="rio"))
-            else:
-                tentativas = session.get("tentativas_erro", 0) + 1
-                session["tentativas_erro"] = tentativas
+                if usuario_encontrado and str(usuario_encontrado.get("SENHA", "")) == input_senha:
+                    session.pop("tentativas_erro", None)
+                    session.pop("email_bloqueado", None)
 
-                if tentativas >= 3:
-                    erro = "Você excedeu 3 tentativas incorretas. Procure a Torre de Controle da Novo Mundo para adquirir uma nova senha."
+                    session["logado"] = True
+                    session["nome"] = usuario_encontrado.get("NOME")
+                    session["perfil"] = usuario_encontrado.get("PERFIL")
+                    return redirect(url_for("acessar_modulo", nome_modulo="rio"))
                 else:
-                    restantes = 3 - tentativas
-                    erro = f"E-mail ou Senha incorretos. Você tem mais {restantes} tentativa(s) antes do bloqueio temporário."
-        except Exception as e:
-            erro = f"Erro de conexão ou processamento: {e}"
+                    tentativas = session.get("tentativas_erro", 0) + 1
+                    session["tentativas_erro"] = tentativas
+
+                    if tentativas >= 3:
+                        modulo_reset = True
+                        erro = "Você excedeu 3 tentativas incorretas. Confirme seu CPF abaixo para cadastrar uma nova senha."
+                    else:
+                        restantes = 3 - tentativas
+                        erro = f"E-mail ou Senha incorretos. Você tem mais {restantes} tentativa(s) antes do bloqueio."
+            except Exception as e:
+                erro = f"Erro de conexão ou processamento: {e}"
+
+        elif acao == "redefinir":
+            input_email = session.get("email_bloqueado", "").strip().lower()
+            input_cpf_raw = re.sub(r'\D', '', request.form.get("cpf", "").strip())
+            
+            # Ajusta para garantir 11 dígitos caso o zero inicial tenha sido ocultado
+            input_cpf = input_cpf_raw.zfill(11) if len(input_cpf_raw) < 11 else input_cpf_raw
+            nova_senha = request.form.get("nova_senha", "").strip()
+
+            if not validar_cpf(input_cpf):
+                modulo_reset = True
+                erro = "O CPF digitado é inválido. Digite os 11 números corretamente."
+            else:
+                try:
+                    planilha = conectar_google_sheets()
+                    aba_usuarios = planilha.worksheet("Usuarios")
+                    
+                    # Usamos get_all_values() para ler tudo como texto bruto e evitar que o gspread corte o zero inicial
+                    linhas = aba_usuarios.get_all_values()
+
+                    if not linhas:
+                        modulo_reset = True
+                        erro = "Aba de usuários está vazia."
+                    else:
+                        cabecalhos = [h.upper().strip() for h in linhas[0]]
+                        idx_email = cabecalhos.index("EMAIL") if "EMAIL" in cabecalhos else None
+                        idx_cpf = cabecalhos.index("CPF") if "CPF" in cabecalhos else None
+                        idx_senha = cabecalhos.index("SENHA") if "SENHA" in cabecalhos else None
+
+                        if idx_cpf is None or idx_senha is None or idx_email is None:
+                            modulo_reset = True
+                            erro = "Erro de configuração: Colunas EMAIL, CPF ou SENHA não encontradas na planilha."
+                        else:
+                            linha_encontrada = None
+
+                            for idx_linha, linha in enumerate(linhas[1:], start=2):
+                                email_planilha = str(linha[idx_email]).strip().lower() if len(linha) > idx_email else ""
+                                cpf_planilha_raw = re.sub(r'\D', '', str(linha[idx_cpf]).strip()) if len(linha) > idx_cpf else ""
+                                cpf_planilha = cpf_planilha_raw.zfill(11) if len(cpf_planilha_raw) < 11 and cpf_planilha_raw else cpf_planilha_raw
+
+                                # Comparação flexível: confere e-mail e confere se os números do CPF batem
+                                if email_planilha == input_email and (cpf_planilha == input_cpf or cpf_planilha_raw == input_cpf_raw):
+                                    linha_encontrada = idx_linha
+                                    break
+
+                            if linha_encontrada:
+                                # Atualiza a célula correspondente à coluna SENHA (índice base 1)
+                                aba_usuarios.update_cell(linha_encontrada, idx_senha + 1, nova_senha)
+                                session.pop("tentativas_erro", None)
+                                session.pop("email_bloqueado", None)
+                                sucesso = "Senha redefinida com sucesso! Faça login com a sua nova senha."
+                                modulo_reset = False
+                            else:
+                                modulo_reset = True
+                                erro = "CPF não confere com o e-mail informado. Verifique os dados digitados."
+                except Exception as e:
+                    modulo_reset = True
+                    erro = f"Erro ao atualizar a senha no Google Sheets: {e}"
 
     return render_template_string(
         TEMPLATE_HTML,
-        erro=erro
+        erro=erro,
+        sucesso=sucesso,
+        modulo_reset=modulo_reset,
+        email_tentativa=email_tentativa
     )
 
 @app.route("/modulo/<nome_modulo>")

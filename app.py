@@ -1,3 +1,5 @@
+import json
+import os
 from datetime import datetime
 import re
 import urllib.parse
@@ -21,7 +23,12 @@ escopos = [
 ]
 
 def conectar_google_sheets():
-    credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
+    if 'GOOGLE_CREDENTIALS' in os.environ:
+        credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
+        credenciais = Credentials.from_service_account_info(credenciais_dict, scopes=escopos)
+    else:
+        credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
+    
     cliente = gspread.authorize(credenciais)
     return cliente.open("PM e RIO Novo")
 

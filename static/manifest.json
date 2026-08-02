@@ -1,0 +1,15 @@
+{
+  "short_name": "PM e RIO",
+  "name": "Sistema PM e RIO - Novo Mundo",
+  "icons": [
+    {
+      "src": "/static/logo.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#1a252f",
+  "theme_color": "#1a252f",
+  "display": "standalone"
+}

@@ -107,6 +107,37 @@ TEMPLATE_HTML = """
 
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        /* --- ESTILO MENU FIXO NO RODAPÉ (MOBILE) --- */
+        @media (max-width: 768px) {
+            .nav, .nav-tabs, .navbar-nav, .menu-container {
+                position: fixed !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                right: 0 !important;
+                top: auto !important;
+                z-index: 9999 !important;
+                background-color: #1a252f !important;
+                display: flex !important;
+                justify-content: space-around !important;
+                align-items: center !important;
+                padding: 6px 0 !important;
+                margin: 0 !important;
+                box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.2) !important;
+                border: none !important;
+            }
+
+            .nav-link, .nav-item, .btn-menu {
+                font-size: 11px !important;
+                padding: 8px 4px !important;
+                text-align: center !important;
+                color: #ffffff !important;
+                flex: 1 !important;
+            }
+
+            body {
+                padding-bottom: 70px !important;
+            }
+        }
         body { 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; 
             background: #f0f2f5;

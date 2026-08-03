@@ -459,6 +459,10 @@ def login():
     modulo_reset = False
     email_tentativa = session.get("email_bloqueado", "")
 
+    # Se já atingiu 3 erros no estado de sessão, mantém na tela de redefinição ao carregar via GET
+    if session.get("tentativas_erro", 0) >= 3:
+        modulo_reset = True
+
     if request.method == "POST":
         acao = request.form.get("acao", "login")
 
@@ -517,7 +521,6 @@ def login():
                     planilha = conectar_google_sheets()
                     aba_usuarios = planilha.worksheet("Usuarios")
                     
-                    # Usamos get_all_values() para ler tudo como texto bruto e evitar que o gspread corte o zero inicial
                     linhas = aba_usuarios.get_all_values()
 
                     if not linhas:
@@ -540,14 +543,18 @@ def login():
                                 cpf_planilha_raw = re.sub(r'\D', '', str(linha[idx_cpf]).strip()) if len(linha) > idx_cpf else ""
                                 cpf_planilha = cpf_planilha_raw.zfill(11) if len(cpf_planilha_raw) < 11 and cpf_planilha_raw else cpf_planilha_raw
 
-                                # Comparação flexível: confere e-mail e confere se os números do CPF batem
                                 if email_planilha == input_email and (cpf_planilha == input_cpf or cpf_planilha_raw == input_cpf_raw):
                                     linha_encontrada = idx_linha
                                     break
 
                             if linha_encontrada:
-                                # Atualiza a célula correspondente à coluna SENHA (índice base 1)
-                                aba_usuarios.update_cell(linha_encontrada, idx_senha + 1, nova_senha)
+                                # Correção de compatibilidade do gspread para atualizar a célula com suporte universal de versão
+                                try:
+                                    aba_usuarios.update_cell(linha_encontrada, idx_senha + 1, str(nova_senha))
+                                except Exception:
+                                    # Fallback caso a versão do gspread exija o método update com notação A1
+                                    aba_usuarios.update(f"{chr(65 + idx_senha)}{linha_encontrada}", [[str(nova_senha)]])
+                                
                                 session.pop("tentativas_erro", None)
                                 session.pop("email_bloqueado", None)
                                 sucesso = "Senha redefinida com sucesso! Faça login com a sua nova senha."

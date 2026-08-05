@@ -22,6 +22,7 @@ NOMES_MODULOS = {
     "pm": "Plano de Manutenção",
     "valores": "Tabela de Valores",
     "informes": "Informes e Circulares",
+    "fichatecnica": "Ficha Técnica",
     "argumentos": "Argumentos de Venda"
 }
 
@@ -413,6 +414,9 @@ TEMPLATE_HTML = """
                 <li class="drawer-item {% if modulo_ativo == 'informes' %}active{% endif %}">
                     <a href="/modulo/informes" onclick="closeDrawer()"><span class="drawer-icon">📢</span> Informes e Circulares</a>
                 </li>
+                <li class="drawer-item {% if modulo_ativo == 'fichatecnica' %}active{% endif %}">
+                    <a href="/modulo/fichatecnica" onclick="closeDrawer()"><span class="drawer-icon">📋</span> Ficha Técnica</a>
+                </li>
                 <li class="drawer-item {% if modulo_ativo == 'argumentos' %}active{% endif %}">
                     <a href="/modulo/argumentos" onclick="closeDrawer()"><span class="drawer-icon">💡</span> Argumentos de Venda</a>
                 </li>
@@ -459,7 +463,6 @@ def login():
     modulo_reset = False
     email_tentativa = session.get("email_bloqueado", "")
 
-    # Se já atingiu 3 erros no estado de sessão, mantém na tela de redefinição ao carregar via GET
     if session.get("tentativas_erro", 0) >= 3:
         modulo_reset = True
 
@@ -509,7 +512,6 @@ def login():
             input_email = session.get("email_bloqueado", "").strip().lower()
             input_cpf_raw = re.sub(r'\D', '', request.form.get("cpf", "").strip())
             
-            # Ajusta para garantir 11 dígitos caso o zero inicial tenha sido ocultado
             input_cpf = input_cpf_raw.zfill(11) if len(input_cpf_raw) < 11 else input_cpf_raw
             nova_senha = request.form.get("nova_senha", "").strip()
 
@@ -548,11 +550,9 @@ def login():
                                     break
 
                             if linha_encontrada:
-                                # Correção de compatibilidade do gspread para atualizar a célula com suporte universal de versão
                                 try:
                                     aba_usuarios.update_cell(linha_encontrada, idx_senha + 1, str(nova_senha))
                                 except Exception:
-                                    # Fallback caso a versão do gspread exija o método update com notação A1
                                     aba_usuarios.update(f"{chr(65 + idx_senha)}{linha_encontrada}", [[str(nova_senha)]])
                                 
                                 session.pop("tentativas_erro", None)
@@ -592,7 +592,7 @@ def acessar_modulo(nome_modulo):
 
             pilulas_rio = []
             for item in produtos_rio:
-                p_nome = item.get("PRODUTO", "")
+                p_nome = str(item.get("PRODUTO", "")).strip()
                 if p_nome:
                     active_cls = "active" if p_nome == produto_selecionado else ""
                     pilulas_rio.append(f'<a href="/modulo/rio?produto={urllib.parse.quote(p_nome)}" class="submodulo-pill {active_cls}">{p_nome}</a>')
@@ -605,7 +605,7 @@ def acessar_modulo(nome_modulo):
             """
 
             if produto_selecionado:
-                item_escolhido = next((item for item in produtos_rio if str(item.get("PRODUTO", "")) == produto_selecionado), None)
+                item_escolhido = next((item for item in produtos_rio if str(item.get("PRODUTO", "")).strip() == produto_selecionado), None)
 
                 if item_escolhido:
                     prod = item_escolhido.get("PRODUTO", "")
@@ -621,7 +621,7 @@ def acessar_modulo(nome_modulo):
 
                     def destacar_termos(texto):
                         if not texto: return ""
-                        texto_formatado = re.sub(r"(Foco:)", r"<b>\1</b>", texto, flags=re.IGNORECASE)
+                        texto_formatado = re.sub(r"(Foco:)", r"<b>\1</b>", str(texto), flags=re.IGNORECASE)
                         texto_formatado = re.sub(r"(Descrição:)", r"<b>\1</b>", texto_formatado, flags=re.IGNORECASE)
                         texto_formatado = re.sub(r"(Funcionalidades:)", r"<b>\1</b>", texto_formatado, flags=re.IGNORECASE)
                         texto_formatado = re.sub(r"(Diferencial Estratégico:|Diferencial Estrategico:)", r"<b>\1</b>", texto_formatado, flags=re.IGNORECASE)
@@ -639,7 +639,7 @@ def acessar_modulo(nome_modulo):
                     validade_texto = f"{mes_vigente}/{ano_vigente}"
 
                     texto_whatsapp = f"📦 *Produto:* 🔧 {prod}\n\n🎯 *Foco:* {foco}\n\n📝 *Descrição:* {descricao}\n\n💰 *Valor:* {valor}\n\n⚠️ *Nota:* Proposta válida para {validade_texto}.\n\n🎬 *Assista ao vídeo explicativo aqui:* {video}\n\n👤 *Contato:* {contato_texto}"
-                    link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(texto_whatsapp)
+                    link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(str(texto_whatsapp))
                     url_video_embed = converter_para_embed(video)
 
                     btn_ver_video = f'<button type="button" class="btn-acao btn-video" onclick="abrirVideoModal(\'{url_video_embed}\')">▶ Assistir Vídeo</button>' if video else ""
@@ -684,7 +684,7 @@ def acessar_modulo(nome_modulo):
                 else:
                     conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Produto não encontrado.</p></div>'
             else:
-                botoes_produtos = "".join([f'<a href="/modulo/rio?produto={item.get("PRODUTO", "")}" class="submenu-btn">{item.get("PRODUTO", "")}</a>' for item in produtos_rio if item.get("PRODUTO")])
+                botoes_produtos = "".join([f'<a href="/modulo/rio?produto={urllib.parse.quote(str(item.get("PRODUTO", "")))}" class="submenu-btn">{item.get("PRODUTO", "")}</a>' for item in produtos_rio if item.get("PRODUTO")])
                 conteudo = f"""
                 <div>
                     <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Telemetria RIO — Selecione um Produto</h2>
@@ -705,7 +705,7 @@ def acessar_modulo(nome_modulo):
 
             pilulas_pm = []
             for item in produtos_pm:
-                p_nome = item.get("PRODUTO", "")
+                p_nome = str(item.get("PRODUTO", "")).strip()
                 if p_nome:
                     active_cls = "active" if p_nome == produto_selecionado else ""
                     pilulas_pm.append(f'<a href="/modulo/pm?produto={urllib.parse.quote(p_nome)}" class="submodulo-pill {active_cls}">{p_nome}</a>')
@@ -718,7 +718,7 @@ def acessar_modulo(nome_modulo):
             """
 
             if produto_selecionado:
-                item_escolhido = next((item for item in produtos_pm if str(item.get("PRODUTO", "")) == produto_selecionado), None)
+                item_escolhido = next((item for item in produtos_pm if str(item.get("PRODUTO", "")).strip() == produto_selecionado), None)
 
                 if item_escolhido:
                     prod = item_escolhido.get("PRODUTO", "")
@@ -734,7 +734,7 @@ def acessar_modulo(nome_modulo):
 
                     def destacar_termos(texto):
                         if not texto: return ""
-                        texto_formatado = re.sub(r"(Foco:)", r"<b>\1</b>", texto, flags=re.IGNORECASE)
+                        texto_formatado = re.sub(r"(Foco:)", r"<b>\1</b>", str(texto), flags=re.IGNORECASE)
                         texto_formatado = re.sub(r"(Descrição:)", r"<b>\1</b>", texto_formatado, flags=re.IGNORECASE)
                         texto_formatado = re.sub(r"(Funcionalidades:)", r"<b>\1</b>", texto_formatado, flags=re.IGNORECASE)
                         texto_formatado = re.sub(r"(Diferencial Estratégico:|Diferencial Estrategico:)", r"<b>\1</b>", texto_formatado, flags=re.IGNORECASE)
@@ -754,7 +754,7 @@ def acessar_modulo(nome_modulo):
                     validade_texto = f"{mes_vigente}/{ano_vigente}"
 
                     texto_whatsapp = f"📦 *Plano de Manutenção:* 🔧 {prod}\n\n🎯 *Foco:* {foco}\n\n📝 *Descrição:* {descricao}\n\n🛡️ *Coberturas:* {coberturas}\n\n⚠️ *Nota:* Proposta válida para {validade_texto}.\n\n🎬 *Assista ao vídeo explicativo aqui:* {video}\n\n👤 *Contato:* {contato_texto}"
-                    link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(texto_whatsapp)
+                    link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(str(texto_whatsapp))
                     url_video_embed = converter_para_embed(video)
 
                     btn_ver_video = f'<button type="button" class="btn-acao btn-video" onclick="abrirVideoModal(\'{url_video_embed}\')">▶ Assistir Vídeo</button>' if video else ""
@@ -809,7 +809,7 @@ def acessar_modulo(nome_modulo):
                 else:
                     conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Plano não encontrado.</p></div>'
             else:
-                botoes_produtos = "".join([f'<a href="/modulo/pm?produto={item.get("PRODUTO", "")}" class="submenu-btn">{item.get("PRODUTO", "")}</a>' for item in produtos_pm if item.get("PRODUTO")])
+                botoes_produtos = "".join([f'<a href="/modulo/pm?produto={urllib.parse.quote(str(item.get("PRODUTO", "")))}" class="submenu-btn">{item.get("PRODUTO", "")}</a>' for item in produtos_pm if item.get("PRODUTO")])
                 conteudo = f"""
                 <div>
                     <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Plano de Manutenção — Selecione um Plano</h2>
@@ -848,7 +848,7 @@ def acessar_modulo(nome_modulo):
 
             pilulas_valores = []
             for item in dados_precos:
-                v_nome = item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO") or ""
+                v_nome = str(item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO") or "").strip()
                 if v_nome:
                     active_cls = "active" if v_nome == produto_selecionado else ""
                     pilulas_valores.append(f'<a href="/modulo/valores?produto={urllib.parse.quote(v_nome)}" class="submodulo-pill {active_cls}">{v_nome}</a>')
@@ -861,7 +861,7 @@ def acessar_modulo(nome_modulo):
             """
 
             if produto_selecionado:
-                item_escolhido = next((item for item in dados_precos if (item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO") or "") == produto_selecionado), None)
+                item_escolhido = next((item for item in dados_precos if str(item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO") or "").strip() == produto_selecionado), None)
 
                 if item_escolhido:
                     titulo_principal = (
@@ -872,32 +872,9 @@ def acessar_modulo(nome_modulo):
                         or "Detalhes do Item"
                     )
                     periodo_val = item_escolhido.get("PERIODO", "")
-                    valor_ficha_bruto = (
-                        item_escolhido.get("FICHA", "")
-                        or item_escolhido.get("FICHA TÉCNICA", "")
-                        or item_escolhido.get("FICHA TECNICA", "")
-                        or item_escolhido.get("FICHA_TECNICA", "")
-                        or item_escolhido.get("PDF", "")
-                    )
-
-                    link_ficha_tecnica = valor_ficha_bruto
-                    if valor_ficha_bruto and not valor_ficha_bruto.startswith("http"):
-                        link_ficha_tecnica = f"https://drive.google.com/drive/search?q={urllib.parse.quote(valor_ficha_bruto)}"
-
+                    
+                    # Removido o bloco da ficha técnica (Abrir PDF e Enviar WhatsApp) conforme solicitado[cite: 5]
                     bloco_ficha_tecnica_html = ""
-                    if valor_ficha_bruto:
-                        texto_wpp_ficha = f"📄 *Ficha Técnica - {titulo_principal}*\n\nConsulte o documento completo no link abaixo:\n{link_ficha_tecnica}"
-                        link_wpp_ficha = f"https://api.whatsapp.com/send?text={urllib.parse.quote(texto_wpp_ficha)}"
-
-                        bloco_ficha_tecnica_html = f"""
-                        <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 12px; margin-bottom: 14px;">
-                            <div class="detalhe-label" style="color: #002244; margin-bottom: 6px;">Ficha Técnica (PDF)</div>
-                            <div class="acoes-ficha-tecnica">
-                                <a href="{link_ficha_tecnica}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📂 ABRIR PDF</a>
-                                <a href="{link_wpp_ficha}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-wpp-pdf">📤 ENVIAR VIA WHATSAPP</a>
-                            </div>
-                        </div>
-                        """
 
                     km_geral_val = item_escolhido.get("KM", "")
                     planos_km_info = [
@@ -1017,7 +994,7 @@ def acessar_modulo(nome_modulo):
                             { '<div style="font-size: 13px; font-weight: 700; color: #4a5568; margin-bottom: 6px; text-transform: uppercase;">Valores por Quilometragem (KM)</div>' if cards_km_html else '' }
                             <div class="grid-planos">{cards_km_html}</div>
 
-                            { '<div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; margin-top: 18px; margin-bottom: 14px;"><div style="display: flex; gap: 10px;"><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Horas (H)</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + hora_geral_val + '</div></div><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Período do Contrato</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + periodo_val + ' Meses</div></div></div></div>' if hora_geral_val else '' }
+                            { '<div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; margin-top: 18px; margin-bottom: 14px;"><div style="display: flex; gap: 10px;"><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Horas (H)</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + str(hora_geral_val) + '</div></div><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Período do Contrato</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + str(periodo_val) + ' Meses</div></div></div></div>' if hora_geral_val else '' }
 
                             { '<div style="font-size: 13px; font-weight: 700; color: #4a5568; margin-top: 10px; margin-bottom: 6px; text-transform: uppercase;">Valores por Horas (H)</div>' if cards_horas_html else '' }
                             <div class="grid-planos">{cards_horas_html}</div>
@@ -1027,7 +1004,7 @@ def acessar_modulo(nome_modulo):
                 else:
                     conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Item não encontrado.</p></div>'
             else:
-                botoes_itens = "".join([f'<a href="/modulo/valores?produto={item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO")}" class="submenu-btn">{item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO")}</a>' for item in dados_precos if (item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO"))])
+                botoes_itens = "".join([f'<a href="/modulo/valores?produto={urllib.parse.quote(str(item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO")))}" class="submenu-btn">{item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO")}</a>' for item in dados_precos if (item.get("MODELO") or item.get("PRODUTO") or item.get("ITEM") or item.get("PLANO"))])
                 conteudo = f"""
                 <div>
                     <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Tabela de Valores — Selecione um Modelo</h2>
@@ -1048,7 +1025,7 @@ def acessar_modulo(nome_modulo):
 
             pilulas_informes = []
             for item in dados_informes:
-                inf_nome = item.get("ASSUNTO", "")
+                inf_nome = str(item.get("ASSUNTO", "")).strip()
                 if inf_nome:
                     active_cls = "active" if inf_nome == informe_selecionado else ""
                     pilulas_informes.append(f'<a href="/modulo/informes?item={urllib.parse.quote(inf_nome)}" class="submodulo-pill {active_cls}">{inf_nome}</a>')
@@ -1061,7 +1038,7 @@ def acessar_modulo(nome_modulo):
             """
 
             if informe_selecionado:
-                item_escolhido = next((item for item in dados_informes if str(item.get("ASSUNTO", "")) == informe_selecionado), None)
+                item_escolhido = next((item for item in dados_informes if str(item.get("ASSUNTO", "")).strip() == informe_selecionado), None)
 
                 if item_escolhido:
                     assunto_val = item_escolhido.get("ASSUNTO", "")
@@ -1102,7 +1079,7 @@ def acessar_modulo(nome_modulo):
                 else:
                     conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Informe não encontrado.</p></div>'
             else:
-                botoes_informes = "".join([f'<a href="/modulo/informes?item={item.get("ASSUNTO", "")}" class="submenu-btn">{item.get("ASSUNTO", "")}</a>' for item in dados_informes if item.get("ASSUNTO")])
+                botoes_informes = "".join([f'<a href="/modulo/informes?item={urllib.parse.quote(str(item.get("ASSUNTO", "")))}" class="submenu-btn">{item.get("ASSUNTO", "")}</a>' for item in dados_informes if item.get("ASSUNTO")])
                 conteudo = f"""
                 <div>
                     <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Informes e Circulares — Avisos e Comunicados</h2>
@@ -1123,7 +1100,7 @@ def acessar_modulo(nome_modulo):
 
             pilulas_argumentos = []
             for item in dados_argumentos:
-                arg_nome = item.get("QUESTIONAMENTO", "")
+                arg_nome = str(item.get("QUESTIONAMENTO", "")).strip()
                 if arg_nome:
                     active_cls = "active" if arg_nome == argumento_selecionado else ""
                     pilulas_argumentos.append(f'<a href="/modulo/argumentos?item={urllib.parse.quote(arg_nome)}" class="submodulo-pill {active_cls}">{arg_nome}</a>')
@@ -1136,7 +1113,7 @@ def acessar_modulo(nome_modulo):
             """
 
             if argumento_selecionado:
-                item_escolhido = next((item for item in dados_argumentos if str(item.get("QUESTIONAMENTO", "")) == argumento_selecionado), None)
+                item_escolhido = next((item for item in dados_argumentos if str(item.get("QUESTIONAMENTO", "")).strip() == argumento_selecionado), None)
 
                 if item_escolhido:
                     pergunta_val = item_escolhido.get("QUESTIONAMENTO", "")
@@ -1146,7 +1123,7 @@ def acessar_modulo(nome_modulo):
                     contato_texto = f"{nome_vendedor}, Torre de Controle da Novo Mundo Caminhões - 📞 (81) 99686-0674"
 
                     texto_whatsapp = f"💡 *Questionamento:* {pergunta_val}\n\n💬 *Resposta / Argumento:* {resposta_val}\n\n👤 *Contato:* {contato_texto}"
-                    link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(texto_whatsapp)
+                    link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(str(texto_whatsapp))
 
                     btn_enviar_wpp = f"""
                     <div style="margin-top: 14px;">
@@ -1177,7 +1154,7 @@ def acessar_modulo(nome_modulo):
                 else:
                     conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Argumento não encontrado.</p></div>'
             else:
-                botoes_argumentos = "".join([f'<a href="/modulo/argumentos?item={item.get("QUESTIONAMENTO", "")}" class="submenu-btn">{item.get("QUESTIONAMENTO", "")}</a>' for item in dados_argumentos if item.get("QUESTIONAMENTO")])
+                botoes_argumentos = "".join([f'<a href="/modulo/argumentos?item={urllib.parse.quote(str(item.get("QUESTIONAMENTO", "")))}" class="submenu-btn">{item.get("QUESTIONAMENTO", "")}</a>' for item in dados_argumentos if item.get("QUESTIONAMENTO")])
                 conteudo = f"""
                 <div>
                     <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Argumentos de Venda — Objeções e Respostas</h2>
@@ -1187,6 +1164,177 @@ def acessar_modulo(nome_modulo):
                 """
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar os dados da aba Argumentos:</b> {e}</div>'
+
+    elif nome_modulo == "fichatecnica":
+        tipo_selecionado = request.args.get("tipo")
+        categoria_selecionada = request.args.get("categoria")
+        modelo_selecionado = request.args.get("modelo")
+
+        try:
+            planilha = conectar_google_sheets()
+            aba_modelos = planilha.worksheet("Modelos")
+            dados_modelos = aba_modelos.get_all_records()
+
+            tipos_disponiveis = sorted(list(set(str(item.get("TIPO", "")).strip() for item in dados_modelos if str(item.get("TIPO", "")).strip())))
+
+            if not tipo_selecionado:
+                botoes_tipos = "".join([f'<a href="/modulo/fichatecnica?tipo={urllib.parse.quote(t)}" class="submenu-btn">{t}</a>' for t in tipos_disponiveis])
+                conteudo = f"""
+                <div>
+                    <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Ficha Técnica — Selecione a Categoria</h2>
+                    <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Escolha abaixo entre Caminhões ou Ônibus para visualizar as categorias:</p>
+                    <div class="submenus-grid">{botoes_tipos}</div>
+                </div>
+                """
+            elif not categoria_selecionada:
+                modelos_do_tipo = [item for item in dados_modelos if str(item.get("TIPO", "")).strip().lower() == tipo_selecionado.lower()]
+                categorias_disponiveis = sorted(list(set(str(item.get("CATEGORIA", "")).strip() for item in modelos_do_tipo if str(item.get("CATEGORIA", "")).strip())))
+
+                botoes_categorias = "".join([f'<a href="/modulo/fichatecnica?tipo={urllib.parse.quote(tipo_selecionado)}&categoria={urllib.parse.quote(c)}" class="submenu-btn">{c}</a>' for c in categorias_disponiveis])
+                conteudo = f"""
+                <div>
+                    <div style="margin-bottom: 10px;">
+                        <a href="/modulo/fichatecnica" style="font-size: 13px; font-weight: 600; color: #0066cc; text-decoration: none;">← Voltar para Tipos</a>
+                    </div>
+                    <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">{tipo_selecionado} — Selecione a Linha / Categoria</h2>
+                    <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Escolha abaixo a categoria para ver os modelos correspondentes:</p>
+                    <div class="submenus-grid">{botoes_categorias}</div>
+                </div>
+                """
+            else:
+                modelos_filtrados = [
+                    item for item in dados_modelos 
+                    if str(item.get("TIPO", "")).strip().lower() == tipo_selecionado.lower() 
+                    and str(item.get("CATEGORIA", "")).strip().lower() == categoria_selecionada.lower()
+                ]
+
+                pilulas_modelos = []
+                for item in modelos_filtrados:
+                    m_nome = str(item.get("MODELO", "")).strip()
+                    if m_nome:
+                        active_cls = "active" if m_nome == modelo_selecionado else ""
+                        pilulas_modelos.append(f'<a href="/modulo/fichatecnica?tipo={urllib.parse.quote(tipo_selecionado)}&categoria={urllib.parse.quote(categoria_selecionada)}&modelo={urllib.parse.quote(m_nome)}" class="submodulo-pill {active_cls}">{m_nome}</a>')
+                
+                nav_superior_html = f"""
+                <div style="margin-bottom: 10px; display: flex; gap: 15px;">
+                    <a href="/modulo/fichatecnica" style="font-size: 13px; font-weight: 600; color: #0066cc; text-decoration: none;">← Tipos</a>
+                    <a href="/modulo/fichatecnica?tipo={urllib.parse.quote(tipo_selecionado)}" style="font-size: 13px; font-weight: 600; color: #0066cc; text-decoration: none;">← Categorias de {tipo_selecionado}</a>
+                </div>
+                <div class="submodulo-nav-container">
+                    <div class="submodulo-nav-label">Navegação — Modelos ({categoria_selecionada})</div>
+                    <div class="submodulo-nav-scroll">{"".join(pilulas_modelos)}</div>
+                </div>
+                """
+
+                if modelo_selecionado:
+                    item_escolhido = next((item for item in modelos_filtrados if str(item.get("MODELO", "")).strip() == modelo_selecionado), None)
+
+                    if item_escolhido:
+                        m_tipo = item_escolhido.get("TIPO", "")
+                        m_categoria = item_escolhido.get("CATEGORIA", "")
+                        m_modelo = item_escolhido.get("MODELO", "")
+                        m_descricao = item_escolhido.get("DESCRIÇÃO", "") or item_escolhido.get("DESCRICAO", "")
+                        m_eficiencia = item_escolhido.get("EFICIÊNCIA", "") or item_escolhido.get("EFICIENCIA", "")
+                        m_conforto = item_escolhido.get("CONFORTO", "")
+                        
+                        m_seguranca_ativa = item_escolhido.get("SEGURANÇA ATIVA", "") or item_escolhido.get("SEGURANCA ATIVA", "")
+                        m_tecnologia = item_escolhido.get("TECNOLOGIA", "")
+                        
+                        m_link = item_escolhido.get("LINK", "")
+
+                        link_pdf = m_link
+                        if m_link and not str(m_link).startswith("http"):
+                            link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(str(m_link))}"
+
+                        bloco_pdf_html = ""
+                        if m_link:
+                            texto_wpp_ft = (
+                                f"📋 *Ficha Técnica - {m_modelo}*\n\n"
+                                f"*Tipo:* {m_tipo} | *Categoria:* {m_categoria}\n\n"
+                                f"*DESCRIÇÃO:*\n{m_descricao}\n\n"
+                                f"*EFICIÊNCIA:*\n{m_eficiencia}\n\n"
+                                f"*CONFORTO:*\n{m_conforto}\n\n"
+                                f"*SEGURANÇA ATIVA:*\n{m_seguranca_ativa}\n\n"
+                                f"*TECNOLOGIA:*\n{m_tecnologia}\n\n"
+                                f"📄 *Ficha Técnica (PDF):* {link_pdf}"
+                            )
+                            link_wpp_ft = f"https://api.whatsapp.com/send?text={urllib.parse.quote(str(texto_wpp_ft))}"
+
+                            bloco_pdf_html = f"""
+                            <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 12px; margin-top: 14px;">
+                                <div class="detalhe-label" style="color: #002244; margin-bottom: 6px;">Documento / Ficha Técnica (PDF)</div>
+                                <div class="acoes-ficha-tecnica">
+                                    <a href="{link_pdf}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📂 ABRIR PDF</a>
+                                    <a href="{link_wpp_ft}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-wpp-pdf">📤 ENVIAR VIA WHATSAPP</a>
+                                </div>
+                            </div>
+                            """
+
+                        conteudo = f"""
+                        <div>
+                            {nav_superior_html}
+                            <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Ficha Técnica do Modelo</h2>
+                            
+                            <div class="produto-detalhe-card">
+                                <div class="detalhe-linha">
+                                    <div class="detalhe-label">Modelo</div>
+                                    <div class="detalhe-valor detalhe-produto-nome" style="font-size: 19px; color: #002244;">{m_modelo}</div>
+                                </div>
+
+                                <div style="display: flex; gap: 10px; margin-bottom: 12px;">
+                                    <div style="flex: 1; background: #f7fafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #edf2f7;">
+                                        <div class="detalhe-label">Tipo</div>
+                                        <div class="detalhe-valor" style="font-weight: 600;">{m_tipo}</div>
+                                    </div>
+                                    <div style="flex: 1; background: #f7fafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #edf2f7;">
+                                        <div class="detalhe-label">Categoria</div>
+                                        <div class="detalhe-valor" style="font-weight: 600;">{m_categoria}</div>
+                                    </div>
+                                </div>
+                                
+                                <div class="detalhe-linha">
+                                    <div class="detalhe-label">Descrição</div>
+                                    <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_descricao}</div>
+                                </div>
+
+                                <div class="detalhe-linha">
+                                    <div class="detalhe-label">Eficiência</div>
+                                    <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_eficiencia}</div>
+                                </div>
+
+                                <div class="detalhe-linha">
+                                    <div class="detalhe-label">Conforto</div>
+                                    <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_conforto}</div>
+                                </div>
+
+                                <div class="detalhe-linha">
+                                    <div class="detalhe-label">Segurança Ativa</div>
+                                    <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_seguranca_ativa}</div>
+                                </div>
+
+                                <div class="detalhe-linha" style="border-bottom: none; margin-bottom: 0; padding-bottom: 0;">
+                                    <div class="detalhe-label">Tecnologia</div>
+                                    <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_tecnologia}</div>
+                                </div>
+                                
+                                {bloco_pdf_html}
+                            </div>
+                        </div>
+                        """
+                    else:
+                        conteudo = f'<div>{nav_superior_html}<p style="color: #c53030;">Modelo não encontrado.</p></div>'
+                else:
+                    botoes_modelos = "".join([f'<a href="/modulo/fichatecnica?tipo={urllib.parse.quote(tipo_selecionado)}&categoria={urllib.parse.quote(categoria_selecionada)}&modelo={urllib.parse.quote(str(item.get("MODELO", "")))}" class="submenu-btn">{item.get("MODELO", "")}</a>' for item in modelos_filtrados if item.get("MODELO")])
+                    conteudo = f"""
+                    <div>
+                        {nav_superior_html}
+                        <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; margin-bottom: 14px; font-size: 17px;">Modelos da Categoria: {categoria_selecionada}</h2>
+                        <p style="color: #4a5568; font-size: 13px; margin-bottom: 14px;">Escolha abaixo o modelo desejado para consultar suas especificações completas:</p>
+                        <div class="submenus-grid">{botoes_modelos}</div>
+                    </div>
+                    """
+        except Exception as e:
+            conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar os dados da aba Modelos:</b> {e}</div>'
 
     else:
         conteudo = f"""

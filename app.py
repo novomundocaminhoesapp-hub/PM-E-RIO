@@ -58,6 +58,24 @@ def conectar_google_sheets():
     cliente = gspread.authorize(credenciais)
     return cliente.open("PM e RIO Novo")
 
+def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
+    """Registra o log de acesso na aba 'LogsAcessos' do Google Sheets[cite: 8]."""
+    try:
+        planilha = conectar_google_sheets()
+        try:
+            aba_logs = planilha.worksheet("LogsAcessos")
+        except gspread.exceptions.WorksheetNotFound:
+            aba_logs = planilha.add_worksheet(title="LogsAcessos", rows=1000, cols=4)
+            aba_logs.append_row(["NOME", "DATA", "HORA", "AÇÃO"])
+        
+        agora = datetime.now()
+        data_str = agora.strftime("%d/%m/%Y")
+        hora_str = agora.strftime("%H:%M:%S")
+        
+        aba_logs.append_row([str(nome_usuario), data_str, hora_str, str(acao_texto)])
+    except Exception as e:
+        print(f"Erro ao registrar log de acesso: {e}")
+
 def converter_para_embed(url):
     if not url:
         return ""
@@ -494,6 +512,10 @@ def login():
                     session["logado"] = True
                     session["nome"] = usuario_encontrado.get("NOME")
                     session["perfil"] = usuario_encontrado.get("PERFIL")
+                    
+                    # Registra o log de acesso na aba "LogsAcessos"[cite: 8]
+                    registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
+
                     return redirect(url_for("acessar_modulo", nome_modulo="rio"))
                 else:
                     tentativas = session.get("tentativas_erro", 0) + 1
@@ -873,7 +895,6 @@ def acessar_modulo(nome_modulo):
                     )
                     periodo_val = item_escolhido.get("PERIODO", "")
                     
-                    # Removido o bloco da ficha técnica (Abrir PDF e Enviar WhatsApp) conforme solicitado[cite: 5]
                     bloco_ficha_tecnica_html = ""
 
                     km_geral_val = item_escolhido.get("KM", "")

@@ -513,7 +513,6 @@ def login():
                     session["nome"] = usuario_encontrado.get("NOME")
                     session["perfil"] = usuario_encontrado.get("PERFIL")
                     
-                    # Registra o log de acesso na aba "LogsAcessos"[cite: 8]
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
 
                     return redirect(url_for("acessar_modulo", nome_modulo="rio"))
@@ -1272,11 +1271,11 @@ def acessar_modulo(nome_modulo):
                             texto_wpp_ft = (
                                 f"📋 *Ficha Técnica - {m_modelo}*\n\n"
                                 f"*Tipo:* {m_tipo} | *Categoria:* {m_categoria}\n\n"
-                                f"*DESCRIÇÃO:*\n{m_descricao}\n\n"
-                                f"*EFICIÊNCIA:*\n{m_eficiencia}\n\n"
-                                f"*CONFORTO:*\n{m_conforto}\n\n"
-                                f"*SEGURANÇA ATIVA:*\n{m_seguranca_ativa}\n\n"
-                                f"*TECNOLOGIA:*\n{m_tecnologia}\n\n"
+                                f"📝 *DESCRIÇÃO:*\n{m_descricao}\n\n"
+                                f"⚡ *EFICIÊNCIA:*\n{m_eficiencia}\n\n"
+                                f"🛋️ *CONFORTO:*\n{m_conforto}\n\n"
+                                f"🛡️ *SEGURANÇA ATIVA:*\n{m_seguranca_ativa}\n\n"
+                                f"💻 *TECNOLOGIA:*\n{m_tecnologia}\n\n"
                                 f"📄 *Ficha Técnica (PDF):* {link_pdf}"
                             )
                             link_wpp_ft = f"https://api.whatsapp.com/send?text={urllib.parse.quote(str(texto_wpp_ft))}"
@@ -1314,27 +1313,27 @@ def acessar_modulo(nome_modulo):
                                 </div>
                                 
                                 <div class="detalhe-linha">
-                                    <div class="detalhe-label">Descrição</div>
+                                    <div class="detalhe-label">📝 Descrição</div>
                                     <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_descricao}</div>
                                 </div>
 
                                 <div class="detalhe-linha">
-                                    <div class="detalhe-label">Eficiência</div>
+                                    <div class="detalhe-label">⚡ Eficiência</div>
                                     <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_eficiencia}</div>
                                 </div>
 
                                 <div class="detalhe-linha">
-                                    <div class="detalhe-label">Conforto</div>
+                                    <div class="detalhe-label">🛋️ Conforto</div>
                                     <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_conforto}</div>
                                 </div>
 
                                 <div class="detalhe-linha">
-                                    <div class="detalhe-label">Segurança Ativa</div>
+                                    <div class="detalhe-label">🛡️ Segurança Ativa</div>
                                     <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_seguranca_ativa}</div>
                                 </div>
 
                                 <div class="detalhe-linha" style="border-bottom: none; margin-bottom: 0; padding-bottom: 0;">
-                                    <div class="detalhe-label">Tecnologia</div>
+                                    <div class="detalhe-label">💻 Tecnologia</div>
                                     <div class="detalhe-valor" style="white-space: pre-line; line-height: 1.5;">{m_tecnologia}</div>
                                 </div>
                                 

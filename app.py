@@ -440,14 +440,6 @@ TEMPLATE_HTML = """
             recognition.start();
         }
 
-        function falarTexto(texto) {
-            if ('speechSynthesis' in window) {
-                var utterance = new SpeechSynthesisUtterance(texto);
-                utterance.lang = 'pt-BR';
-                window.speechSynthesis.speak(utterance);
-            }
-        }
-
         function enviarMensagemIA() {
             var input = document.getElementById('ai-user-input');
             var mensagem = input.value.trim();
@@ -467,7 +459,6 @@ TEMPLATE_HTML = """
                 var respostaBot = data.resposta || "Desculpe, ocorreu um erro.";
                 chatBody.innerHTML += `<div class="ai-msg bot">${respostaBot}</div>`;
                 chatBody.scrollTop = chatBody.scrollHeight;
-                falarTexto(respostaBot);
             })
             .catch(error => {
                 chatBody.innerHTML += `<div class="ai-msg bot">Erro de conexão com o servidor de IA.</div>`;
@@ -767,7 +758,6 @@ def acessar_modulo(nome_modulo):
     conteudo = ""
     modulo_titulo = NOMES_MODULOS.get(nome_modulo, "Início")
 
-    # Obter mapa do Drive para resolver links de PDF corretamente
     _, mapa_drive = obter_conteudo_pastas_drive()
 
     if nome_modulo == "rio":
@@ -1232,7 +1222,6 @@ def acessar_modulo(nome_modulo):
                     informacao_val = item_escolhido.get("INFORMAÇÃO", "") or item_escolhido.get("INFORMACAO", "")
                     circular_val = item_escolhido.get("CIRCULAR", "").strip()
 
-                    # Resolver link do PDF via mapa do Drive se necessário
                     link_pdf = circular_val
                     if circular_val:
                         if circular_val.lower() in mapa_drive:
@@ -1437,7 +1426,6 @@ def acessar_modulo(nome_modulo):
                         
                         m_link = str(item_escolhido.get("LINK", "")).strip()
 
-                        # Resolver link do PDF via mapa do Drive
                         link_pdf = m_link
                         if m_link:
                             if m_link.lower() in mapa_drive:
@@ -1572,7 +1560,6 @@ def chat_ia():
             try:
                 aba = planilha.worksheet(nome_aba)
                 registros = aba.get_all_records()
-                # Otimizado: converter registros em linhas de texto compactas ao invés de JSON pesado
                 linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros]
                 contexto_abas.append(f"### ABA: {nome_aba}\n" + "\n".join(linhas_texto))
             except Exception:

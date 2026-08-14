@@ -5,4 +5,4 @@ google-auth==2.29.0
 google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
-google-genai
+google-generativeai==0.8.5

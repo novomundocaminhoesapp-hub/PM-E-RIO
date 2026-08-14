@@ -7,6 +7,7 @@ import traceback
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 import gspread
 
 app = Flask(__name__)
@@ -58,6 +59,35 @@ def conectar_google_sheets():
     
     cliente = gspread.authorize(credenciais)
     return cliente.open("PM e RIO Novo")
+
+def obter_conteudo_pastas_drive():
+    """Varre o Google Drive para listar arquivos das pastas do sistema."""
+    try:
+        if 'GOOGLE_CREDENTIALS' in os.environ:
+            credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
+            credenciais = Credentials.from_service_account_info(credenciais_dict, scopes=escopos)
+        else:
+            credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
+        
+        service = build('drive', 'v3', credentials=credenciais)
+        
+        # Lista arquivos no Google Drive acessíveis pela credencial
+        results = service.files().list(
+            pageSize=200,
+            fields="files(id, name, mimeType, webViewLink, parents)"
+        ).execute()
+        files = results.get('files', [])
+        
+        lista_arquivos = []
+        for f in files:
+            nome = f.get('name')
+            link = f.get('webViewLink', '')
+            mime = f.get('mimeType', '')
+            lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}")
+            
+        return "\n".join(lista_arquivos)
+    except Exception as e:
+        return f"Não foi possível listar os arquivos do Drive: {e}"
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     """Registra o log de acesso na aba 'LogsAcessos' do Google Sheets."""
@@ -592,7 +622,7 @@ TEMPLATE_HTML = """
             
             <div id="ai-chat-messages" class="ai-chat-body">
                 <div class="ai-msg bot">
-                    Olá! Sou seu assistente especialista nos manuais, circulares e bases da Novo Mundo. Como posso te ajudar hoje? (Pode digitar ou usar o microfone 🎙️)
+                    Olá! Sou seu assistente especialista nas pastas, circulares e bases da Novo Mundo. Como posso te ajudar hoje? (Pode digitar ou usar o microfone 🎙️)
                 </div>
             </div>
 
@@ -1519,11 +1549,33 @@ def chat_ia():
         return jsonify({"resposta": "Por favor, digite ou fale uma pergunta."})
 
     try:
+        # 1. Lê dinamicamente todas as abas da planilha principal
+        planilha = conectar_google_sheets()
+        contexto_abas = []
+        abas_para_ler = ["RIO", "PM", "PM_Precos", "Informes", "Argumentos", "Modelos"]
+        
+        for nome_aba in abas_para_ler:
+            try:
+                aba = planilha.worksheet(nome_aba)
+                registros = aba.get_all_records()
+                contexto_abas.append(f"--- ABA DA PLANILHA ({nome_aba}) ---\n{json.dumps(registros, ensure_ascii=False, indent=2)}")
+            except Exception:
+                pass
+        
+        dados_planilha = "\n\n".join(contexto_abas)
+
+        # 2. Varre os arquivos e pastas do Google Drive (Circulares, Base de Conhecimento, Modelos, Doc)
+        dados_drive = obter_conteudo_pastas_drive()
+
+        base_conhecimento_geral = (
+            f"=== DADOS DA PLANILHA PRINCIPAL (PM e RIO Novo) ===\n{dados_planilha}\n\n"
+            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (CIRCULARES, BASE DE CONHECIMENTO, MODELOS, DOC) ===\n{dados_drive}"
+        )
+
         from google import genai
         from google.genai import types
         
         api_key_gemini = os.environ.get("GEMINI_API_KEY")
-        
         if not api_key_gemini:
             return jsonify({"resposta": "🚨 Erro de configuração: A chave GEMINI_API_KEY não foi encontrada nas variáveis de ambiente."})
             
@@ -1531,12 +1583,16 @@ def chat_ia():
         
         instrucao_sistema = (
             "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
-            "Responda às dúvidas da equipe com base estrita nas informações de telemetria RIO, "
-            "Planos de Manutenção, circulares e fichas técnicas."
+            "Responda às dúvidas da equipe com base absoluta na base de dados unificada abaixo, "
+            "que contém as informações das abas do Google Sheets e a lista de documentos/PDFs das pastas do Google Drive "
+            "(Circulares, Base de Conhecimento, Modelos e Doc). "
+            "Sempre que relevante, indique o nome do arquivo ou link correspondente para que o usuário possa abrir o documento oficial. "
+            "Se a resposta não constar na base abaixo, informe educadamente que não encontrou essa informação nos registros.\n\n"
+            f"{base_conhecimento_geral}"
         )
         
         resposta_gemini = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.5-flash",
             contents=pergunta_usuario,
             config=types.GenerateContentConfig(
                 system_instruction=instrucao_sistema

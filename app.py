@@ -19,6 +19,8 @@ MESES_PT = {
     9: "setembro", 10: "outubro", 11: "novembro", 12: "dezembro"
 }
 
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+
 NOMES_MODULOS = {
     "rio": "Telemetria RIO",
     "pm": "Plano de Manutenção",
@@ -1590,9 +1592,9 @@ def chat_ia():
             f"{base_conhecimento_geral}"
         )
         
-        # Utilizando o modelo oficial gemini-2.0-flash
+        # Modelo Gemini configurável por variável de ambiente (padrão: gemini-3.5-flash)
         resposta_gemini = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_MODEL,
             contents=pergunta_usuario,
             config=types.GenerateContentConfig(
                 system_instruction=instrucao_sistema

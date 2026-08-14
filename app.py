@@ -4,6 +4,7 @@ from datetime import datetime
 import re
 import urllib.parse
 import traceback
+import google.generativeai as genai
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
@@ -1560,20 +1561,6 @@ def chat_ia():
         dados_planilha = "\n\n".join(contexto_abas)
         dados_drive = obter_conteudo_pastas_drive()
 
-        base_conhecimento_geral = (
-            f"=== DADOS DA PLANILHA PRINCIPAL (PM e RIO Novo) ===\n{dados_planilha}\n\n"
-            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (CIRCULARES, BASE DE CONHECIMENTO, MODELOS, DOC) ===\n{dados_drive}"
-        )
-
-        from google import genai
-        from google.genai import types
-        
-        api_key_gemini = os.environ.get("GEMINI_API_KEY")
-        if not api_key_gemini:
-            return jsonify({"resposta": "🚨 Erro de configuração: A chave GEMINI_API_KEY não foi encontrada nas variáveis de ambiente."})
-            
-        client = genai.Client(api_key=api_key_gemini)
-        
         instrucao_sistema = (
             "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
             "Responda às dúvidas da equipe com base absoluta na base de dados unificada abaixo, "
@@ -1581,39 +1568,48 @@ def chat_ia():
             "e a listagem de arquivos das pastas do Google Drive (Circulares, Base de Conhecimento, Modelos e Doc). "
             "Sempre que relevante, indique os dados ou o link do documento correspondente. "
             "Se a resposta não constar na base abaixo, informe educadamente que não encontrou essa informação nos registros.\n\n"
-            f"{base_conhecimento_geral}"
+            f"=== DADOS DA PLANILHA PRINCIPAL (PM e RIO Novo) ===\n{dados_planilha}\n\n"
+            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (CIRCULARES, BASE DE CONHECIMENTO, MODELOS, DOC) ===\n{dados_drive}"
         )
-        
-        modelos_candidatos = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro"]
-        
-        modelo_custom = os.environ.get("GEMINI_MODEL", "").strip()
-        if modelo_custom:
-            modelos_candidatos.insert(0, modelo_custom)
 
-        resposta_gemini = None
-        ultimo_erro = None
+        api_key_gemini = os.environ.get("GEMINI_API_KEY")
 
-        for modelo_atual in modelos_candidatos:
-            try:
-                print(f"🤖 Tentando IA com o modelo: {modelo_atual}")
-                resposta_gemini = client.models.generate_content(
-                    model=modelo_atual,
-                    contents=pergunta_usuario,
-                    config=types.GenerateContentConfig(
-                        system_instruction=instrucao_sistema
-                    )
-                )
-                if resposta_gemini and resposta_gemini.text:
-                    break
-            except Exception as e_tentativa:
-                ultimo_erro = e_tentativa
-                print(f"⚠️ Falha com o modelo {modelo_atual}: {e_tentativa}")
-                continue
+        if not api_key_gemini:
+            return jsonify({
+                "resposta": "🚨 GEMINI_API_KEY não configurada."
+            })
 
-        if not resposta_gemini or not resposta_gemini.text:
-            raise ultimo_erro if ultimo_erro else Exception("Nenhum modelo compatível respondeu.")
-        
-        return jsonify({"resposta": resposta_gemini.text})
+        genai.configure(api_key=api_key_gemini)
+
+        prompt_final = f"""
+        {instrucao_sistema}
+
+        PERGUNTA DO USUÁRIO:
+        {pergunta_usuario}
+        """
+
+        try:
+            model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash"
+            )
+
+            resposta = model.generate_content(prompt_final)
+
+            texto_resposta = ""
+
+            if hasattr(resposta, "text"):
+                texto_resposta = resposta.text
+            elif resposta.candidates:
+                texto_resposta = resposta.candidates[0].content.parts[0].text
+
+            return jsonify({
+                "resposta": texto_resposta
+            })
+
+        except Exception as erro_gemini:
+            return jsonify({
+                "resposta": f"🚨 Erro Gemini: {str(erro_gemini)}"
+            })
 
     except Exception as e:
         erro_detalhado = traceback.format_exc()

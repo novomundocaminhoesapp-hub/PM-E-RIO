@@ -77,15 +77,18 @@ def obter_conteudo_pastas_drive():
         files = results.get('files', [])
         
         lista_arquivos = []
+        mapa_links = {}
         for f in files:
             nome = f.get('name')
             link = f.get('webViewLink', '')
             mime = f.get('mimeType', '')
             lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}")
-            
-        return "\n".join(lista_arquivos)
+            if nome:
+                mapa_links[nome.strip().lower()] = link
+                
+        return "\n".join(lista_arquivos), mapa_links
     except Exception as e:
-        return f"Não foi possível listar os arquivos do Drive: {e}"
+        return f"Não foi possível listar os arquivos do Drive: {e}", {}
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     try:
@@ -764,6 +767,9 @@ def acessar_modulo(nome_modulo):
     conteudo = ""
     modulo_titulo = NOMES_MODULOS.get(nome_modulo, "Início")
 
+    # Obter mapa do Drive para resolver links de PDF corretamente
+    _, mapa_drive = obter_conteudo_pastas_drive()
+
     if nome_modulo == "rio":
         produto_selecionado = request.args.get("produto")
 
@@ -1224,7 +1230,15 @@ def acessar_modulo(nome_modulo):
                 if item_escolhido:
                     assunto_val = item_escolhido.get("ASSUNTO", "")
                     informacao_val = item_escolhido.get("INFORMAÇÃO", "") or item_escolhido.get("INFORMACAO", "")
-                    circular_val = item_escolhido.get("CIRCULAR", "")
+                    circular_val = item_escolhido.get("CIRCULAR", "").strip()
+
+                    # Resolver link do PDF via mapa do Drive se necessário
+                    link_pdf = circular_val
+                    if circular_val:
+                        if circular_val.lower() in mapa_drive:
+                            link_pdf = mapa_drive[circular_val.lower()]
+                        elif not circular_val.startswith("http"):
+                            link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(circular_val)}"
 
                     bloco_circular_html = ""
                     if circular_val:
@@ -1232,7 +1246,7 @@ def acessar_modulo(nome_modulo):
                         <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 12px; margin-top: 14px;">
                             <div class="detalhe-label" style="color: #002244; margin-bottom: 6px;">Circular Oficial</div>
                             <div class="acoes-ficha-tecnica">
-                                <a href="{circular_val}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📄 ABRIR CIRCULAR (PDF)</a>
+                                <a href="{link_pdf}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📄 ABRIR CIRCULAR (PDF)</a>
                             </div>
                         </div>
                         """
@@ -1421,11 +1435,15 @@ def acessar_modulo(nome_modulo):
                         m_seguranca_ativa = item_escolhido.get("SEGURANÇA ATIVA", "") or item_escolhido.get("SEGURANCA ATIVA", "")
                         m_tecnologia = item_escolhido.get("TECNOLOGIA", "")
                         
-                        m_link = item_escolhido.get("LINK", "")
+                        m_link = str(item_escolhido.get("LINK", "")).strip()
 
+                        # Resolver link do PDF via mapa do Drive
                         link_pdf = m_link
-                        if m_link and not str(m_link).startswith("http"):
-                            link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(str(m_link))}"
+                        if m_link:
+                            if m_link.lower() in mapa_drive:
+                                link_pdf = mapa_drive[m_link.lower()]
+                            elif not m_link.startswith("http"):
+                                link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(m_link)}"
 
                         bloco_pdf_html = ""
                         if m_link:
@@ -1554,22 +1572,25 @@ def chat_ia():
             try:
                 aba = planilha.worksheet(nome_aba)
                 registros = aba.get_all_records()
-                contexto_abas.append(f"--- ABA DA PLANILHA PRINCIPAL ({nome_aba}) ---\n{json.dumps(registros, ensure_ascii=False, indent=2)}")
+                # Otimizado: converter registros em linhas de texto compactas ao invés de JSON pesado
+                linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros]
+                contexto_abas.append(f"### ABA: {nome_aba}\n" + "\n".join(linhas_texto))
             except Exception:
                 pass
         
         dados_planilha = "\n\n".join(contexto_abas)
-        dados_drive = obter_conteudo_pastas_drive()
+        dados_drive, _ = obter_conteudo_pastas_drive()
 
         instrucao_sistema = (
-            "Você é o Assistente Virtual da Novo Mundo Caminhões. "
-            "IMPORTANTE: Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo, "
-            "que contém as informações completas de todas as abas da planilha principal (PM e RIO Novo) "
-            "e a listagem de arquivos das pastas do Google Drive (Circulares, Base de Conhecimento, Modelos, Doc e Vídeos). "
-            "É proibido utilizar conhecimentos gerais externos ou inventar informações. "
-            "Se a resposta exata não constar nos dados abaixo, informe educadamente que não encontrou essa informação nos registros oficiais da empresa. "
-            "Sempre que relevante, indique os dados ou o link do documento/arquivo correspondente.\n\n"
-            f"=== DADOS DA PLANILHA PRINCIPAL (PM e RIO Novo) ===\n{dados_planilha}\n\n"
+            "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
+            "DIRETRIZES DE COMPORTAMENTO:\n"
+            "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
+            "(que contém as informações completas das planilhas PM e RIO Novo e dos arquivos do Google Drive).\n"
+            "2. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática (destacando pontos importantes como PBT, especificações, motorização, valores ou regras de contratos).\n"
+            "3. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
+            "4. Se a resposta exata não constar nos dados abaixo, informe educadamente que a informação não foi encontrada nos registros oficiais da empresa.\n"
+            "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
+            f"=== DADOS DA PLANILHA PRINCIPAL ===\n{dados_planilha}\n\n"
             f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE ===\n{dados_drive}"
         )
 
@@ -1591,10 +1612,9 @@ def chat_ia():
 
         modelos_candidatos = [
             "gemini-1.5-flash",
-            "gemini-2.0-flash",
-            "gemini-flash-latest",
             "gemini-1.5-pro",
-            "gemini-2.5-flash"
+            "gemini-2.0-flash",
+            "gemini-flash-latest"
         ]
 
         modelo_custom = os.environ.get("GEMINI_MODEL", "").strip()

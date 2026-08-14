@@ -1581,10 +1581,8 @@ def chat_ia():
             f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE ===\n{dados_drive}"
         )
 
-        # Tenta obter a chave do ambiente; caso não exista, permite fallback direto se necessário
         api_key_gemini = os.environ.get("GEMINI_API_KEY")
         if not api_key_gemini:
-            # Se preferir colar sua chave diretamente aqui para testes locais, substitua a string abaixo:
             api_key_gemini = "COLOQUE_SUA_CHAVE_API_AQUI"
 
         if not api_key_gemini or api_key_gemini == "COLOQUE_SUA_CHAVE_API_AQUI":
@@ -1641,10 +1639,18 @@ def chat_ia():
         })
 
     except Exception as e:
+        erro_str = str(e)
         erro_detalhado = traceback.format_exc()
         print("--- ERRO COMPLETO DO GEMINI ---")
         print(erro_detalhado)
         print("-------------------------------")
+        
+        # Tratamento amigável para o Erro 429 (Limite de requisições excedido)
+        if "429" in erro_str or "quota" in erro_str.lower():
+            return jsonify({
+                "resposta": "⚠️ O limite temporário de requisições da API do Gemini foi atingido (Erro 429). Por favor, aguarde cerca de 15 a 30 segundos e envie sua pergunta novamente."
+            })
+            
         return jsonify({"resposta": f"🚨 ERRO TÉCNICO: {str(e)}"})
 
 @app.route("/logout", methods=["POST"])

@@ -4,4 +4,5 @@ gspread==6.1.2
 google-auth==2.29.0
 google-auth-oauthlib
 google-auth-httplib2
+google-api-python-client
 google-genai

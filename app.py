@@ -1545,7 +1545,6 @@ def chat_ia():
         return jsonify({"resposta": "Por favor, digite ou fale uma pergunta."})
 
     try:
-        # 1. Lê dinamicamente todas as abas da planilha principal para busca de informações
         planilha = conectar_google_sheets()
         contexto_abas = []
         abas_para_ler = ["RIO", "PM", "PM_Precos", "Informes", "Argumentos", "Modelos"]
@@ -1559,8 +1558,6 @@ def chat_ia():
                 pass
         
         dados_planilha = "\n\n".join(contexto_abas)
-
-        # 2. Varre as pastas do Google Drive (CIRCULARES, BASE DE CONHECIMENTO, MODELOS, DOC)
         dados_drive = obter_conteudo_pastas_drive()
 
         base_conhecimento_geral = (
@@ -1577,22 +1574,6 @@ def chat_ia():
             
         client = genai.Client(api_key=api_key_gemini)
         
-        # 3. Descoberta dinâmica automática do melhor modelo Flash disponível para a chave
-        modelo_selecionado = os.environ.get("GEMINI_MODEL", "")
-        if not modelo_selecionado:
-            modelo_selecionado = "gemini-2.0-flash" # Padrão inicial
-            try:
-                modelos = client.models.list()
-                for m in modelos:
-                    nome = m.name if hasattr(m, 'name') else str(m)
-                    if "flash" in nome.lower():
-                        modelo_selecionado = nome.replace("models/", "")
-                        break
-            except Exception as e_list:
-                print(f"Aviso ao listar modelos automaticamente: {e_list}")
-
-        print(f"🤖 Usando modelo de IA: {modelo_selecionado}")
-
         instrucao_sistema = (
             "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
             "Responda às dúvidas da equipe com base absoluta na base de dados unificada abaixo, "
@@ -1603,13 +1584,34 @@ def chat_ia():
             f"{base_conhecimento_geral}"
         )
         
-        resposta_gemini = client.models.generate_content(
-            model=modelo_selecionado,
-            contents=pergunta_usuario,
-            config=types.GenerateContentConfig(
-                system_instruction=instrucao_sistema
-            )
-        )
+        modelos_candidatos = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro"]
+        
+        modelo_custom = os.environ.get("GEMINI_MODEL", "").strip()
+        if modelo_custom:
+            modelos_candidatos.insert(0, modelo_custom)
+
+        resposta_gemini = None
+        ultimo_erro = None
+
+        for modelo_atual in modelos_candidatos:
+            try:
+                print(f"🤖 Tentando IA com o modelo: {modelo_atual}")
+                resposta_gemini = client.models.generate_content(
+                    model=modelo_atual,
+                    contents=pergunta_usuario,
+                    config=types.GenerateContentConfig(
+                        system_instruction=instrucao_sistema
+                    )
+                )
+                if resposta_gemini and resposta_gemini.text:
+                    break
+            except Exception as e_tentativa:
+                ultimo_erro = e_tentativa
+                print(f"⚠️ Falha com o modelo {modelo_atual}: {e_tentativa}")
+                continue
+
+        if not resposta_gemini or not resposta_gemini.text:
+            raise ultimo_erro if ultimo_erro else Exception("Nenhum modelo compatível respondeu.")
         
         return jsonify({"resposta": resposta_gemini.text})
 

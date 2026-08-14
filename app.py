@@ -1581,11 +1581,15 @@ def chat_ia():
             f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE ===\n{dados_drive}"
         )
 
+        # Tenta obter a chave do ambiente; caso não exista, permite fallback direto se necessário
         api_key_gemini = os.environ.get("GEMINI_API_KEY")
-
         if not api_key_gemini:
+            # Se preferir colar sua chave diretamente aqui para testes locais, substitua a string abaixo:
+            api_key_gemini = "COLOQUE_SUA_CHAVE_API_AQUI"
+
+        if not api_key_gemini or api_key_gemini == "COLOQUE_SUA_CHAVE_API_AQUI":
             return jsonify({
-                "resposta": "🚨 GEMINI_API_KEY não configurada."
+                "resposta": "🚨 GEMINI_API_KEY não configurada. Defina a variável de ambiente ou insira a chave no código."
             })
 
         genai.configure(api_key=api_key_gemini)

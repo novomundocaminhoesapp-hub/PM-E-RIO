@@ -71,7 +71,6 @@ def obter_conteudo_pastas_drive():
         
         service = build('drive', 'v3', credentials=credenciais)
         
-        # Lista arquivos no Google Drive acessíveis pela credencial
         results = service.files().list(
             pageSize=200,
             fields="files(id, name, mimeType, webViewLink, parents)"
@@ -1549,7 +1548,7 @@ def chat_ia():
         return jsonify({"resposta": "Por favor, digite ou fale uma pergunta."})
 
     try:
-        # 1. Lê dinamicamente todas as abas da planilha principal
+        # 1. Lê dinamicamente todas as abas da planilha principal (PM e RIO Novo)
         planilha = conectar_google_sheets()
         contexto_abas = []
         abas_para_ler = ["RIO", "PM", "PM_Precos", "Informes", "Argumentos", "Modelos"]
@@ -1558,13 +1557,13 @@ def chat_ia():
             try:
                 aba = planilha.worksheet(nome_aba)
                 registros = aba.get_all_records()
-                contexto_abas.append(f"--- ABA DA PLANILHA ({nome_aba}) ---\n{json.dumps(registros, ensure_ascii=False, indent=2)}")
+                contexto_abas.append(f"--- ABA DA PLANILHA PRINCIPAL ({nome_aba}) ---\n{json.dumps(registros, ensure_ascii=False, indent=2)}")
             except Exception:
                 pass
         
         dados_planilha = "\n\n".join(contexto_abas)
 
-        # 2. Varre os arquivos e pastas do Google Drive (Circulares, Base de Conhecimento, Modelos, Doc)
+        # 2. Varre as pastas do Google Drive (CIRCULARES, BASE DE CONHECIMENTO, MODELOS, DOC)
         dados_drive = obter_conteudo_pastas_drive()
 
         base_conhecimento_geral = (
@@ -1584,15 +1583,16 @@ def chat_ia():
         instrucao_sistema = (
             "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
             "Responda às dúvidas da equipe com base absoluta na base de dados unificada abaixo, "
-            "que contém as informações das abas do Google Sheets e a lista de documentos/PDFs das pastas do Google Drive "
-            "(Circulares, Base de Conhecimento, Modelos e Doc). "
-            "Sempre que relevante, indique o nome do arquivo ou link correspondente para que o usuário possa abrir o documento oficial. "
+            "que contém as informações completas de todas as abas da planilha principal (PM e RIO Novo) "
+            "e a listagem de arquivos das pastas do Google Drive (Circulares, Base de Conhecimento, Modelos e Doc). "
+            "Sempre que relevante, indique os dados ou o link do documento correspondente. "
             "Se a resposta não constar na base abaixo, informe educadamente que não encontrou essa informação nos registros.\n\n"
             f"{base_conhecimento_geral}"
         )
         
+        # Configurado para usar o modelo Flash-Lite otimizado e econômico
         resposta_gemini = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-flash-lite",
             contents=pergunta_usuario,
             config=types.GenerateContentConfig(
                 system_instruction=instrucao_sistema

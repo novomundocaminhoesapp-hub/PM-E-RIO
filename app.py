@@ -1588,28 +1588,45 @@ def chat_ia():
         {pergunta_usuario}
         """
 
-        try:
-            model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash"
-            )
+        modelos_candidatos = [
+            "gemini-1.5-flash",
+            "gemini-2.0-flash",
+            "gemini-flash-latest",
+            "gemini-1.5-pro",
+            "gemini-2.5-flash"
+        ]
 
-            resposta = model.generate_content(prompt_final)
+        modelo_custom = os.environ.get("GEMINI_MODEL", "").strip()
+        if modelo_custom:
+            modelos_candidatos.insert(0, modelo_custom)
 
-            texto_resposta = ""
+        resposta_gemini = None
+        ultimo_erro = None
 
-            if hasattr(resposta, "text"):
-                texto_resposta = resposta.text
-            elif resposta.candidates:
-                texto_resposta = resposta.candidates[0].content.parts[0].text
+        for modelo_atual in modelos_candidatos:
+            try:
+                print(f"🤖 Tentando IA com o modelo: {modelo_atual}")
+                model = genai.GenerativeModel(model_name=modelo_atual)
+                resposta_gemini = model.generate_content(prompt_final)
+                if resposta_gemini and (hasattr(resposta_gemini, "text") or resposta_gemini.candidates):
+                    break
+            except Exception as e_tentativa:
+                ultimo_erro = e_tentativa
+                print(f"⚠️ Falha com o modelo {modelo_atual}: {e_tentativa}")
+                continue
 
-            return jsonify({
-                "resposta": texto_resposta
-            })
+        if not resposta_gemini:
+            raise ultimo_erro if ultimo_erro else Exception("Nenhum modelo compatível respondeu.")
 
-        except Exception as erro_gemini:
-            return jsonify({
-                "resposta": f"🚨 Erro Gemini: {str(erro_gemini)}"
-            })
+        texto_resposta = ""
+        if hasattr(resposta_gemini, "text") and resposta_gemini.text:
+            texto_resposta = resposta_gemini.text
+        elif resposta_gemini.candidates:
+            texto_resposta = resposta_gemini.candidates[0].content.parts[0].text
+
+        return jsonify({
+            "resposta": texto_resposta
+        })
 
     except Exception as e:
         erro_detalhado = traceback.format_exc()

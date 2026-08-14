@@ -34,7 +34,6 @@ escopos = [
 ]
 
 def validar_cpf(cpf_input):
-    """Valida formato e dígitos verificadores. Aceita tratar zeros à esquerda."""
     cpf = re.sub(r'\D', '', str(cpf_input))
     if len(cpf) < 11:
         cpf = cpf.zfill(11)
@@ -61,7 +60,6 @@ def conectar_google_sheets():
     return cliente.open("PM e RIO Novo")
 
 def obter_conteudo_pastas_drive():
-    """Varre o Google Drive para listar arquivos das pastas do sistema."""
     try:
         if 'GOOGLE_CREDENTIALS' in os.environ:
             credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
@@ -89,7 +87,6 @@ def obter_conteudo_pastas_drive():
         return f"Não foi possível listar os arquivos do Drive: {e}"
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
-    """Registra o log de acesso na aba 'LogsAcessos' do Google Sheets."""
     try:
         planilha = conectar_google_sheets()
         try:
@@ -1580,6 +1577,22 @@ def chat_ia():
             
         client = genai.Client(api_key=api_key_gemini)
         
+        # 3. Descoberta dinâmica automática do melhor modelo Flash disponível para a chave
+        modelo_selecionado = os.environ.get("GEMINI_MODEL", "")
+        if not modelo_selecionado:
+            modelo_selecionado = "gemini-2.0-flash" # Padrão inicial
+            try:
+                modelos = client.models.list()
+                for m in modelos:
+                    nome = m.name if hasattr(m, 'name') else str(m)
+                    if "flash" in nome.lower():
+                        modelo_selecionado = nome.replace("models/", "")
+                        break
+            except Exception as e_list:
+                print(f"Aviso ao listar modelos automaticamente: {e_list}")
+
+        print(f"🤖 Usando modelo de IA: {modelo_selecionado}")
+
         instrucao_sistema = (
             "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
             "Responda às dúvidas da equipe com base absoluta na base de dados unificada abaixo, "
@@ -1590,9 +1603,8 @@ def chat_ia():
             f"{base_conhecimento_geral}"
         )
         
-        # Utilizando o modelo oficial padrão gemini-1.5-flash
         resposta_gemini = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model=modelo_selecionado,
             contents=pergunta_usuario,
             config=types.GenerateContentConfig(
                 system_instruction=instrucao_sistema

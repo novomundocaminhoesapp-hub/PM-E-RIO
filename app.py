@@ -3,8 +3,9 @@ import os
 from datetime import datetime
 import re
 import urllib.parse
+import traceback
 
-from flask import Flask, redirect, render_template_string, request, session, url_for
+from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
 import gspread
 
@@ -59,7 +60,7 @@ def conectar_google_sheets():
     return cliente.open("PM e RIO Novo")
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
-    """Registra o log de acesso na aba 'LogsAcessos' do Google Sheets[cite: 8]."""
+    """Registra o log de acesso na aba 'LogsAcessos' do Google Sheets."""
     try:
         planilha = conectar_google_sheets()
         try:
@@ -296,6 +297,46 @@ TEMPLATE_HTML = """
         .btn-fechar-modal { background: transparent; border: none; color: #ffffff; font-size: 24px; cursor: pointer; line-height: 1; padding: 0 4px; }
         .iframe-container { position: relative; width: 100%; padding-bottom: 56.25%; height: 0; background: #000; }
         .iframe-container iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 0; }
+
+        /* Estilos do Widget da IA */
+        #ai-float-btn {
+            position: fixed; bottom: 24px; right: 24px; width: 60px; height: 60px;
+            background: #002244; border-radius: 50%; display: flex; align-items: center;
+            justify-content: center; box-shadow: 0 4px 15px rgba(0,34,68,0.4); cursor: pointer; z-index: 9999;
+            transition: transform 0.3s ease;
+        }
+        #ai-float-btn:hover { transform: scale(1.08); }
+        #ai-float-btn img { width: 35px; height: auto; object-fit: contain; }
+        .ai-pulse-ring {
+            position: absolute; width: 100%; height: 100%; border-radius: 50%;
+            border: 2px solid #0066cc; animation: pulseAI 2s infinite;
+        }
+        @keyframes pulseAI {
+            0% { transform: scale(1); opacity: 1; }
+            100% { transform: scale(1.4); opacity: 0; }
+        }
+        .ai-chat-container {
+            position: fixed; bottom: 95px; right: 24px; width: 350px; height: 480px;
+            background: #ffffff; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            z-index: 9998; display: none; flex-direction: column; overflow: hidden; border: 1px solid #cbd5e0;
+        }
+        .ai-chat-header {
+            background: #002244; color: white; padding: 12px 16px; font-weight: 600;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .ai-chat-body {
+            flex-grow: 1; padding: 12px; overflow-y: auto; background: #f7fafc;
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        .ai-chat-footer {
+            padding: 10px; background: #ffffff; border-top: 1px solid #e2e8f0; display: flex; gap: 8px; align-items: center;
+        }
+        .ai-chat-footer input {
+            flex-grow: 1; padding: 8px 12px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 14px; background: #f7fafc;
+        }
+        .ai-msg { max-width: 80%; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4; }
+        .ai-msg.bot { background: #e2e8f0; color: #2d3748; align-self: flex-start; }
+        .ai-msg.user { background: #002244; color: #ffffff; align-self: flex-end; }
     </style>
     <script>
         function toggleDrawer() {
@@ -336,6 +377,71 @@ TEMPLATE_HTML = """
             var iframe = document.getElementById('iframeVideo');
             iframe.src = '';
             modal.style.display = 'none';
+        }
+
+        function forcarAtualizacao() {
+            var url = window.location.pathname + window.location.search;
+            var separador = url.indexOf('?') !== -1 ? '&' : '?';
+            window.location.href = url + separador + '_t=' + new Date().getTime();
+        }
+
+        function toggleAIChat() {
+            var modal = document.getElementById('ai-chat-modal');
+            modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
+        }
+
+        function ouvirVoz() {
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+                alert("Seu navegador não suporta reconhecimento de voz.");
+                return;
+            }
+            var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            var recognition = new SpeechRecognition();
+            recognition.lang = 'pt-BR';
+            var btnMic = document.getElementById('btn-mic');
+            btnMic.style.background = '#feb2b2';
+            recognition.onresult = function(event) {
+                var textoFalado = event.results[0][0].transcript;
+                document.getElementById('ai-user-input').value = textoFalado;
+                btnMic.style.background = '#edf2f7';
+                enviarMensagemIA();
+            };
+            recognition.onerror = function() { btnMic.style.background = '#edf2f7'; };
+            recognition.start();
+        }
+
+        function falarTexto(texto) {
+            if ('speechSynthesis' in window) {
+                var utterance = new SpeechSynthesisUtterance(texto);
+                utterance.lang = 'pt-BR';
+                window.speechSynthesis.speak(utterance);
+            }
+        }
+
+        function enviarMensagemIA() {
+            var input = document.getElementById('ai-user-input');
+            var mensagem = input.value.trim();
+            if (!mensagem) return;
+            var chatBody = document.getElementById('ai-chat-messages');
+            chatBody.innerHTML += `<div class="ai-msg user">${mensagem}</div>`;
+            input.value = '';
+            chatBody.scrollTop = chatBody.scrollHeight;
+
+            fetch('/api/chat-ia', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mensagem: mensagem })
+            })
+            .then(response => response.json())
+            .then(data => {
+                var respostaBot = data.resposta || "Desculpe, ocorreu um erro.";
+                chatBody.innerHTML += `<div class="ai-msg bot">${respostaBot}</div>`;
+                chatBody.scrollTop = chatBody.scrollHeight;
+                falarTexto(respostaBot);
+            })
+            .catch(error => {
+                chatBody.innerHTML += `<div class="ai-msg bot">Erro de conexão com o servidor de IA.</div>`;
+            });
         }
     </script>
 </head>
@@ -400,7 +506,7 @@ TEMPLATE_HTML = """
                 <div class="topbar-title">{{ modulo_titulo }}</div>
             </div>
             <div class="topbar-right">
-                <button onclick="window.location.reload();" title="Atualizar">↻</button>
+                <button onclick="forcarAtualizacao()" title="Atualizar">↻</button>
             </div>
         </header>
 
@@ -466,6 +572,34 @@ TEMPLATE_HTML = """
                 <div class="iframe-container">
                     <iframe id="iframeVideo" src="" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
                 </div>
+            </div>
+        </div>
+
+        <!-- WIDGET FLUTUANTE DA IA -->
+        <div id="ai-float-btn" onclick="toggleAIChat()" title="Assistente IA - Novo Mundo">
+            <img src="{{ url_for('static', filename='logo.png') }}" alt="IA">
+            <span class="ai-pulse-ring"></span>
+        </div>
+
+        <div id="ai-chat-modal" class="ai-chat-container">
+            <div class="ai-chat-header">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="font-size: 18px;">🤖</span>
+                    <span>Assistente Inteligente RIO</span>
+                </div>
+                <button type="button" onclick="toggleAIChat()" style="background:none; border:none; color:white; font-size:20px; cursor:pointer;">&times;</button>
+            </div>
+            
+            <div id="ai-chat-messages" class="ai-chat-body">
+                <div class="ai-msg bot">
+                    Olá! Sou seu assistente especialista nos manuais, circulares e bases da Novo Mundo. Como posso te ajudar hoje? (Pode digitar ou usar o microfone 🎙️)
+                </div>
+            </div>
+
+            <div class="ai-chat-footer">
+                <button type="button" id="btn-mic" onclick="ouvirVoz()" title="Falar por Voz" style="background:#edf2f7; border:none; border-radius:50%; width:38px; height:38px; cursor:pointer; font-size:16px;">🎙️</button>
+                <input type="text" id="ai-user-input" placeholder="Digite sua dúvida..." onkeypress="if(event.key === 'Enter') enviarMensagemIA()">
+                <button type="button" onclick="enviarMensagemIA()" style="background:#002244; color:white; border:none; border-radius:6px; padding:0 14px; cursor:pointer; font-weight:650;">Enviar</button>
             </div>
         </div>
     {% endif %}
@@ -1372,6 +1506,52 @@ def acessar_modulo(nome_modulo):
         modulo_ativo=nome_modulo,
         modulo_titulo=modulo_titulo
     )
+
+@app.route("/api/chat-ia", methods=["POST"])
+def chat_ia():
+    if not session.get("logado"):
+        return jsonify({"resposta": "Sessão expirada. Faça login novamente."}), 401
+    
+    dados = request.get_json()
+    pergunta_usuario = dados.get("mensagem", "").strip()
+    
+    if not pergunta_usuario:
+        return jsonify({"resposta": "Por favor, digite ou fale uma pergunta."})
+
+    try:
+        from google import genai
+        from google.genai import types
+        
+        # Chave puxada de forma segura da variável de ambiente (evita bloqueio no GitHub)
+        api_key_gemini = os.environ.get("GEMINI_API_KEY")
+        
+        if not api_key_gemini:
+            return jsonify({"resposta": "🚨 Erro de configuração: A chave GEMINI_API_KEY não foi encontrada nas variáveis de ambiente."})
+            
+        client = genai.Client(api_key=api_key_gemini)
+        
+        instrucao_sistema = (
+            "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
+            "Responda às dúvidas da equipe com base estrita nas informações de telemetria RIO, "
+            "Planos de Manutenção, circulares e fichas técnicas."
+        )
+        
+        resposta_gemini = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=pergunta_usuario,
+            config=types.GenerateContentConfig(
+                system_instruction=instrucao_sistema
+            )
+        )
+        
+        return jsonify({"resposta": resposta_gemini.text})
+
+    except Exception as e:
+        erro_detalhado = traceback.format_exc()
+        print("--- ERRO COMPLETO DO GEMINI ---")
+        print(erro_detalhado)
+        print("-------------------------------")
+        return jsonify({"resposta": f"🚨 ERRO TÉCNICO: {str(e)}"})
 
 @app.route("/logout", methods=["POST"])
 def logout():

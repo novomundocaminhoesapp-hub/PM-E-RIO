@@ -1,6 +1,7 @@
-Flask
+Flask==3.1.0
 gunicorn
-gspread
-google-auth
+gspread==6.1.2
+google-auth==2.29.0
 google-auth-oauthlib
 google-auth-httplib2
+google-genai

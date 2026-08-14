@@ -1522,7 +1522,6 @@ def chat_ia():
         from google import genai
         from google.genai import types
         
-        # Chave puxada de forma segura da variável de ambiente (evita bloqueio no GitHub)
         api_key_gemini = os.environ.get("GEMINI_API_KEY")
         
         if not api_key_gemini:
@@ -1537,7 +1536,7 @@ def chat_ia():
         )
         
         resposta_gemini = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=pergunta_usuario,
             config=types.GenerateContentConfig(
                 system_instruction=instrucao_sistema

@@ -71,21 +71,24 @@ def obter_conteudo_pastas_drive():
         service = build('drive', 'v3', credentials=credenciais)
         
         results = service.files().list(
-            pageSize=200,
+            pageSize=300,
             fields="files(id, name, mimeType, webViewLink, parents)"
         ).execute()
         files = results.get('files', [])
         
         lista_arquivos = []
+        mapa_links = {}
         for f in files:
             nome = f.get('name')
             link = f.get('webViewLink', '')
             mime = f.get('mimeType', '')
             lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}")
-            
-        return "\n".join(lista_arquivos)
+            if nome:
+                mapa_links[nome.strip().lower()] = link
+                
+        return "\n".join(lista_arquivos), mapa_links
     except Exception as e:
-        return f"Não foi possível listar os arquivos do Drive: {e}"
+        return f"Não foi possível listar os arquivos do Drive: {e}", {}
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     try:
@@ -437,14 +440,6 @@ TEMPLATE_HTML = """
             recognition.start();
         }
 
-        function falarTexto(texto) {
-            if ('speechSynthesis' in window) {
-                var utterance = new SpeechSynthesisUtterance(texto);
-                utterance.lang = 'pt-BR';
-                window.speechSynthesis.speak(utterance);
-            }
-        }
-
         function enviarMensagemIA() {
             var input = document.getElementById('ai-user-input');
             var mensagem = input.value.trim();
@@ -464,7 +459,6 @@ TEMPLATE_HTML = """
                 var respostaBot = data.resposta || "Desculpe, ocorreu um erro.";
                 chatBody.innerHTML += `<div class="ai-msg bot">${respostaBot}</div>`;
                 chatBody.scrollTop = chatBody.scrollHeight;
-                falarTexto(respostaBot);
             })
             .catch(error => {
                 chatBody.innerHTML += `<div class="ai-msg bot">Erro de conexão com o servidor de IA.</div>`;
@@ -619,7 +613,7 @@ TEMPLATE_HTML = """
             
             <div id="ai-chat-messages" class="ai-chat-body">
                 <div class="ai-msg bot">
-                    Olá! Sou seu assistente especialista nas pastas, circulares e bases da Novo Mundo. Como posso te ajudar hoje? (Pode digitar ou usar o microfone 🎙️)
+                    Sou o Assistente Virtual da Novo Mundo Caminhões, como posso ajudar?
                 </div>
             </div>
 
@@ -763,6 +757,8 @@ def acessar_modulo(nome_modulo):
 
     conteudo = ""
     modulo_titulo = NOMES_MODULOS.get(nome_modulo, "Início")
+
+    _, mapa_drive = obter_conteudo_pastas_drive()
 
     if nome_modulo == "rio":
         produto_selecionado = request.args.get("produto")
@@ -1224,7 +1220,14 @@ def acessar_modulo(nome_modulo):
                 if item_escolhido:
                     assunto_val = item_escolhido.get("ASSUNTO", "")
                     informacao_val = item_escolhido.get("INFORMAÇÃO", "") or item_escolhido.get("INFORMACAO", "")
-                    circular_val = item_escolhido.get("CIRCULAR", "")
+                    circular_val = item_escolhido.get("CIRCULAR", "").strip()
+
+                    link_pdf = circular_val
+                    if circular_val:
+                        if circular_val.lower() in mapa_drive:
+                            link_pdf = mapa_drive[circular_val.lower()]
+                        elif not circular_val.startswith("http"):
+                            link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(circular_val)}"
 
                     bloco_circular_html = ""
                     if circular_val:
@@ -1232,7 +1235,7 @@ def acessar_modulo(nome_modulo):
                         <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 12px; margin-top: 14px;">
                             <div class="detalhe-label" style="color: #002244; margin-bottom: 6px;">Circular Oficial</div>
                             <div class="acoes-ficha-tecnica">
-                                <a href="{circular_val}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📄 ABRIR CIRCULAR (PDF)</a>
+                                <a href="{link_pdf}" target="_blank" rel="noopener noreferrer" class="btn-acao-ficha btn-abrir-pdf">📄 ABRIR CIRCULAR (PDF)</a>
                             </div>
                         </div>
                         """
@@ -1421,11 +1424,14 @@ def acessar_modulo(nome_modulo):
                         m_seguranca_ativa = item_escolhido.get("SEGURANÇA ATIVA", "") or item_escolhido.get("SEGURANCA ATIVA", "")
                         m_tecnologia = item_escolhido.get("TECNOLOGIA", "")
                         
-                        m_link = item_escolhido.get("LINK", "")
+                        m_link = str(item_escolhido.get("LINK", "")).strip()
 
                         link_pdf = m_link
-                        if m_link and not str(m_link).startswith("http"):
-                            link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(str(m_link))}"
+                        if m_link:
+                            if m_link.lower() in mapa_drive:
+                                link_pdf = mapa_drive[m_link.lower()]
+                            elif not m_link.startswith("http"):
+                                link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(m_link)}"
 
                         bloco_pdf_html = ""
                         if m_link:
@@ -1543,40 +1549,56 @@ def chat_ia():
     pergunta_usuario = dados.get("mensagem", "").strip()
     
     if not pergunta_usuario:
-        return jsonify({"resposta": "Por favor, digite ou fale uma pergunta."})
+        return jsonify({"resposta": "Por favor, digite uma pergunta."})
 
     try:
         planilha = conectar_google_sheets()
         contexto_abas = []
-        abas_para_ler = ["RIO", "PM", "PM_Precos", "Informes", "Argumentos", "Modelos"]
         
-        for nome_aba in abas_para_ler:
-            try:
-                aba = planilha.worksheet(nome_aba)
-                registros = aba.get_all_records()
-                contexto_abas.append(f"--- ABA DA PLANILHA PRINCIPAL ({nome_aba}) ---\n{json.dumps(registros, ensure_ascii=False, indent=2)}")
-            except Exception:
-                pass
+        # VARREDURA AUTOMÁTICA DE TODAS AS ABAS DA PLANILHA PRINCIPAL (PM e RIO Novo)
+        try:
+            todas_as_abas = planilha.worksheets()
+            for aba in todas_as_abas:
+                nome_aba = aba.title
+                try:
+                    registros = aba.get_all_records()
+                    linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros]
+                    contexto_abas.append(f"### ABA DA PLANILHA: {nome_aba}\n" + "\n".join(linhas_texto))
+                except Exception:
+                    try:
+                        valores = aba.get_all_values()
+                        linhas_texto = [f"- " + " | ".join([str(c) for c in linha if str(c).strip()]) for linha in valores]
+                        contexto_abas.append(f"### ABA DA PLANILHA (Valores): {nome_aba}\n" + "\n".join(linhas_texto))
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Erro ao varrer abas da planilha: {e}")
         
         dados_planilha = "\n\n".join(contexto_abas)
-        dados_drive = obter_conteudo_pastas_drive()
+        
+        # BUSCA DE TODOS OS ARQUIVOS E PASTAS DO GOOGLE DRIVE (Modelos, Vídeos, Circulares, etc.)
+        dados_drive, _ = obter_conteudo_pastas_drive()
 
         instrucao_sistema = (
-            "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
-            "Responda às dúvidas da equipe com base absoluta na base de dados unificada abaixo, "
-            "que contém as informações completas de todas as abas da planilha principal (PM e RIO Novo) "
-            "e a listagem de arquivos das pastas do Google Drive (Circulares, Base de Conhecimento, Modelos e Doc). "
-            "Sempre que relevante, indique os dados ou o link do documento correspondente. "
-            "Se a resposta não constar na base abaixo, informe educadamente que não encontrou essa informação nos registros.\n\n"
-            f"=== DADOS DA PLANILHA PRINCIPAL (PM e RIO Novo) ===\n{dados_planilha}\n\n"
-            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (CIRCULARES, BASE DE CONHECIMENTO, MODELOS, DOC) ===\n{dados_drive}"
+            "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
+            "DIRETRIZES DE COMPORTAMENTO:\n"
+            "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
+            "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e TODOS OS ARQUIVOS/PASTAS do Google Drive: Modelos, Vídeos, Circulares, Base de Conhecimento e Documentos).\n"
+            "2. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática (destacando pontos importantes como PBT, especificações, motorização, valores ou regras de contratos).\n"
+            "3. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
+            "4. Se a resposta exata não constar nos dados abaixo, informe educadamente que a informação não foi encontrada nos registros oficiais da empresa.\n"
+            "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
+            f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
+            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (Modelos, Vídeos, Circulares, Docs) ===\n{dados_drive}"
         )
 
         api_key_gemini = os.environ.get("GEMINI_API_KEY")
-
         if not api_key_gemini:
+            api_key_gemini = "COLOQUE_SUA_CHAVE_API_AQUI"
+
+        if not api_key_gemini or api_key_gemini == "COLOQUE_SUA_CHAVE_API_AQUI":
             return jsonify({
-                "resposta": "🚨 GEMINI_API_KEY não configurada."
+                "resposta": "🚨 GEMINI_API_KEY não configurada. Defina a variável de ambiente ou insira a chave no código."
             })
 
         genai.configure(api_key=api_key_gemini)
@@ -1588,12 +1610,12 @@ def chat_ia():
         {pergunta_usuario}
         """
 
+        # Modelos atualizados para evitar erro 404
         modelos_candidatos = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
             "gemini-1.5-flash",
-            "gemini-2.0-flash",
-            "gemini-flash-latest",
-            "gemini-1.5-pro",
-            "gemini-2.5-flash"
+            "gemini-1.5-pro"
         ]
 
         modelo_custom = os.environ.get("GEMINI_MODEL", "").strip()
@@ -1629,10 +1651,17 @@ def chat_ia():
         })
 
     except Exception as e:
+        erro_str = str(e)
         erro_detalhado = traceback.format_exc()
         print("--- ERRO COMPLETO DO GEMINI ---")
         print(erro_detalhado)
         print("-------------------------------")
+        
+        if "429" in erro_str or "quota" in erro_str.lower():
+            return jsonify({
+                "resposta": "⚠️ O limite temporário de requisições da API do Gemini foi atingido (Erro 429). Por favor, aguarde cerca de 15 a 30 segundos e envie sua pergunta novamente."
+            })
+            
         return jsonify({"resposta": f"🚨 ERRO TÉCNICO: {str(e)}"})
 
 @app.route("/logout", methods=["POST"])

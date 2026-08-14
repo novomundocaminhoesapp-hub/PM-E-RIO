@@ -1548,7 +1548,7 @@ def chat_ia():
         return jsonify({"resposta": "Por favor, digite ou fale uma pergunta."})
 
     try:
-        # 1. Lê dinamicamente todas as abas da planilha principal (PM e RIO Novo)
+        # 1. Lê dinamicamente todas as abas da planilha principal para busca de informações
         planilha = conectar_google_sheets()
         contexto_abas = []
         abas_para_ler = ["RIO", "PM", "PM_Precos", "Informes", "Argumentos", "Modelos"]
@@ -1590,9 +1590,9 @@ def chat_ia():
             f"{base_conhecimento_geral}"
         )
         
-        # Configurado para usar o modelo Flash-Lite otimizado e econômico
+        # Modelo padrão estável e universalmente aceito pela nova biblioteca do Google GenAI
         resposta_gemini = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-1.5-flash",
             contents=pergunta_usuario,
             config=types.GenerateContentConfig(
                 system_instruction=instrucao_sistema

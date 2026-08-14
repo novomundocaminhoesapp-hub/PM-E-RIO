@@ -619,7 +619,7 @@ TEMPLATE_HTML = """
             
             <div id="ai-chat-messages" class="ai-chat-body">
                 <div class="ai-msg bot">
-                    Olá! Sou seu assistente especialista nas pastas, circulares e bases da Novo Mundo. Como posso te ajudar hoje? (Pode digitar ou usar o microfone 🎙️)
+                    Sou o Assistente Virtual da Novo Mundo Caminhões, como posso ajudar?
                 </div>
             </div>
 
@@ -1562,14 +1562,15 @@ def chat_ia():
         dados_drive = obter_conteudo_pastas_drive()
 
         instrucao_sistema = (
-            "Você é o assistente virtual especialista da Novo Mundo Caminhões & Ônibus. "
-            "Responda às dúvidas da equipe com base absoluta na base de dados unificada abaixo, "
+            "Você é o Assistente Virtual da Novo Mundo Caminhões. "
+            "IMPORTANTE: Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo, "
             "que contém as informações completas de todas as abas da planilha principal (PM e RIO Novo) "
-            "e a listagem de arquivos das pastas do Google Drive (Circulares, Base de Conhecimento, Modelos e Doc). "
-            "Sempre que relevante, indique os dados ou o link do documento correspondente. "
-            "Se a resposta não constar na base abaixo, informe educadamente que não encontrou essa informação nos registros.\n\n"
+            "e a listagem de arquivos das pastas do Google Drive (Circulares, Base de Conhecimento, Modelos, Doc e Vídeos). "
+            "É proibido utilizar conhecimentos gerais externos ou inventar informações. "
+            "Se a resposta exata não constar nos dados abaixo, informe educadamente que não encontrou essa informação nos registros oficiais da empresa. "
+            "Sempre que relevante, indique os dados ou o link do documento/arquivo correspondente.\n\n"
             f"=== DADOS DA PLANILHA PRINCIPAL (PM e RIO Novo) ===\n{dados_planilha}\n\n"
-            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (CIRCULARES, BASE DE CONHECIMENTO, MODELOS, DOC) ===\n{dados_drive}"
+            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE ===\n{dados_drive}"
         )
 
         api_key_gemini = os.environ.get("GEMINI_API_KEY")

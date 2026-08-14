@@ -1536,7 +1536,7 @@ def chat_ia():
         )
         
         resposta_gemini = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-1.5-flash",
             contents=pergunta_usuario,
             config=types.GenerateContentConfig(
                 system_instruction=instrucao_sistema

@@ -4,7 +4,10 @@ from datetime import datetime
 import re
 import urllib.parse
 import traceback
-import google.generativeai as genai
+from google import genai
+
+# Configuração da chave para testes locais
+
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
@@ -29,10 +32,24 @@ NOMES_MODULOS = {
     "argumentos": "Argumentos de Venda"
 }
 
+# Escopos usados apenas pelo Google Sheets e Drive.
 escopos = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
+
+
+def criar_cliente_gemini():
+    """Cria o cliente do Gemini usando a GEMINI_API_KEY (Google AI Studio - 100% Gratuito)."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "A variável de ambiente GEMINI_API_KEY não foi configurada. "
+            "Crie sua chave gratuita no Google AI Studio e defina GEMINI_API_KEY."
+        )
+    print("🤖 Gemini: usando GEMINI_API_KEY (Google AI Studio - Gratuito)")
+    return genai.Client(api_key=api_key)
+
 
 def validar_cpf(cpf_input):
     cpf = re.sub(r'\D', '', str(cpf_input))
@@ -454,14 +471,14 @@ TEMPLATE_HTML = """
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ mensagem: mensagem })
             })
-            .then(response => response.json())
-            .then(data => {
+            .then(response => response.json().then(data => {
                 var respostaBot = data.resposta || "Desculpe, ocorreu um erro.";
                 chatBody.innerHTML += `<div class="ai-msg bot">${respostaBot}</div>`;
                 chatBody.scrollTop = chatBody.scrollHeight;
-            })
+            }))
             .catch(error => {
-                chatBody.innerHTML += `<div class="ai-msg bot">Erro de conexão com o servidor de IA.</div>`;
+                chatBody.innerHTML += `<div class="ai-msg bot">Erro de conexão ou resposta inválida do servidor de IA.</div>`;
+                chatBody.scrollTop = chatBody.scrollHeight;
             });
         }
     </script>
@@ -1551,11 +1568,20 @@ def chat_ia():
     if not pergunta_usuario:
         return jsonify({"resposta": "Por favor, digite uma pergunta."})
 
+    # TRATAMENTO RÁPIDO PARA CUMPRIMENTOS OU FRASES MUITO CURTAS (< 3 PALAVRAS)
+    palavras = pergunta_usuario.split()
+    texto_lower = pergunta_usuario.lower()
+    cumprimentos = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "tudo bem", "eae", "hey", "salve"]
+    
+    if len(palavras) < 3 or texto_lower in cumprimentos:
+        return jsonify({
+            "resposta": "Olá! Você precisa formular sua pergunta com base no conteúdo do App."
+        })
+
     try:
         planilha = conectar_google_sheets()
         contexto_abas = []
         
-        # VARREDURA AUTOMÁTICA DE TODAS AS ABAS DA PLANILHA PRINCIPAL (PM e RIO Novo)
         try:
             todas_as_abas = planilha.worksheets()
             for aba in todas_as_abas:
@@ -1576,7 +1602,6 @@ def chat_ia():
         
         dados_planilha = "\n\n".join(contexto_abas)
         
-        # BUSCA DE TODOS OS ARQUIVOS E PASTAS DO GOOGLE DRIVE (Modelos, Vídeos, Circulares, etc.)
         dados_drive, _ = obter_conteudo_pastas_drive()
 
         instrucao_sistema = (
@@ -1584,25 +1609,17 @@ def chat_ia():
             "DIRETRIZES DE COMPORTAMENTO:\n"
             "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
             "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e TODOS OS ARQUIVOS/PASTAS do Google Drive: Modelos, Vídeos, Circulares, Base de Conhecimento e Documentos).\n"
-            "2. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática (destacando pontos importantes como PBT, especificações, motorização, valores ou regras de contratos).\n"
-            "3. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
-            "4. Se a resposta exata não constar nos dados abaixo, informe educadamente que a informação não foi encontrada nos registros oficiais da empresa.\n"
+            "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
+            "'Você precisa formular sua pergunta com base no conteúdo do App.'\n"
+            "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática (destacando pontos importantes como PBT, especificações, motorização, valores ou regras de contratos).\n"
+            "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
             "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
             f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
             f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (Modelos, Vídeos, Circulares, Docs) ===\n{dados_drive}"
         )
 
-        api_key_gemini = os.environ.get("GEMINI_API_KEY")
-        if not api_key_gemini:
-            api_key_gemini = "COLOQUE_SUA_CHAVE_API_AQUI"
-
-        if not api_key_gemini or api_key_gemini == "COLOQUE_SUA_CHAVE_API_AQUI":
-            return jsonify({
-                "resposta": "🚨 GEMINI_API_KEY não configurada. Defina a variável de ambiente ou insira a chave no código."
-            })
-
-        genai.configure(api_key=api_key_gemini)
-
+        client = criar_cliente_gemini()
+        
         prompt_final = f"""
         {instrucao_sistema}
 
@@ -1610,59 +1627,41 @@ def chat_ia():
         {pergunta_usuario}
         """
 
-        # Modelos atualizados para evitar erro 404
-        modelos_candidatos = [
-            "gemini-3.7-flash",
-            "gemini-3.6-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro"
-        ]
-
-        modelo_custom = os.environ.get("GEMINI_MODEL", "").strip()
-        if modelo_custom:
-            modelos_candidatos.insert(0, modelo_custom)
-
-        resposta_gemini = None
+                # SISTEMA DE CONTINGÊNCIA (FALLBACK) ENTRE MODELOS PARA EVITAR ERROS 503 DE ALTA DEMANDA
+        modelos_para_tentar = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro"]
+        response = None
         ultimo_erro = None
 
-        for modelo_atual in modelos_candidatos:
+        for modelo_atual in modelos_para_tentar:
             try:
                 print(f"🤖 Tentando IA com o modelo: {modelo_atual}")
-                model = genai.GenerativeModel(model_name=modelo_atual)
-                resposta_gemini = model.generate_content(prompt_final)
-                if resposta_gemini and (hasattr(resposta_gemini, "text") or resposta_gemini.candidates):
+                response = client.models.generate_content(
+                    model=modelo_atual,
+                    contents=prompt_final
+                )
+                if response and response.text:
                     break
-            except Exception as e_tentativa:
-                ultimo_erro = e_tentativa
-                print(f"⚠️ Falha com o modelo {modelo_atual}: {e_tentativa}")
+            except Exception as err:
+                ultimo_erro = err
+                print(f"⚠️ Falha temporária com o modelo {modelo_atual}: {err}")
                 continue
 
-        if not resposta_gemini:
-            raise ultimo_erro if ultimo_erro else Exception("Nenhum modelo compatível respondeu.")
-
-        texto_resposta = ""
-        if hasattr(resposta_gemini, "text") and resposta_gemini.text:
-            texto_resposta = resposta_gemini.text
-        elif resposta_gemini.candidates:
-            texto_resposta = resposta_gemini.candidates[0].content.parts[0].text
+        if not response or not response.text:
+            raise RuntimeError(f"Todos os modelos estão temporariamente ocupados. Último erro: {ultimo_erro}")
 
         return jsonify({
-            "resposta": texto_resposta
+            "resposta": response.text
         })
 
     except Exception as e:
-        erro_str = str(e)
         erro_detalhado = traceback.format_exc()
-        print("--- ERRO COMPLETO DO GEMINI ---")
+        print("--- ERRO COMPLETO DO GEMINI / SERVIDOR ---")
         print(erro_detalhado)
-        print("-------------------------------")
+        print("------------------------------------------")
         
-        if "429" in erro_str or "quota" in erro_str.lower():
-            return jsonify({
-                "resposta": "⚠️ O limite temporário de requisições da API do Gemini foi atingido (Erro 429). Por favor, aguarde cerca de 15 a 30 segundos e envie sua pergunta novamente."
-            })
-            
-        return jsonify({"resposta": f"🚨 ERRO TÉCNICO: {str(e)}"})
+        return jsonify({
+            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda nos servidores do Google): {str(e)}"
+        })
 
 @app.route("/logout", methods=["POST"])
 def logout():

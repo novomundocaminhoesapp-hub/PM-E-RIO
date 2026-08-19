@@ -1,13 +1,11 @@
 import json
 import os
+import time
 from datetime import datetime
 import re
 import urllib.parse
 import traceback
 from google import genai
-
-# Configuração da chave para testes locais
-
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
@@ -38,10 +36,22 @@ escopos = [
     "https://www.googleapis.com/auth/drive"
 ]
 
+# CACHE GLOBAL DA IA PARA EVITAR TIMEOUT (5 MINUTOS)
+CACHE_IA = {
+    "contexto_sistema": "",
+    "timestamp": 0
+}
+TEMPO_CACHE_SEGUNDOS = 300
+
 
 def criar_cliente_gemini():
-    """Cria o cliente do Gemini usando a GEMINI_API_KEY (Google AI Studio - 100% Gratuito)."""
+    """Cria o cliente do Gemini usando a GEMINI_API_KEY do ambiente."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "A variável de ambiente GEMINI_API_KEY não foi configurada."
+        )
+    return genai.Client(api_key=api_key)
     if not api_key:
         raise RuntimeError(
             "A variável de ambiente GEMINI_API_KEY não foi configurada. "
@@ -825,7 +835,7 @@ def acessar_modulo(nome_modulo):
                     foco_formatado = destacar_termos(foco)
                     descricao_formatada = destacar_termos(descricao)
 
-                    nome_vendedor = session.get("nome", "André Santana")
+                    nome_vendedor = session.get("nome", "Usuário")
                     contato_texto = f"{nome_vendedor}, Torre de Controle da Novo Mundo Caminhões - 📞 (81) 99686-0674"
 
                     agora = datetime.now()
@@ -940,7 +950,7 @@ def acessar_modulo(nome_modulo):
                     descricao_formatada = destacar_termos(descricao)
                     coberturas_formatadas = destacar_termos(coberturas)
 
-                    nome_vendedor = session.get("nome", "André Santana")
+                    nome_vendedor = session.get("nome", "Usuário")
                     contato_texto = f"{nome_vendedor}, Torre de Controle da Novo Mundo Caminhões - 📞 (81) 99686-0674"
 
                     agora = datetime.now()
@@ -1320,7 +1330,7 @@ def acessar_modulo(nome_modulo):
                     pergunta_val = item_escolhido.get("QUESTIONAMENTO", "")
                     resposta_val = item_escolhido.get("RESPOSTA", "")
 
-                    nome_vendedor = session.get("nome", "André Santana")
+                    nome_vendedor = session.get("nome", "Usuário")
                     contato_texto = f"{nome_vendedor}, Torre de Controle da Novo Mundo Caminhões - 📞 (81) 99686-0674"
 
                     texto_whatsapp = f"💡 *Questionamento:* {pergunta_val}\n\n💬 *Resposta / Argumento:* {resposta_val}\n\n👤 *Contato:* {contato_texto}"
@@ -1559,6 +1569,8 @@ def acessar_modulo(nome_modulo):
 
 @app.route("/api/chat-ia", methods=["POST"])
 def chat_ia():
+    global CACHE_IA
+    
     if not session.get("logado"):
         return jsonify({"resposta": "Sessão expirada. Faça login novamente."}), 401
     
@@ -1579,56 +1591,70 @@ def chat_ia():
         })
 
     try:
-        planilha = conectar_google_sheets()
-        contexto_abas = []
+        agora = time.time()
         
-        try:
-            todas_as_abas = planilha.worksheets()
-            for aba in todas_as_abas:
-                nome_aba = aba.title
-                try:
-                    registros = aba.get_all_records()
-                    linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros]
-                    contexto_abas.append(f"### ABA DA PLANILHA: {nome_aba}\n" + "\n".join(linhas_texto))
-                except Exception:
+        # VERIFICAÇÃO DO CACHE (Atualiza se estiver vazio ou se passou de 5 minutos)
+        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
+            print("🔄 IA: Atualizando cache de dados (Lendo Planilha e Google Drive)...")
+            planilha = conectar_google_sheets()
+            contexto_abas = []
+            
+            try:
+                todas_as_abas = planilha.worksheets()
+                for aba in todas_as_abas:
+                    nome_aba = aba.title
                     try:
-                        valores = aba.get_all_values()
-                        linhas_texto = [f"- " + " | ".join([str(c) for c in linha if str(c).strip()]) for linha in valores]
-                        contexto_abas.append(f"### ABA DA PLANILHA (Valores): {nome_aba}\n" + "\n".join(linhas_texto))
+                        registros = aba.get_all_records()
+                        linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros]
+                        contexto_abas.append(f"### ABA DA PLANILHA: {nome_aba}\n" + "\n".join(linhas_texto))
                     except Exception:
-                        pass
-        except Exception as e:
-            print(f"Erro ao varrer abas da planilha: {e}")
-        
-        dados_planilha = "\n\n".join(contexto_abas)
-        
-        dados_drive, _ = obter_conteudo_pastas_drive()
+                        try:
+                            valores = aba.get_all_values()
+                            linhas_texto = [f"- " + " | ".join([str(c) for c in linha if str(c).strip()]) for linha in valores]
+                            contexto_abas.append(f"### ABA DA PLANILHA (Valores): {nome_aba}\n" + "\n".join(linhas_texto))
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"Erro ao varrer abas da planilha: {e}")
+            
+            dados_planilha = "\n\n".join(contexto_abas)
+            
+            dados_drive, _ = obter_conteudo_pastas_drive()
 
-        instrucao_sistema = (
-            "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
-            "DIRETRIZES DE COMPORTAMENTO:\n"
-            "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
-            "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e TODOS OS ARQUIVOS/PASTAS do Google Drive: Modelos, Vídeos, Circulares, Base de Conhecimento e Documentos).\n"
-            "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
-            "'Você precisa formular sua pergunta com base no conteúdo do App.'\n"
-            "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática (destacando pontos importantes como PBT, especificações, motorização, valores ou regras de contratos).\n"
-            "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
-            "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
-            f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
-            f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (Modelos, Vídeos, Circulares, Docs) ===\n{dados_drive}"
-        )
+            instrucao_sistema = (
+                "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
+                "DIRETRIZES DE COMPORTAMENTO:\n"
+                "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
+                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e TODOS OS ARQUIVOS/PASTAS do Google Drive: Modelos, Vídeos, Circulares, Base de Conhecimento e Documentos).\n"
+                "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
+                "'Você precisa formular sua pergunta com base no conteúdo do App.'\n"
+                "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática (destacando pontos importantes como PBT, especificações, motorização, valores ou regras de contratos).\n"
+                "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
+                "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
+                f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
+                f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (Modelos, Vídeos, Circulares, Docs) ===\n{dados_drive}"
+            )
+            
+            CACHE_IA["contexto_sistema"] = instrucao_sistema
+            CACHE_IA["timestamp"] = agora
+        else:
+            print("⚡ IA: Usando dados em cache (Evitando chamadas desnecessárias).")
 
         client = criar_cliente_gemini()
         
         prompt_final = f"""
-        {instrucao_sistema}
+        {CACHE_IA["contexto_sistema"]}
 
         PERGUNTA DO USUÁRIO:
         {pergunta_usuario}
         """
 
-                # SISTEMA DE CONTINGÊNCIA (FALLBACK) ENTRE MODELOS PARA EVITAR ERROS 503 DE ALTA DEMANDA
-        modelos_para_tentar = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro"]
+        # SISTEMA DE CONTINGÊNCIA (FALLBACK) COM MODELOS DA LINHA 3.x
+        modelos_para_tentar = [
+            "gemini-3.6-flash", 
+            "gemini-3.5-flash-lite", 
+            "gemini-3.1-pro"
+        ]
         response = None
         ultimo_erro = None
 
@@ -1660,7 +1686,7 @@ def chat_ia():
         print("------------------------------------------")
         
         return jsonify({
-            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda nos servidores do Google): {str(e)}"
+            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda ou falha de leitura): {str(e)}"
         })
 
 @app.route("/logout", methods=["POST"])

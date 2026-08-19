@@ -346,7 +346,6 @@ TEMPLATE_HTML = """
         .iframe-container { position: relative; width: 100%; padding-bottom: 56.25%; height: 0; background: #000; }
         .iframe-container iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 0; }
 
-        /* Estilos do Widget da IA */
         #ai-float-btn {
             position: fixed; bottom: 24px; right: 24px; width: 60px; height: 60px;
             background: #002244; border-radius: 50%; display: flex; align-items: center;
@@ -538,7 +537,6 @@ TEMPLATE_HTML = """
             </div>
         </div>
     {% else %}
-        <!-- BARRA SUPERIOR -->
         <header class="topbar">
             <div class="topbar-left">
                 <button class="menu-hamburger" onclick="toggleDrawer()">☰</button>
@@ -614,7 +612,6 @@ TEMPLATE_HTML = """
             </div>
         </div>
 
-        <!-- WIDGET FLUTUANTE DA IA -->
         <div id="ai-float-btn" onclick="toggleAIChat()" title="Assistente IA - Novo Mundo">
             <img src="{{ url_for('static', filename='logo.png') }}" alt="IA">
             <span class="ai-pulse-ring"></span>
@@ -1577,7 +1574,7 @@ def chat_ia():
     
     if len(palavras) < 3 or texto_lower in cumprimentos:
         return jsonify({
-            "resposta": "Olá! Você precisa formular sua pergunta com base no conteúdo do App."
+            "resposta": "Resposta não encontrada no APP, deseja reformular a pergunta?"
         })
 
     try:
@@ -1615,7 +1612,7 @@ def chat_ia():
                 "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
                 "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e a listagem de arquivos e links do Google Drive).\n"
                 "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
-                "'Você precisa formular sua pergunta com base no conteúdo do App.'\n"
+                "'Resposta não encontrada no APP, deseja reformular a pergunta?'\n"
                 "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática.\n"
                 "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
                 "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"

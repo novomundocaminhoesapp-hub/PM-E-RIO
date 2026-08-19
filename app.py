@@ -368,8 +368,8 @@ TEMPLATE_HTML = """
             z-index: 9998; display: none; flex-direction: column; overflow: hidden; border: 1px solid #cbd5e0;
         }
         .ai-chat-header {
-            background: #002244; color: white; padding: 10px 16px; font-weight: 600;
-            display: flex; justify-content: space-between; align-items: center; font-size: 14px;
+            background: #002244; color: white; padding: 12px 16px; font-weight: 600;
+            display: flex; justify-content: space-between; align-items: center;
         }
         .ai-chat-body {
             flex-grow: 1; padding: 12px; overflow-y: auto; background: #f7fafc;
@@ -381,21 +381,9 @@ TEMPLATE_HTML = """
         .ai-chat-footer input {
             flex-grow: 1; padding: 8px 12px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 14px; background: #f7fafc;
         }
-        .ai-msg { max-width: 85%; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4; word-break: break-word; }
+        .ai-msg { max-width: 80%; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4; }
         .ai-msg.bot { background: #e2e8f0; color: #2d3748; align-self: flex-start; }
-        .ai-msg.bot a { color: #0056b3; font-weight: 600; text-decoration: underline; }
         .ai-msg.user { background: #002244; color: #ffffff; align-self: flex-end; }
-        .ai-typing span {
-            height: 7px; width: 7px; float: left; margin: 0 2px; background-color: #90949c;
-            border-radius: 50%; display: inline-block; animation: typing 1s infinite ease-in-out;
-        }
-        .ai-typing span:nth-of-type(2) { animation-delay: 0.2s; }
-        .ai-typing span:nth-of-type(3) { animation-delay: 0.4s; }
-        @keyframes typing {
-            0% { transform: translateY(0); }
-            50% { transform: translateY(-5px); }
-            100% { transform: translateY(0); }
-        }
     </style>
     <script>
         function toggleDrawer() {
@@ -449,19 +437,6 @@ TEMPLATE_HTML = """
             modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
         }
 
-        function limparCacheIA() {
-            fetch('/api/limpar-cache', { method: 'POST' })
-            .then(res => res.json()).then(data => {
-                alert(data.mensagem || "Cache limpo com sucesso!");
-            }).catch(() => alert("Erro ao limpar cache."));
-        }
-
-        function formatarLinksTexto(texto) {
-            if (!texto) return "";
-            var expUrl = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
-            return texto.replace(expUrl, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
-        }
-
         function ouvirVoz() {
             if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
                 alert("Seu navegador não suporta reconhecimento de voz.");
@@ -487,13 +462,8 @@ TEMPLATE_HTML = """
             var mensagem = input.value.trim();
             if (!mensagem) return;
             var chatBody = document.getElementById('ai-chat-messages');
-            
             chatBody.innerHTML += `<div class="ai-msg user">${mensagem}</div>`;
             input.value = '';
-            chatBody.scrollTop = chatBody.scrollHeight;
-
-            var idDigitando = 'typing-' + Date.now();
-            chatBody.innerHTML += `<div id="${idDigitando}" class="ai-msg bot ai-typing"><span></span><span></span><span></span></div>`;
             chatBody.scrollTop = chatBody.scrollHeight;
 
             fetch('/api/chat-ia', {
@@ -502,17 +472,11 @@ TEMPLATE_HTML = """
                 body: JSON.stringify({ mensagem: mensagem })
             })
             .then(response => response.json().then(data => {
-                var elemTyping = document.getElementById(idDigitando);
-                if (elemTyping) elemTyping.remove();
-
                 var respostaBot = data.resposta || "Desculpe, ocorreu um erro.";
-                var respostaFormatada = formatarLinksTexto(respostaBot);
-                chatBody.innerHTML += `<div class="ai-msg bot">${respostaFormatada}</div>`;
+                chatBody.innerHTML += `<div class="ai-msg bot">${respostaBot}</div>`;
                 chatBody.scrollTop = chatBody.scrollHeight;
             }))
             .catch(error => {
-                var elemTyping = document.getElementById(idDigitando);
-                if (elemTyping) elemTyping.remove();
                 chatBody.innerHTML += `<div class="ai-msg bot">Erro de conexão ou resposta inválida do servidor de IA.</div>`;
                 chatBody.scrollTop = chatBody.scrollHeight;
             });
@@ -617,10 +581,7 @@ TEMPLATE_HTML = """
                 <li class="drawer-item {% if modulo_ativo == 'argumentos' %}active{% endif %}">
                     <a href="/modulo/argumentos" onclick="closeDrawer()"><span class="drawer-icon">💡</span> Argumentos de Venda</a>
                 </li>
-                <li class="drawer-item" style="margin-top: 10px; border-top: 1px solid #edf2f7;">
-                    <button type="button" onclick="limparCacheIA()" style="color: #2b6cb0;"><span class="drawer-icon">🔄</span> Atualizar Base IA</button>
-                </li>
-                <li class="drawer-item" style="border-top: 1px solid #edf2f7;">
+                <li class="drawer-item" style="margin-top: 20px; border-top: 1px solid #edf2f7;">
                     <form action="/logout" method="POST" style="margin: 0; width: 100%;">
                         <button type="submit"><span class="drawer-icon">🚪</span> Sair da Conta</button>
                     </form>
@@ -721,7 +682,6 @@ def login():
                     session["logado"] = True
                     session["nome"] = usuario_encontrado.get("NOME")
                     session["perfil"] = usuario_encontrado.get("PERFIL")
-                    session.pop("historico_ia", None)
                     
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
 
@@ -1595,13 +1555,6 @@ def acessar_modulo(nome_modulo):
         modulo_titulo=modulo_titulo
     )
 
-@app.route("/api/limpar-cache", methods=["POST"])
-def limpar_cache():
-    global CACHE_IA
-    CACHE_IA["contexto_sistema"] = ""
-    CACHE_IA["timestamp"] = 0
-    return jsonify({"mensagem": "Base de dados e cache da IA atualizados com sucesso!"})
-
 @app.route("/api/chat-ia", methods=["POST"])
 def chat_ia():
     global CACHE_IA
@@ -1668,28 +1621,16 @@ def chat_ia():
             )
             
             CACHE_IA["contexto_sistema"] = instrucao_sistema
-            CACHE_IA["timestamp"] = agorap
+            CACHE_IA["timestamp"] = agora
         else:
             print("⚡ IA: Usando dados em cache.")
-
-        if "historico_ia" not in session:
-            session["historico_ia"] = []
-
-        historico_atual = session["historico_ia"]
-        
-        prompt_historico = ""
-        for h in historico_atual:
-            prompt_historico += f"Usuário: {h['user']}\nAssistente: {h['bot']}\n"
 
         client = criar_cliente_gemini()
         
         prompt_final = f"""
         {CACHE_IA["contexto_sistema"]}
 
-        HISTÓRICO RECENTE DA CONVERSA:
-        {prompt_historico}
-
-        PERGUNTA ATUAL DO USUÁRIO:
+        PERGUNTA DO USUÁRIO:
         {pergunta_usuario}
         """
 
@@ -1718,16 +1659,8 @@ def chat_ia():
         if not response or not response.text:
             raise RuntimeError(f"Todos os modelos estão temporariamente ocupados. Último erro: {ultimo_erro}")
 
-        resposta_ia = response.text
-
-        historico_atual.append({"user": pergunta_usuario, "bot": resposta_ia})
-        if len(historico_atual) > 3:
-            historico_atual.pop(0)
-        session["historico_ia"] = historico_atual
-        session.modified = True
-
         return jsonify({
-            "resposta": resposta_ia
+            "resposta": response.text
         })
 
     except Exception as e:

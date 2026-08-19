@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import io
 from datetime import datetime
 import re
 import urllib.parse
@@ -10,7 +11,9 @@ from google import genai
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 import gspread
+from pypdf import PdfReader
 
 app = Flask(__name__)
 app.secret_key = "chave_secreta_pm_rio"
@@ -30,13 +33,11 @@ NOMES_MODULOS = {
     "argumentos": "Argumentos de Venda"
 }
 
-# Escopos usados apenas pelo Google Sheets e Drive.
 escopos = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# CACHE GLOBAL DA IA PARA EVITAR TIMEOUT (5 MINUTOS)
 CACHE_IA = {
     "contexto_sistema": "",
     "timestamp": 0
@@ -45,19 +46,12 @@ TEMPO_CACHE_SEGUNDOS = 300
 
 
 def criar_cliente_gemini():
-    """Cria o cliente do Gemini usando a GEMINI_API_KEY do ambiente."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(
-            "A variável de ambiente GEMINI_API_KEY não foi configurada."
-        )
-    return genai.Client(api_key=api_key)
-    if not api_key:
-        raise RuntimeError(
             "A variável de ambiente GEMINI_API_KEY não foi configurada. "
-            "Crie sua chave gratuita no Google AI Studio e defina GEMINI_API_KEY."
+            "Defina GEMINI_API_KEY no seu ambiente."
         )
-    print("🤖 Gemini: usando GEMINI_API_KEY (Google AI Studio - Gratuito)")
     return genai.Client(api_key=api_key)
 
 
@@ -98,22 +92,50 @@ def obter_conteudo_pastas_drive():
         service = build('drive', 'v3', credentials=credenciais)
         
         results = service.files().list(
-            pageSize=300,
-            fields="files(id, name, mimeType, webViewLink, parents)"
+            pageSize=100,
+            fields="files(id, name, mimeType, webViewLink)"
         ).execute()
         files = results.get('files', [])
         
-        lista_arquivos = []
+        lista_dados_arquivos = []
         mapa_links = {}
+        
         for f in files:
+            file_id = f.get('id')
             nome = f.get('name')
             link = f.get('webViewLink', '')
             mime = f.get('mimeType', '')
-            lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}")
+            
             if nome:
                 mapa_links[nome.strip().lower()] = link
+            
+            # Se for PDF, tenta ler o conteúdo interno do arquivo
+            texto_pdf = ""
+            if mime == "application/pdf" and file_id:
+                try:
+                    request_file = service.files().get_media(fileId=file_id)
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request_file)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                    
+                    fh.seek(0)
+                    reader = PdfReader(fh)
+                    extracted_text = []
+                    for page in reader.pages:
+                        t = page.extract_text()
+                        if t:
+                            extracted_text.append(t)
+                    texto_pdf = "\n".join(extracted_text)
+                except Exception as ex:
+                    texto_pdf = f"[Não foi possível ler o texto do PDF: {ex}]"
+            
+            lista_dados_arquivos.append(
+                f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}\n  Conteúdo Extraído:\n  {texto_pdf if texto_pdf else '[Sem texto ou não é PDF]'}"
+            )
                 
-        return "\n".join(lista_arquivos), mapa_links
+        return "\n\n".join(lista_dados_arquivos), mapa_links
     except Exception as e:
         return f"Não foi possível listar os arquivos do Drive: {e}", {}
 
@@ -1580,7 +1602,6 @@ def chat_ia():
     if not pergunta_usuario:
         return jsonify({"resposta": "Por favor, digite uma pergunta."})
 
-    # TRATAMENTO RÁPIDO PARA CUMPRIMENTOS OU FRASES MUITO CURTAS (< 3 PALAVRAS)
     palavras = pergunta_usuario.split()
     texto_lower = pergunta_usuario.lower()
     cumprimentos = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "tudo bem", "eae", "hey", "salve"]
@@ -1593,9 +1614,8 @@ def chat_ia():
     try:
         agora = time.time()
         
-        # VERIFICAÇÃO DO CACHE (Atualiza se estiver vazio ou se passou de 5 minutos)
         if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
-            print("🔄 IA: Atualizando cache de dados (Lendo Planilha e Google Drive)...")
+            print("🔄 IA: Atualizando cache de dados (Lendo Planilha e Extraindo Texto dos PDFs do Drive)...")
             planilha = conectar_google_sheets()
             contexto_abas = []
             
@@ -1618,27 +1638,26 @@ def chat_ia():
                 print(f"Erro ao varrer abas da planilha: {e}")
             
             dados_planilha = "\n\n".join(contexto_abas)
-            
             dados_drive, _ = obter_conteudo_pastas_drive()
 
             instrucao_sistema = (
                 "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
                 "DIRETRIZES DE COMPORTAMENTO:\n"
                 "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
-                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e TODOS OS ARQUIVOS/PASTAS do Google Drive: Modelos, Vídeos, Circulares, Base de Conhecimento e Documentos).\n"
+                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e o TEXTO EXTRAÍDO de todos os PDFs e documentos do Google Drive).\n"
                 "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
                 "'Você precisa formular sua pergunta com base no conteúdo do App.'\n"
-                "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática (destacando pontos importantes como PBT, especificações, motorização, valores ou regras de contratos).\n"
+                "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática.\n"
                 "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
                 "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
                 f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
-                f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE (Modelos, Vídeos, Circulares, Docs) ===\n{dados_drive}"
+                f"=== CONTEÚDO EXTRAÍDO DOS ARQUIVOS DO GOOGLE DRIVE (PDFs e Docs) ===\n{dados_drive}"
             )
             
             CACHE_IA["contexto_sistema"] = instrucao_sistema
             CACHE_IA["timestamp"] = agora
         else:
-            print("⚡ IA: Usando dados em cache (Evitando chamadas desnecessárias).")
+            print("⚡ IA: Usando dados em cache.")
 
         client = criar_cliente_gemini()
         
@@ -1649,7 +1668,6 @@ def chat_ia():
         {pergunta_usuario}
         """
 
-        # SISTEMA DE CONTINGÊNCIA (FALLBACK) COM MODELOS DA LINHA 3.x
         modelos_para_tentar = [
             "gemini-3.6-flash", 
             "gemini-3.5-flash-lite", 

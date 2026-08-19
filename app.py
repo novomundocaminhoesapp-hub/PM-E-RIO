@@ -1,7 +1,6 @@
 import json
 import os
 import time
-import io
 from datetime import datetime
 import re
 import urllib.parse
@@ -11,9 +10,7 @@ from google import genai
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 import gspread
-from pypdf import PdfReader
 
 app = Flask(__name__)
 app.secret_key = "chave_secreta_pm_rio"
@@ -92,50 +89,22 @@ def obter_conteudo_pastas_drive():
         service = build('drive', 'v3', credentials=credenciais)
         
         results = service.files().list(
-            pageSize=100,
+            pageSize=150,
             fields="files(id, name, mimeType, webViewLink)"
         ).execute()
         files = results.get('files', [])
         
-        lista_dados_arquivos = []
+        lista_arquivos = []
         mapa_links = {}
-        
         for f in files:
-            file_id = f.get('id')
             nome = f.get('name')
             link = f.get('webViewLink', '')
             mime = f.get('mimeType', '')
-            
+            lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}")
             if nome:
                 mapa_links[nome.strip().lower()] = link
-            
-            # Se for PDF, tenta ler o conteúdo interno do arquivo
-            texto_pdf = ""
-            if mime == "application/pdf" and file_id:
-                try:
-                    request_file = service.files().get_media(fileId=file_id)
-                    fh = io.BytesIO()
-                    downloader = MediaIoBaseDownload(fh, request_file)
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
-                    
-                    fh.seek(0)
-                    reader = PdfReader(fh)
-                    extracted_text = []
-                    for page in reader.pages:
-                        t = page.extract_text()
-                        if t:
-                            extracted_text.append(t)
-                    texto_pdf = "\n".join(extracted_text)
-                except Exception as ex:
-                    texto_pdf = f"[Não foi possível ler o texto do PDF: {ex}]"
-            
-            lista_dados_arquivos.append(
-                f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}\n  Conteúdo Extraído:\n  {texto_pdf if texto_pdf else '[Sem texto ou não é PDF]'}"
-            )
                 
-        return "\n\n".join(lista_dados_arquivos), mapa_links
+        return "\n".join(lista_arquivos), mapa_links
     except Exception as e:
         return f"Não foi possível listar os arquivos do Drive: {e}", {}
 
@@ -1615,7 +1584,7 @@ def chat_ia():
         agora = time.time()
         
         if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
-            print("🔄 IA: Atualizando cache de dados (Lendo Planilha e Extraindo Texto dos PDFs do Drive)...")
+            print("🔄 IA: Atualizando cache de dados (Planilha e Listagem do Drive)...")
             planilha = conectar_google_sheets()
             contexto_abas = []
             
@@ -1644,14 +1613,14 @@ def chat_ia():
                 "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
                 "DIRETRIZES DE COMPORTAMENTO:\n"
                 "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
-                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e o TEXTO EXTRAÍDO de todos os PDFs e documentos do Google Drive).\n"
+                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e a listagem de arquivos e links do Google Drive).\n"
                 "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
                 "'Você precisa formular sua pergunta com base no conteúdo do App.'\n"
                 "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática.\n"
                 "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
                 "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
                 f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
-                f"=== CONTEÚDO EXTRAÍDO DOS ARQUIVOS DO GOOGLE DRIVE (PDFs e Docs) ===\n{dados_drive}"
+                f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE ===\n{dados_drive}"
             )
             
             CACHE_IA["contexto_sistema"] = instrucao_sistema

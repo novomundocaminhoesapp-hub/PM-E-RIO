@@ -106,7 +106,7 @@ def obter_conteudo_pastas_drive():
                 
         return "\n".join(lista_arquivos), mapa_links
     except Exception as e:
-        return f"Não foi possível listar os arquivos do Drive: {e}", {}
+        return f"Não foi possível listar os arquivos du Drive: {e}", {}
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     try:
@@ -1615,6 +1615,15 @@ def chat_ia():
     if not pergunta_usuario:
         return jsonify({"resposta": "Por favor, digite uma pergunta."})
 
+    palavras = pergunta_usuario.split()
+    texto_lower = pergunta_usuario.lower()
+    cumprimentos = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "tudo bem", "eae", "hey", "salve"]
+    
+    if len(palavras) < 3 or texto_lower in cumprimentos:
+        return jsonify({
+            "resposta": "Resposta não encontrada no APP, deseja reformular a pergunta?"
+        })
+
     try:
         agora = time.time()
         
@@ -1670,28 +1679,66 @@ def chat_ia():
         
         prompt_historico = ""
         for h in historico_atual:
-            prompt_historico += f"Usuário: {h['usuario']}\nAssistente: {h['bot']}\n"
-        
-        prompt_final = f"{CACHE_IA['contexto_sistema']}\n\nHistorico da conversa:\n{prompt_historico}\nUsuário: {pergunta_usuario}\nAssistente:"
+            prompt_historico += f"Usuário: {h['user']}\nAssistente: {h['bot']}\n"
 
         client = criar_cliente_gemini()
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt_final,
-        )
+        
+        prompt_final = f"""
+        {CACHE_IA["contexto_sistema"]}
 
-        resposta_bot = response.text.strip() if response.text else "Desculpe, não consegui obter uma resposta."
+        HISTÓRICO RECENTE DA CONVERSA:
+        {prompt_historico}
 
-        historico_atual.append({"usuario": pergunta_usuario, "bot": resposta_bot})
-        if len(historico_atual) > 6:
-            historico_atual = historico_atual[-6:]
+        PERGUNTA ATUAL DO USUÁRIO:
+        {pergunta_usuario}
+        """
+
+        modelos_para_tentar = [
+            "gemini-3.6-flash", 
+            "gemini-3.5-flash-lite", 
+            "gemini-3.1-pro"
+        ]
+        response = None
+        ultimo_erro = None
+
+        for modelo_atual in modelos_para_tentar:
+            try:
+                print(f"🤖 Tentando IA com o modelo: {modelo_atual}")
+                response = client.models.generate_content(
+                    model=modelo_atual,
+                    contents=prompt_final
+                )
+                if response and response.text:
+                    break
+            except Exception as err:
+                ultimo_erro = err
+                print(f"⚠️ Falha temporária com o modelo {modelo_atual}: {err}")
+                continue
+
+        if not response or not response.text:
+            raise RuntimeError(f"Todos os modelos estão temporariamente ocupados. Último erro: {ultimo_erro}")
+
+        resposta_ia = response.text
+
+        historico_atual.append({"user": pergunta_usuario, "bot": resposta_ia})
+        if len(historico_atual) > 3:
+            historico_atual.pop(0)
         session["historico_ia"] = historico_atual
+        session.modified = True
 
-        return jsonify({"resposta": resposta_bot})
+        return jsonify({
+            "resposta": resposta_ia
+        })
 
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({"resposta": f"Erro interno no processamento da IA: {e}"}), 500
+        erro_detalhado = traceback.format_exc()
+        print("--- ERRO COMPLETO DO GEMINI / SERVIDOR ---")
+        print(erro_detalhado)
+        print("------------------------------------------")
+        
+        return jsonify({
+            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda ou falha de leitura): {str(e)}"
+        })
 
 @app.route("/logout", methods=["POST"])
 def logout():
@@ -1699,4 +1746,4 @@ def logout():
     return redirect(url_for("login"))
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(debug=True)

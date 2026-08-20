@@ -106,7 +106,7 @@ def obter_conteudo_pastas_drive():
                 
         return "\n".join(lista_arquivos), mapa_links
     except Exception as e:
-        return f"Não foi possível listar os arquivos do Drive: {e}", {}
+        return f"Não foi possível listar os arquivos du Drive: {e}", {}
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     try:
@@ -383,6 +383,7 @@ TEMPLATE_HTML = """
         }
         .ai-msg { max-width: 85%; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4; word-break: break-word; }
         .ai-msg.bot { background: #e2e8f0; color: #2d3748; align-self: flex-start; }
+        .ai-msg.bot a { color: #0056b3; font-weight: 600; text-decoration: underline; }
         .ai-msg.user { background: #002244; color: #ffffff; align-self: flex-end; }
         .ai-typing span {
             height: 7px; width: 7px; float: left; margin: 0 2px; background-color: #90949c;
@@ -457,8 +458,17 @@ TEMPLATE_HTML = """
 
         function formatarLinksTexto(texto) {
             if (!texto) return "";
+            
+            var expMarkdown = /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g;
+            texto = texto.replace(expMarkdown, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+            
             var expUrl = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
-            return texto.replace(expUrl, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color: #0066cc; text-decoration: underline;">$1</a>');
+            texto = texto.replace(expUrl, function(match) {
+                if (match.includes('href=')) return match;
+                return '<a href="' + match + '" target="_blank" rel="noopener noreferrer">' + match + '</a>';
+            });
+            
+            return texto;
         }
 
         function ouvirVoz() {
@@ -720,7 +730,7 @@ def login():
                     session["logado"] = True
                     session["nome"] = usuario_encontrado.get("NOME")
                     session["perfil"] = usuario_encontrado.get("PERFIL")
-                    session.pop("historico_ia", None) # Limpa histórico ao logar
+                    session.pop("historico_ia", None)
                     
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
 
@@ -1671,16 +1681,17 @@ def chat_ia():
         else:
             print("⚡ IA: Usando dados em cache.")
 
-        # Recupera ou inicializa o histórico de conversas na sessão do usuário
         if "historico_ia" not in session:
             session["historico_ia"] = []
 
-        # Mantém as últimas 6 interações (3 turnos de conversa) para contexto
         historico_atual = session["historico_ia"]
         
         prompt_historico = ""
         for h in historico_atual:
-            prompt_historico += f"Usuário: {h['user']}\nAssistente: {h['bot']}\n"
+            # 💡 SOLUÇÃO DO KEYERROR AQUI: Usa h.get para não quebrar se o formato antigo 'usuario' estiver salvo nos cookies
+            usr = h.get("user", h.get("usuario", ""))
+            ast = h.get("bot", h.get("assistente", ""))
+            prompt_historico += f"Usuário: {usr}\nAssistente: {ast}\n"
 
         client = criar_cliente_gemini()
         
@@ -1694,10 +1705,11 @@ def chat_ia():
         {pergunta_usuario}
         """
 
+        # 💡 SOLUÇÃO DOS MODELOS AQUI: Usar os nomes oficiais do SDK Google GenAI
         modelos_para_tentar = [
-            "gemini-3.6-flash", 
-            "gemini-3.5-flash-lite", 
-            "gemini-3.1-pro"
+            "gemini-2.0-flash", 
+            "gemini-1.5-flash", 
+            "gemini-1.5-pro"
         ]
         response = None
         ultimo_erro = None
@@ -1721,7 +1733,6 @@ def chat_ia():
 
         resposta_ia = response.text
 
-        # Atualiza o histórico na sessão
         historico_atual.append({"user": pergunta_usuario, "bot": resposta_ia})
         if len(historico_atual) > 3:
             historico_atual.pop(0)
@@ -1739,7 +1750,7 @@ def chat_ia():
         print("------------------------------------------")
         
         return jsonify({
-            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda ou falha de leitura): {str(e)}"
+            "resposta": f"🚨 Ocorreu um erro interno: {str(e)}"
         })
 
 @app.route("/logout", methods=["POST"])

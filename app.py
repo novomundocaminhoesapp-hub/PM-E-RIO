@@ -88,25 +88,34 @@ def obter_conteudo_pastas_drive():
         
         service = build('drive', 'v3', credentials=credenciais)
         
-        results = service.files().list(
-            pageSize=150,
-            fields="files(id, name, mimeType, webViewLink)"
-        ).execute()
-        files = results.get('files', [])
-        
         lista_arquivos = []
         mapa_links = {}
-        for f in files:
-            nome = f.get('name')
-            link = f.get('webViewLink', '')
-            mime = f.get('mimeType', '')
-            lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}")
-            if nome:
-                mapa_links[nome.strip().lower()] = link
+        page_token = None
+        
+        while True:
+            results = service.files().list(
+                pageSize=1000,
+                fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                pageToken=page_token
+            ).execute()
+            
+            files = results.get('files', [])
+            
+            for f in files:
+                nome = f.get('name')
+                link = f.get('webViewLink', '')
+                mime = f.get('mimeType', '')
+                lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime} | Link: {link}")
+                if nome:
+                    mapa_links[nome.strip().lower()] = link
+                    
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
                 
         return "\n".join(lista_arquivos), mapa_links
     except Exception as e:
-        return f"Não foi possível listar os arquivos du Drive: {e}", {}
+        return f"Não foi possível listar os arquivos do Drive: {e}", {}
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     try:
@@ -459,14 +468,11 @@ TEMPLATE_HTML = """
      function formatarLinksTexto(texto) {
             if (!texto) return "";
             
-            // 1. Converte links no formato Markdown [Texto](url) para <a href="url" target="_blank">Texto</a>
             var expMarkdown = /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g;
             texto = texto.replace(expMarkdown, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
             
-            // 2. Converte URLs soltas que não estavam em formato Markdown em links clicáveis
             var expUrl = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
             texto = texto.replace(expUrl, function(match) {
-                // Evita duplicar tag <a> caso a URL já tenha sido convertida no passo anterior
                 if (match.includes('href=')) return match;
                 return '<a href="' + match + '" target="_blank" rel="noopener noreferrer">' + match + '</a>';
             });
@@ -1691,7 +1697,6 @@ def chat_ia():
         
         prompt_historico = ""
         for h in historico_atual:
-            # Proteção contra formatos antigos salvos nos cookies (Evita o KeyError)
             usr = h.get("user", h.get("usuario", ""))
             ast = h.get("bot", h.get("assistente", ""))
             prompt_historico += f"Usuário: {usr}\nAssistente: {ast}\n"
@@ -1708,7 +1713,6 @@ def chat_ia():
         {pergunta_usuario}
         """
 
-        # Mantendo seus modelos exatos da imagem
         modelos_para_tentar = [
             "gemini-3.6-flash", 
             "gemini-3.5-flash-lite", 

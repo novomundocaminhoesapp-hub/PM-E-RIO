@@ -493,7 +493,6 @@ TEMPLATE_HTML = """
             var expMarkdown = /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g;
             texto = texto.replace(expMarkdown, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
             
-            // CORRIGIDO: Adicionado a-z para capturar URLs minúsculas do Google Drive / YouTube corretamente
             var expUrl = /(\b(https?|ftp|file):\/\/[-a-zA-Z0-9+&@#\/%?=~_|!:,.;]*[-a-zA-Z0-9+&@#\/%=~_|])/ig;
             texto = texto.replace(expUrl, function(match) {
                 if (match.includes('href=')) return match;
@@ -1712,7 +1711,7 @@ def chat_ia():
             ast = h.get("bot", h.get("assistente", ""))
             prompt_historico += f"Usuário: {usr}\nAssistente: {ast}\n"
 
-        client = criar_client_gemini()
+        client = criar_cliente_gemini()
         
         prompt_final = f"""
         {CACHE_IA["contexto_sistema"]}

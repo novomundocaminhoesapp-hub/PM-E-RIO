@@ -383,7 +383,6 @@ TEMPLATE_HTML = """
         }
         .ai-msg { max-width: 85%; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4; word-break: break-word; }
         .ai-msg.bot { background: #e2e8f0; color: #2d3748; align-self: flex-start; }
-        .ai-msg.bot a { color: #0056b3; font-weight: 600; text-decoration: underline; word-break: break-all; }
         .ai-msg.user { background: #002244; color: #ffffff; align-self: flex-end; }
         .ai-typing span {
             height: 7px; width: 7px; float: left; margin: 0 2px; background-color: #90949c;
@@ -458,10 +457,8 @@ TEMPLATE_HTML = """
 
         function formatarLinksTexto(texto) {
             if (!texto) return "";
-            var expUrl = /(https?:\/\/[^\s]+)/g;
-            return texto.replace(expUrl, function(url) {
-                return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + url + '</a>';
-            });
+            var expUrl = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
+            return texto.replace(expUrl, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color: #0066cc; text-decoration: underline;">$1</a>');
         }
 
         function ouvirVoz() {
@@ -723,7 +720,7 @@ def login():
                     session["logado"] = True
                     session["nome"] = usuario_encontrado.get("NOME")
                     session["perfil"] = usuario_encontrado.get("PERFIL")
-                    session.pop("historico_ia", None)
+                    session.pop("historico_ia", None) # Limpa histórico ao logar
                     
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
 
@@ -806,11 +803,6 @@ def login():
         modulo_reset=modulo_reset,
         email_tentativa=email_tentativa
     )
-
-@app.route("/logout", methods=["POST"])
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
 
 @app.route("/modulo/<nome_modulo>")
 def acessar_modulo(nome_modulo):
@@ -1204,21 +1196,6 @@ def acessar_modulo(nome_modulo):
                                 </div>
                                 """
 
-                    bloco_resumo_horas = f"""
-                    <div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; margin-top: 18px; margin-bottom: 14px;">
-                        <div style="display: flex; gap: 10px;">
-                            <div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;">
-                                <div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Horas (H)</div>
-                                <div style="font-size: 15px; font-weight: 700; color: #1a202c;">{hora_geral_val}</div>
-                            </div>
-                            <div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;">
-                                <div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Período do Contrato</div>
-                                <div style="font-size: 15px; font-weight: 700; color: #1a202c;">{periodo_val} Meses</div>
-                            </div>
-                        </div>
-                    </div>
-                    """ if hora_geral_val else ""
-
                     conteudo = f"""
                     <div>
                         {nav_superior_html}
@@ -1248,7 +1225,7 @@ def acessar_modulo(nome_modulo):
                             { '<div style="font-size: 13px; font-weight: 700; color: #4a5568; margin-bottom: 6px; text-transform: uppercase;">Valores por Quilometragem (KM)</div>' if cards_km_html else '' }
                             <div class="grid-planos">{cards_km_html}</div>
 
-                            {bloco_resumo_horas}
+                            { '<div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; margin-top: 18px; margin-bottom: 14px;"><div style="display: flex; gap: 10px;"><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Horas (H)</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + str(hora_geral_val) + '</div></div><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Período do Contrato</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + str(periodo_val) + ' Meses</div></div></div></div>' if hora_geral_val else '' }
 
                             { '<div style="font-size: 13px; font-weight: 700; color: #4a5568; margin-top: 10px; margin-bottom: 6px; text-transform: uppercase;">Valores por Horas (H)</div>' if cards_horas_html else '' }
                             <div class="grid-planos">{cards_horas_html}</div>
@@ -1297,7 +1274,7 @@ def acessar_modulo(nome_modulo):
                 if item_escolhido:
                     assunto_val = item_escolhido.get("ASSUNTO", "")
                     informacao_val = item_escolhido.get("INFORMAÇÃO", "") or item_escolhido.get("INFORMACAO", "")
-                    circular_val = str(item_escolhido.get("CIRCULAR", "")).strip()
+                    circular_val = item_escolhido.get("CIRCULAR", "").strip()
 
                     link_pdf = circular_val
                     if circular_val:
@@ -1637,6 +1614,15 @@ def chat_ia():
     if not pergunta_usuario:
         return jsonify({"resposta": "Por favor, digite uma pergunta."})
 
+    palavras = pergunta_usuario.split()
+    texto_lower = pergunta_usuario.lower()
+    cumprimentos = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "tudo bem", "eae", "hey", "salve"]
+    
+    if len(palavras) < 3 or texto_lower in cumprimentos:
+        return jsonify({
+            "resposta": "Resposta não encontrada no APP, deseja reformular a pergunta?"
+        })
+
     try:
         agora = time.time()
         
@@ -1675,7 +1661,7 @@ def chat_ia():
                 "'Resposta não encontrada no APP, deseja reformular a pergunta?'\n"
                 "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática.\n"
                 "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
-                "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros. Insira os links completos iniciados com http:// ou https:// para que sejam clicáveis pelo usuário.\n\n"
+                "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
                 f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
                 f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE ===\n{dados_drive}"
             )
@@ -1685,34 +1671,81 @@ def chat_ia():
         else:
             print("⚡ IA: Usando dados em cache.")
 
+        # Recupera ou inicializa o histórico de conversas na sessão do usuário
         if "historico_ia" not in session:
             session["historico_ia"] = []
 
+        # Mantém as últimas 6 interações (3 turnos de conversa) para contexto
         historico_atual = session["historico_ia"]
         
         prompt_historico = ""
         for h in historico_atual:
-            prompt_historico += f"Usuário: {h['usuario']}\nAssistente: {h['bot']}\n"
-        
-        prompt_final = f"{CACHE_IA['contexto_sistema']}\n\nHistorico da conversa:\n{prompt_historico}\nUsuário: {pergunta_usuario}\nAssistente:"
+            prompt_historico += f"Usuário: {h['user']}\nAssistente: {h['bot']}\n"
 
         client = criar_cliente_gemini()
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt_final,
-        )
+        
+        prompt_final = f"""
+        {CACHE_IA["contexto_sistema"]}
 
-        resposta_bot = response.text.strip() if response.text else "Desculpe, não consegui obter uma resposta."
+        HISTÓRICO RECENTE DA CONVERSA:
+        {prompt_historico}
 
-        historico_atual.append({"usuario": pergunta_usuario, "bot": resposta_bot})
-        if len(historico_atual) > 6:
-            historico_atual = historico_atual[-6:]
+        PERGUNTA ATUAL DO USUÁRIO:
+        {pergunta_usuario}
+        """
+
+        modelos_para_tentar = [
+            "gemini-3.6-flash", 
+            "gemini-3.5-flash-lite", 
+            "gemini-3.1-pro"
+        ]
+        response = None
+        ultimo_erro = None
+
+        for modelo_atual in modelos_para_tentar:
+            try:
+                print(f"🤖 Tentando IA com o modelo: {modelo_atual}")
+                response = client.models.generate_content(
+                    model=modelo_atual,
+                    contents=prompt_final
+                )
+                if response and response.text:
+                    break
+            except Exception as err:
+                ultimo_erro = err
+                print(f"⚠️ Falha temporária com o modelo {modelo_atual}: {err}")
+                continue
+
+        if not response or not response.text:
+            raise RuntimeError(f"Todos os modelos estão temporariamente ocupados. Último erro: {ultimo_erro}")
+
+        resposta_ia = response.text
+
+        # Atualiza o histórico na sessão
+        historico_atual.append({"user": pergunta_usuario, "bot": resposta_ia})
+        if len(historico_atual) > 3:
+            historico_atual.pop(0)
         session["historico_ia"] = historico_atual
+        session.modified = True
 
-        return jsonify({"resposta": resposta_bot})
+        return jsonify({
+            "resposta": resposta_ia
+        })
+
     except Exception as e:
-        print(f"Erro na rota /api/chat-ia: {e}")
-        return jsonify({"resposta": f"Ocorreu um erro interno: {e}"}), 500
+        erro_detalhado = traceback.format_exc()
+        print("--- ERRO COMPLETO DO GEMINI / SERVIDOR ---")
+        print(erro_detalhado)
+        print("------------------------------------------")
+        
+        return jsonify({
+            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda ou falha de leitura): {str(e)}"
+        })
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(debug=True)

@@ -78,28 +78,6 @@ def conectar_google_sheets():
     cliente = gspread.authorize(credenciais)
     return cliente.open("PM e RIO Novo")
 
-def obter_registros_seguros(aba):
-    """Lê a planilha de forma posicional e blindada contra colunas duplicadas ou vazias."""
-    linhas = aba.get_all_values()
-    if not linhas or len(linhas) <= 1:
-        return []
-    cabecalhos = linhas[0]
-    dados = []
-    for linha in linhas[1:]:
-        item_dict = {}
-        for i, valor_celula in enumerate(linha):
-            if i < len(cabecalhos) and str(cabecalhos[i]).strip():
-                nome_coluna = str(cabecalhos[i]).strip()
-                if nome_coluna in item_dict:
-                    idx = 1
-                    while f"{nome_coluna}_{idx}" in item_dict:
-                        idx += 1
-                    nome_coluna = f"{nome_coluna}_{idx}"
-                item_dict[nome_coluna] = valor_celula
-        if any(str(v).strip() for v in item_dict.values()):
-            dados.append(item_dict)
-    return dados
-
 def obter_conteudo_pastas_drive():
     try:
         if 'GOOGLE_CREDENTIALS' in os.environ:
@@ -745,7 +723,7 @@ def login():
             try:
                 planilha = conectar_google_sheets()
                 aba_usuarios = planilha.worksheet("Usuarios")
-                usuarios = obter_registros_seguros(aba_usuarios)
+                usuarios = aba_usuarios.get_all_records()
 
                 usuario_encontrado = None
 
@@ -861,7 +839,7 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
             aba_rio = planilha.worksheet("RIO")
-            produtos_rio = obter_registros_seguros(aba_rio)
+            produtos_rio = aba_rio.get_all_records()
 
             pilulas_rio = []
             for item in produtos_rio:
@@ -974,7 +952,7 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
             aba_pm = planilha.worksheet("PM")
-            produtos_pm = obter_registros_seguros(aba_pm)
+            produtos_pm = aba_pm.get_all_records()
 
             pilulas_pm = []
             for item in produtos_pm:
@@ -1099,7 +1077,25 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
             aba_precos = planilha.worksheet("PM_Precos")
-            dados_precos = obter_registros_seguros(aba_precos)
+            linhas = aba_precos.get_all_values()
+
+            if len(linhas) > 1:
+                cabecalhos = linhas[0]
+                dados_precos = []
+                for linha in linhas[1:]:
+                    item_dict = {}
+                    for i, valor_celula in enumerate(linha):
+                        if i < len(cabecalhos) and cabecalhos[i].strip():
+                            nome_coluna = cabecalhos[i].strip()
+                            if nome_coluna in item_dict:
+                                idx = 1
+                                while f"{nome_coluna}_{idx}" in item_dict:
+                                    idx += 1
+                                nome_coluna = f"{nome_coluna}_{idx}"
+                            item_dict[nome_coluna] = valor_celula
+                    dados_precos.append(item_dict)
+            else:
+                dados_precos = []
 
             pilulas_valores = []
             for item in dados_precos:
@@ -1275,7 +1271,7 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
             aba_informes = planilha.worksheet("Informes")
-            dados_informes = obter_registros_seguros(aba_informes)
+            dados_informes = aba_informes.get_all_records()
 
             pilulas_informes = []
             for item in dados_informes:
@@ -1357,7 +1353,7 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
             aba_argumentos = planilha.worksheet("Argumentos")
-            dados_argumentos = obter_registros_seguros(aba_argumentos)
+            dados_argumentos = aba_argumentos.get_all_records()
 
             pilulas_argumentos = []
             for item in dados_argumentos:
@@ -1435,8 +1431,19 @@ def acessar_modulo(nome_modulo):
             planilha = conectar_google_sheets()
             aba_modelos = planilha.worksheet("Modelos")
             
-            # LEITURA SEGURA COM OBTENÇÃO DE REGISTROS BLINDADOS
-            dados_modelos = obter_registros_seguros(aba_modelos)
+            # LEITURA POSICIONAL SEGURA (Evita mistura de colunas/links do get_all_records)
+            linhas_brutas = aba_modelos.get_all_values()
+            dados_modelos = []
+            
+            if len(linhas_brutas) > 1:
+                cabecalhos = [h.strip() for h in linhas_brutas[0]]
+                for linha in linhas_brutas[1:]:
+                    item_dict = {}
+                    for i, val in enumerate(linha):
+                        if i < len(cabecalhos) and cabecalhos[i]:
+                            item_dict[cabecalhos[i]] = val
+                    if any(item_dict.values()):
+                        dados_modelos.append(item_dict)
 
             tipos_disponiveis = sorted(list(set(str(item.get("TIPO", "")).strip() for item in dados_modelos if str(item.get("TIPO", "")).strip())))
 
@@ -1503,7 +1510,7 @@ def acessar_modulo(nome_modulo):
                         m_seguranca_ativa = item_escolhido.get("SEGURANÇA ATIVA", "") or item_escolhido.get("SEGURANCA ATIVA", "")
                         m_tecnologia = item_escolhido.get("TECNOLOGIA", "")
                         
-                        # BUSCA DE LINK EXATA E BLINDADA
+                        # BUSCA DE LINK EXATA E RIGOROSA DA PLANILHA
                         m_link = str(item_escolhido.get("LINK", "")).strip()
                         if not m_link:
                             for k, v in item_escolhido.items():
@@ -1667,7 +1674,7 @@ def chat_ia():
                 for aba in todas_as_abas:
                     nome_aba = aba.title
                     try:
-                        registros = obter_registros_seguros(aba)
+                        registros = aba.get_all_records()
                         linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros]
                         contexto_abas.append(f"### ABA DA PLANILHA: {nome_aba}\n" + "\n".join(linhas_texto))
                     except Exception:
@@ -1687,7 +1694,7 @@ def chat_ia():
                 "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
                 "DIRETRIZES DE COMPORTAMENTO:\n"
                 "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
-                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e a listagem de arquivos e links do Google Drive).\n"
+                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e a listagem de arquivos e links du Google Drive).\n"
                 "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
                 "'Resposta não encontrada no APP, deseja reformular a pergunta?'\n"
                 "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática.\n"
@@ -1713,7 +1720,7 @@ def chat_ia():
             ast = h.get("bot", h.get("assistente", ""))
             prompt_historico += f"Usuário: {usr}\nAssistente: {ast}\n"
 
-        client = criar_client_gemini()
+        client = criar_cliente_gemini()
         
         prompt_final = f"""
         {CACHE_IA["contexto_sistema"]}

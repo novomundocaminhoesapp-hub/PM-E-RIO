@@ -456,10 +456,22 @@ TEMPLATE_HTML = """
             }).catch(() => alert("Erro ao limpar cache."));
         }
 
-        function formatarLinksTexto(texto) {
+     function formatarLinksTexto(texto) {
             if (!texto) return "";
+            
+            // 1. Converte links no formato Markdown [Texto](url) para <a href="url" target="_blank">Texto</a>
+            var expMarkdown = /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g;
+            texto = texto.replace(expMarkdown, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+            
+            // 2. Converte URLs soltas que não estavam em formato Markdown em links clicáveis
             var expUrl = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
-            return texto.replace(expUrl, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+            texto = texto.replace(expUrl, function(match) {
+                // Evita duplicar tag <a> caso a URL já tenha sido convertida no passo anterior
+                if (match.includes('href=')) return match;
+                return '<a href="' + match + '" target="_blank" rel="noopener noreferrer">' + match + '</a>';
+            });
+            
+            return texto;
         }
 
         function ouvirVoz() {

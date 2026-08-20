@@ -1430,7 +1430,20 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
             aba_modelos = planilha.worksheet("Modelos")
-            dados_modelos = aba_modelos.get_all_records()
+            
+            # LEITURA POSICIONAL SEGURA (Evita mistura de colunas/links do get_all_records)
+            linhas_brutas = aba_modelos.get_all_values()
+            dados_modelos = []
+            
+            if len(linhas_brutas) > 1:
+                cabecalhos = [h.strip() for h in linhas_brutas[0]]
+                for linha in linhas_brutas[1:]:
+                    item_dict = {}
+                    for i, val in enumerate(linha):
+                        if i < len(cabecalhos) and cabecalhos[i]:
+                            item_dict[cabecalhos[i]] = val
+                    if any(item_dict.values()):
+                        dados_modelos.append(item_dict)
 
             tipos_disponiveis = sorted(list(set(str(item.get("TIPO", "")).strip() for item in dados_modelos if str(item.get("TIPO", "")).strip())))
 
@@ -1497,7 +1510,13 @@ def acessar_modulo(nome_modulo):
                         m_seguranca_ativa = item_escolhido.get("SEGURANÇA ATIVA", "") or item_escolhido.get("SEGURANCA ATIVA", "")
                         m_tecnologia = item_escolhido.get("TECNOLOGIA", "")
                         
+                        # BUSCA DE LINK EXATA E RIGOROSA DA PLANILHA
                         m_link = str(item_escolhido.get("LINK", "")).strip()
+                        if not m_link:
+                            for k, v in item_escolhido.items():
+                                if "link" in k.lower() and str(v).strip():
+                                    m_link = str(v).strip()
+                                    break
 
                         link_pdf = m_link
                         if m_link:
@@ -1675,7 +1694,7 @@ def chat_ia():
                 "Você é o Assistente Virtual inteligente, articulado e prestativo da Novo Mundo Caminhões. "
                 "DIRETRIZES DE COMPORTAMENTO:\n"
                 "1. Responda às dúvidas da equipe STRICTAMENTE E EXCLUSIVAMENTE com base na base de dados unificada abaixo "
-                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e a listagem de arquivos e links do Google Drive).\n"
+                "(que contém TODAS AS ABAS da planilha principal 'PM e RIO Novo' e a listagem de arquivos e links du Google Drive).\n"
                 "2. Se a pergunta do usuário não constar nos dados fornecidos ou estiver fora do escopo, responda obrigatoriamente: "
                 "'Resposta não encontrada no APP, deseja reformular a pergunta?'\n"
                 "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática.\n"

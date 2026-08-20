@@ -456,14 +456,17 @@ TEMPLATE_HTML = """
             }).catch(() => alert("Erro ao limpar cache."));
         }
 
-        function formatarLinksTexto(texto) {
+     function formatarLinksTexto(texto) {
             if (!texto) return "";
             
+            // 1. Converte links no formato Markdown [Texto](url) para <a href="url" target="_blank">Texto</a>
             var expMarkdown = /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g;
             texto = texto.replace(expMarkdown, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
             
+            // 2. Converte URLs soltas que não estavam em formato Markdown em links clicáveis
             var expUrl = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
             texto = texto.replace(expUrl, function(match) {
+                // Evita duplicar tag <a> caso a URL já tenha sido convertida no passo anterior
                 if (match.includes('href=')) return match;
                 return '<a href="' + match + '" target="_blank" rel="noopener noreferrer">' + match + '</a>';
             });
@@ -1688,7 +1691,7 @@ def chat_ia():
         
         prompt_historico = ""
         for h in historico_atual:
-            # 💡 SOLUÇÃO DO KEYERROR AQUI: Usa h.get para não quebrar se o formato antigo 'usuario' estiver salvo nos cookies
+            # Proteção contra formatos antigos salvos nos cookies (Evita o KeyError)
             usr = h.get("user", h.get("usuario", ""))
             ast = h.get("bot", h.get("assistente", ""))
             prompt_historico += f"Usuário: {usr}\nAssistente: {ast}\n"
@@ -1705,11 +1708,11 @@ def chat_ia():
         {pergunta_usuario}
         """
 
-        # 💡 SOLUÇÃO DOS MODELOS AQUI: Usar os nomes oficiais do SDK Google GenAI
+        # Mantendo seus modelos exatos da imagem
         modelos_para_tentar = [
-            "gemini-2.0-flash", 
-            "gemini-1.5-flash", 
-            "gemini-1.5-pro"
+            "gemini-3.6-flash", 
+            "gemini-3.5-flash-lite", 
+            "gemini-3.1-pro"
         ]
         response = None
         ultimo_erro = None
@@ -1750,7 +1753,7 @@ def chat_ia():
         print("------------------------------------------")
         
         return jsonify({
-            "resposta": f"🚨 Ocorreu um erro interno: {str(e)}"
+            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda ou falha de leitura): {str(e)}"
         })
 
 @app.route("/logout", methods=["POST"])

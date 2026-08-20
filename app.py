@@ -6,6 +6,7 @@ import re
 import urllib.parse
 import traceback
 from google import genai
+from google.genai import types
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
@@ -106,7 +107,7 @@ def obter_conteudo_pastas_drive():
                 
         return "\n".join(lista_arquivos), mapa_links
     except Exception as e:
-        return f"Não foi possível listar os arquivos du Drive: {e}", {}
+        return f"Não foi possível listar os arquivos do Drive: {e}", {}
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     try:
@@ -383,7 +384,7 @@ TEMPLATE_HTML = """
         }
         .ai-msg { max-width: 85%; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4; word-break: break-word; }
         .ai-msg.bot { background: #e2e8f0; color: #2d3748; align-self: flex-start; }
-        .ai-msg.bot a { color: #0056b3; font-weight: 600; text-decoration: underline; }
+        .ai-msg.bot a { color: #0056b3; font-weight: 600; text-decoration: underline; word-break: break-all; }
         .ai-msg.user { background: #002244; color: #ffffff; align-self: flex-end; }
         .ai-typing span {
             height: 7px; width: 7px; float: left; margin: 0 2px; background-color: #90949c;
@@ -458,8 +459,9 @@ TEMPLATE_HTML = """
 
         function formatarLinksTexto(texto) {
             if (!texto) return "";
-            var expUrl = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
-            return texto.replace(expUrl, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+            var textoFormatado = texto.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+            var expUrl = /(^|[^"'])(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
+            return textoFormatado.replace(expUrl, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
         }
 
         function ouvirVoz() {
@@ -804,6 +806,11 @@ def login():
         modulo_reset=modulo_reset,
         email_tentativa=email_tentativa
     )
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 @app.route("/modulo/<nome_modulo>")
 def acessar_modulo(nome_modulo):
@@ -1662,7 +1669,7 @@ def chat_ia():
                 "'Resposta não encontrada no APP, deseja reformular a pergunta?'\n"
                 "3. NUNCA faça apenas um 'copia e cola' bruto ou resposta fria em tabela. Seja inteligente: analise as informações, interprete os dados técnicos, explique o contexto com clareza, formate a resposta em linguagem natural profissional e didática.\n"
                 "4. É terminantemente proibido utilizar conhecimentos gerais externos ou inventar informações.\n"
-                "5. Sempre que relevante, mencione o nome do documento ou link correspondente disponível nos registros.\n\n"
+                "5. Sempre que relevante, mencione o nome do documento ou forneça os links disponíveis nos registros no formato Markdown [Nome do Link](URL) ou URL direta.\n\n"
                 f"=== CONTEÚDO COMPLETO DE TODAS AS ABAS DA PLANILHA ===\n{dados_planilha}\n\n"
                 f"=== ARQUIVOS NAS PASTAS DO GOOGLE DRIVE ===\n{dados_drive}"
             )
@@ -1676,74 +1683,47 @@ def chat_ia():
             session["historico_ia"] = []
 
         historico_atual = session["historico_ia"]
+
+        # Constrói a lista de conteúdos/mensagens para o Gemini SDK
+        conteudos = []
+        for item in historico_atual:
+            conteudos.append(types.Content(
+                role=item["role"],
+                parts=[types.Part.from_text(text=item["text"])]
+            ))
         
-        prompt_historico = ""
-        for h in historico_atual:
-            prompt_historico += f"Usuário: {h['user']}\nAssistente: {h['bot']}\n"
+        conteudos.append(types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=pergunta_usuario)]
+        ))
 
-        client = criar_cliente_gemini()
+        cliente_gemini = criar_cliente_gemini()
         
-        prompt_final = f"""
-        {CACHE_IA["contexto_sistema"]}
+        configuracao = types.GenerateContentConfig(
+            system_instruction=CACHE_IA["contexto_sistema"],
+            temperature=0.2
+        )
 
-        HISTÓRICO RECENTE DA CONVERSA:
-        {prompt_historico}
+        resposta = cliente_gemini.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=conteudos,
+            config=configuracao
+        )
 
-        PERGUNTA ATUAL DO USUÁRIO:
-        {pergunta_usuario}
-        """
+        texto_resposta = resposta.text if resposta.text else "Resposta não encontrada no APP, deseja reformular a pergunta?"
 
-        modelos_para_tentar = [
-            "gemini-3.6-flash", 
-            "gemini-3.5-flash-lite", 
-            "gemini-3.1-pro"
-        ]
-        response = None
-        ultimo_erro = None
+        historico_atual.append({"role": "user", "text": pergunta_usuario})
+        historico_atual.append({"role": "model", "text": texto_resposta})
+        session["historico_ia"] = historico_atual[-10:]  # Mantém as últimas 10 trocas
 
-        for modelo_atual in modelos_para_tentar:
-            try:
-                print(f"🤖 Tentando IA com o modelo: {modelo_atual}")
-                response = client.models.generate_content(
-                    model=modelo_atual,
-                    contents=prompt_final
-                )
-                if response and response.text:
-                    break
-            except Exception as err:
-                ultimo_erro = err
-                print(f"⚠️ Falha temporária com o modelo {modelo_atual}: {err}")
-                continue
-
-        if not response or not response.text:
-            raise RuntimeError(f"Todos os modelos estão temporariamente ocupados. Último erro: {ultimo_erro}")
-
-        resposta_ia = response.text
-
-        historico_atual.append({"user": pergunta_usuario, "bot": resposta_ia})
-        if len(historico_atual) > 3:
-            historico_atual.pop(0)
-        session["historico_ia"] = historico_atual
-        session.modified = True
-
-        return jsonify({
-            "resposta": resposta_ia
-        })
+        return jsonify({"resposta": texto_resposta})
 
     except Exception as e:
-        erro_detalhado = traceback.format_exc()
-        print("--- ERRO COMPLETO DO GEMINI / SERVIDOR ---")
-        print(erro_detalhado)
-        print("------------------------------------------")
-        
+        print(f"Erro na IA Gemini: {traceback.format_exc()}")
         return jsonify({
-            "resposta": f"🚨 ERRO INTERNO DO SERVIDOR (Alta demanda ou falha de leitura): {str(e)}"
-        })
+            "resposta": f"Erro interno ao consultar o Assistente Inteligente: {str(e)}"
+        }), 500
 
-@app.route("/logout", methods=["POST"])
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

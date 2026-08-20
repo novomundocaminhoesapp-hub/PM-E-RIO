@@ -1499,15 +1499,19 @@ def acessar_modulo(nome_modulo):
                         
                         m_link = str(item_escolhido.get("LINK", "")).strip()
 
-                        link_pdf = m_link
-                        if m_link:
-                            if m_link.lower() in mapa_drive:
-                                link_pdf = mapa_drive[m_link.lower()]
-                            elif not m_link.startswith("http"):
-                                link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(m_link)}"
+                        # Força o link correto do PDF para o modelo 11.180 / s caso venha correspondente
+                        if "11.180" in m_modelo:
+                            link_pdf = "https://drive.google.com/file/d/117_EeMOVY3DHJz48gkp_QZExz7Sp6ug3/view?usp=sharing"
+                        else:
+                            link_pdf = m_link
+                            if m_link:
+                                if m_link.lower() in mapa_drive:
+                                    link_pdf = mapa_drive[m_link.lower()]
+                                elif not m_link.startswith("http"):
+                                    link_pdf = f"https://drive.google.com/drive/search?q={urllib.parse.quote(m_link)}"
 
                         bloco_pdf_html = ""
-                        if m_link:
+                        if m_link or "11.180" in m_modelo:
                             texto_wpp_ft = (
                                 f"📋 *Ficha Técnica - {m_modelo}*\n\n"
                                 f"*Tipo:* {m_tipo} | *Categoria:* {m_categoria}\n\n"
@@ -1713,9 +1717,10 @@ def chat_ia():
         {pergunta_usuario}
         """
 
+        # Modelos exatamente como configurados e testados no seu painel
         modelos_para_tentar = [
-            "gemini-3.6-flash", 
             "gemini-3.5-flash-lite", 
+            "gemini-3.6-flash", 
             "gemini-3.1-pro"
         ]
         response = None

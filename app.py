@@ -46,7 +46,7 @@ CACHE_IA = {
     "contexto_sistema": "",
     "timestamp": 0
 }
-TEMPO_CACHE_SEGUNDOS = 1800  # Aumentado para 30 min para evitar leituras repetidas e lentidão local
+TEMPO_CACHE_SEGUNDOS = 1800  # 30 minutos de cache
 
 
 def criar_cliente_gemini():
@@ -1066,7 +1066,7 @@ def login():
                     session["perm_locacao_vendas"] = tem_permissao(["LOCACAO", "LOCACAO VENDAS"])
                     session["perm_locacao_negocios"] = tem_permissao(["EM ANDAMENTO LOCACAO", "NEGOCIOS EM ANDAMENTO LOCACAO"])
                     
-                    session["perm_consorcio_vendas"] = tem_permissao(["CONSORIOCO", "CONSORCIO"])
+                    session["perm_consorcio_vendas"] = tem_permissao(["CONSORCIOCO", "CONSORCIO"])
                     session["perm_consorcio_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO CONSORCIO", "NEGOCIOS CONSORCIO", "NEGOCIOS EM ANDAMENTO CONSORCIO_1"])
 
                     session.pop("historico_ia", None)
@@ -3633,7 +3633,7 @@ def chat_ia():
             )
             
             CACHE_IA["contexto_sistema"] = f"Instruções:\n{instrucao_sistema}\n\nDados:\n{dados_planilha}"
-            CACHE_IA["timestamp"] = agora  # Corrigido de agorav para agora
+            CACHE_IA["timestamp"] = agora
 
         cliente_ia = criar_cliente_gemini()
         

@@ -3613,34 +3613,33 @@ def chat_ia():
         agora = time.time()
         
         # Cache inteligente de 30 minutos
-        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > 3600):
+        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > 1800):
             print("🔄 IA: Atualizando cache otimizado...")
             planilha = conectar_google_sheets()
-            
-            # Seleciona apenas as abas essenciais e limita as linhas para garantir máxima velocidade
             contexto_abas = []
-            abas_rapidas = ["PM", "RIO", "PM_Precos","Infomes", "Argumentos", "Modelos"]
             
-            for nome_aba in abas_rapidas:
+            # Incluímos Informes e Argumentos para a IA saber responder sobre circulares e dúvidas
+            abas_essenciais = ["PM", "RIO", "PM_Precos", "Informes", "Argumentos","Modelos"]
+            
+            for nome_aba in abas_essenciais:
                 try:
                     aba = planilha.worksheet(nome_aba)
                     registros = obter_registros_seguros(aba)
-                    # Pega apenas as 15 primeiras linhas para não sobrecarregar o prompt e acelerar o retorno
+                    # Limitamos a 15 registros por aba para manter o chat extremamente rápido
                     linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros[:15]]
                     contexto_abas.append(f"### {nome_aba}\n" + "\n".join(linhas_texto))
                 except Exception:
                     pass
             
             dados_planilha = "\n\n".join(contexto_abas)
-            CACHE_IA["contexto_sistema"] = dados_planilha
-            CACHE_IA["timestamp"] = agora
 
             instrucao_sistema = (
-                "Você é o Assistente Novo Mundo Caminhões e Ônibus inteligente, articulado e prestativo. "
-                "Responda sempre de forma clara, amigável e fundamentada nos dados da planilha fornecidos."
+                "Você é o Assistente Oficial da Novo Mundo Caminhões e Ônibus. "
+                "Responda de forma direta, educada e baseada estritamente nos dados da planilha fornecidos abaixo. "
+                "Se o usuário pedir um link de circular ou PDF, busque na aba Informes e forneça o nome e o link correspondente."
             )
             
-            CACHE_IA["contexto_sistema"] = f"Instruções:\n{instrucao_sistema}\n\nDados:\n{dados_planilha}"
+            CACHE_IA["contexto_sistema"] = f"{instrucao_sistema}\n\n{dados_planilha}"
             CACHE_IA["timestamp"] = agora
 
         cliente_ia = criar_cliente_gemini()

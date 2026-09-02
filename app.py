@@ -3619,7 +3619,7 @@ def chat_ia():
             
             # Seleciona apenas as abas essenciais e limita as linhas para garantir máxima velocidade
             contexto_abas = []
-            abas_rapidas = ["PM", "RIO", "PM_Precos"]
+            abas_rapidas = ["PM", "RIO", "PM_Precos","Infomes", "Argumentos", "Modelos"]
             
             for nome_aba in abas_rapidas:
                 try:

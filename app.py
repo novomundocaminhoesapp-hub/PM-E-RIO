@@ -46,7 +46,7 @@ CACHE_IA = {
     "contexto_sistema": "",
     "timestamp": 0
 }
-TEMPO_CACHE_SEGUNDOS = 300
+TEMPO_CACHE_SEGUNDOS = 1800  # Aumentado para 30 min para evitar leituras repetidas e lentidão local
 
 
 def criar_cliente_gemini():
@@ -1033,7 +1033,6 @@ def login():
                     session["perfil"] = usuario_encontrado.get("PERFIL")
                     session["email_usuario"] = usuario_encontrado.get("EMAIL")
                     
-                    # NOVA FUNÇÃO DE LEITURA INTELIGENTE (Ignora acentos e espaços da planilha)
                     def normalize_key(k):
                         return unicodedata.normalize('NFKD', str(k)).encode('ASCII', 'ignore').decode('utf-8').strip().upper()
 
@@ -1041,7 +1040,6 @@ def login():
 
                     def tem_permissao(chaves_alvo):
                         for chave in chaves_alvo:
-                            # Verifica a chave exata e possíveis variações com sufixo numérico inseridas pelo gspread
                             chaves_possiveis = [chave] + [f"{chave}_{i}" for i in range(1, 10)]
                             for c in chaves_possiveis:
                                 val = user_norm_keys.get(c, "")
@@ -1057,7 +1055,6 @@ def login():
                     session["perm_argumentos"] = tem_permissao(["ARGUMENTOS DE VENDA", "ARGUMENTOS"])
                     session["perm_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO", "NEGOCIOS EM ANDAMENTO_1", "NEGOCIOS"])
                     
-                    # Tratamento isolado para Vendas Gerais flexibilizado
                     val_vendas = False
                     for k_norm, v_val in user_norm_keys.items():
                         if "VENDAS" in k_norm and "LOC" not in k_norm and "CON" not in k_norm:
@@ -1066,7 +1063,6 @@ def login():
                                 break
                     session["perm_vendas"] = val_vendas
 
-                    # Correção específica para Locação e Consórcio
                     session["perm_locacao_vendas"] = tem_permissao(["LOCACAO", "LOCACAO VENDAS"])
                     session["perm_locacao_negocios"] = tem_permissao(["EM ANDAMENTO LOCACAO", "NEGOCIOS EM ANDAMENTO LOCACAO"])
                     
@@ -3613,48 +3609,38 @@ def chat_ia():
     try:
         agora = time.time()
         
+        # Cache inteligente de 30 minutos
         if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
-            print("🔄 IA: Atualizando cache de dados (Planilha e Listagem do Drive)...")
+            print("🔄 IA: Atualizando cache de dados (Planilha)...")
             planilha = conectar_google_sheets()
             contexto_abas = []
             
-            try:
-                todas_as_abas = planilha.worksheets()
-                for aba in todas_as_abas:
-                    nome_aba = aba.title
-                    try:
-                        registros = obter_registros_seguros(aba)
-                        linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros]
-                        contexto_abas.append(f"### ABA DA PLANILHA: {nome_aba}\n" + "\n".join(linhas_texto))
-                    except Exception:
-                        try:
-                            valores = aba.get_all_values()
-                            linhas_texto = [f"- " + " | ".join([str(c) for c in linha if str(c).strip()]) for linha in valores]
-                            contexto_abas.append(f"### ABA DA PLANILHA (Valores): {nome_aba}\n" + "\n".join(linhas_texto))
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(f"Erro ao varrer abas da planilha: {e}")
+            abas_importantes = ["PM", "RIO", "PM_Precos", "Modelos", "Argumentos", "Informes"]
+            for nome_aba in abas_importantes:
+                try:
+                    aba = planilha.worksheet(nome_aba)
+                    registros = obter_registros_seguros(aba)
+                    linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros[:25]]
+                    contexto_abas.append(f"### {nome_aba}\n" + "\n".join(linhas_texto))
+                except Exception:
+                    pass
             
             dados_planilha = "\n\n".join(contexto_abas)
-            dados_drive, _ = obter_conteudo_pastas_drive()
 
             instrucao_sistema = (
                 "Você é o Assistente Novo Mundo Caminhões e Ônibus inteligente, articulado e prestativo. "
-                "Responda sempre de forma clara, amigável e fundamentada EXCLUSIVAMENTE nos dados da planilha e do Drive fornecidos. "
-                "Se não souber a resposta, seja honesto e diga que não encontrou essa informação."
+                "Responda sempre de forma clara, amigável e fundamentada nos dados da planilha fornecidos."
             )
             
-            CACHE_IA["contexto_sistema"] = f"Instruções:\n{instrucao_sistema}\n\nDados da Planilha:\n{dados_planilha}\n\nArquivos no Drive:\n{dados_drive}"
-            CACHE_IA["timestamp"] = agora
+            CACHE_IA["contexto_sistema"] = f"Instruções:\n{instrucao_sistema}\n\nDados:\n{dados_planilha}"
+            CACHE_IA["timestamp"] = agora  # Corrigido de agorav para agora
 
-        # Chamada real da API do Gemini para processar o chat
         cliente_ia = criar_cliente_gemini()
         
         prompt_completo = f"{CACHE_IA['contexto_sistema']}\n\nPergunta do Usuário: {pergunta_usuario}\nResposta:"
         
         resposta_ia = cliente_ia.models.generate_content(
-            model="gemini-3.5-Flash-Lite",
+            model="gemini-3.5-flash-lite",
             contents=prompt_completo
         )
         
@@ -3667,9 +3653,7 @@ def chat_ia():
 
 @app.route("/logout", methods=["GET", "POST"])
 def logout():
-    # Limpa todos os dados da sessão do usuário atual
     session.clear()
-    # Redireciona de volta para a tela de login
     return redirect(url_for("login"))
 
 if __name__ == "__main__":

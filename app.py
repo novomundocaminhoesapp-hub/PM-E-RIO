@@ -16,8 +16,6 @@ import gspread
 app = Flask(__name__)
 app.secret_key = "chave_secreta_pm_rio"
 
-os.environ["GEMINI_API_KEY"] = 
-
 MESES_PT = {
     1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
     5: "maio", 6: "junho", 7: "julho", 8: "agosto",

@@ -51,6 +51,9 @@ TEMPO_CACHE_SEGUNDOS = 1800  # 30 minutos de cache
 
 def criar_cliente_gemini():
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        # Insira sua chave de API aqui diretamente como segurança, ou mantenha a leitura do ambiente
+        api_key = ""
     return genai.Client(api_key=api_key)
 
 
@@ -3610,22 +3613,27 @@ def chat_ia():
         agora = time.time()
         
         # Cache inteligente de 30 minutos
-        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
-            print("🔄 IA: Atualizando cache de dados (Planilha)...")
+        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > 3600):
+            print("🔄 IA: Atualizando cache otimizado...")
             planilha = conectar_google_sheets()
-            contexto_abas = []
             
-            abas_importantes = ["PM", "RIO", "PM_Precos", "Modelos", "Argumentos", "Informes"]
-            for nome_aba in abas_importantes:
+            # Seleciona apenas as abas essenciais e limita as linhas para garantir máxima velocidade
+            contexto_abas = []
+            abas_rapidas = ["PM", "RIO", "PM_Precos"]
+            
+            for nome_aba in abas_rapidas:
                 try:
                     aba = planilha.worksheet(nome_aba)
                     registros = obter_registros_seguros(aba)
-                    linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros[:25]]
+                    # Pega apenas as 15 primeiras linhas para não sobrecarregar o prompt e acelerar o retorno
+                    linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros[:15]]
                     contexto_abas.append(f"### {nome_aba}\n" + "\n".join(linhas_texto))
                 except Exception:
                     pass
             
             dados_planilha = "\n\n".join(contexto_abas)
+            CACHE_IA["contexto_sistema"] = dados_planilha
+            CACHE_IA["timestamp"] = agora
 
             instrucao_sistema = (
                 "Você é o Assistente Novo Mundo Caminhões e Ônibus inteligente, articulado e prestativo. "
@@ -3639,10 +3647,25 @@ def chat_ia():
         
         prompt_completo = f"{CACHE_IA['contexto_sistema']}\n\nPergunta do Usuário: {pergunta_usuario}\nResposta:"
         
-        resposta_ia = cliente_ia.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt_completo
-        )
+        resposta_ia = None
+        # Tentativa com os modelos 3.5 / 3.6 atualizados
+        modelos_para_tentar = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"]
+        
+        ultimo_erro = None
+        for nome_modelo in modelos_para_tentar:
+            try:
+                resposta_ia = cliente_ia.models.generate_content(
+                    model=nome_modelo,
+                    contents=prompt_completo
+                )
+                if resposta_ia and resposta_ia.text:
+                    break
+            except Exception as err:
+                ultimo_erro = err
+                continue
+                
+        if not resposta_ia or not resposta_ia.text:
+            raise Exception(f"Todos os modelos falharam. Último erro: {ultimo_erro}")
         
         return jsonify({"resposta": resposta_ia.text})
 

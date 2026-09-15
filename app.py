@@ -29,14 +29,14 @@ NOMES_MODULOS = {
     "informes": "Informes e Circulares",
     "fichatecnica": "Ficha Técnica",
     "argumentos": "Argumentos de Venda",
-    "simulador": "Simulador TRATON",
-    "linksuteis": "Links Úteis",
     "negocios": "Negócios em Andamento",
+    "visitas": "Visitas e Acompanhamento",
     "vendas": "Vendas Fechadas",
     "locacao_vendas": "Locação - Vendas",
     "locacao_negocios": "Locação - Negócios",
     "consorcio_vendas": "Consórcio - Vendas",
-    "consorcio_negocios": "Consórcio - Negócios"
+    "consorcio_negocios": "Consórcio - Negócios",
+    "traton": "Simulador Traton"
 }
 
 escopos = [
@@ -54,7 +54,6 @@ TEMPO_CACHE_SEGUNDOS = 1800  # 30 minutos de cache
 def criar_cliente_gemini():
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        # Insira sua chave de API aqui diretamente como segurança, ou mantenha a leitura do ambiente
         api_key = ""
     return genai.Client(api_key=api_key)
 
@@ -106,44 +105,324 @@ def obter_registros_seguros(aba):
             dados.append(item_dict)
     return dados
 
+
 def obter_conteudo_pastas_drive():
+    """
+    Lê os arquivos disponíveis no Google Drive usando as mesmas credenciais
+    do sistema e monta um mapa:
+        nome do arquivo -> link de visualização
+
+    Retorna:
+        (conteudo_pastas, mapa_drive)
+
+    O segundo item é usado pelos módulos que precisam transformar o nome
+    de uma Circular/Ficha Técnica em um link do Google Drive.
+    """
+    mapa_drive = {}
+    conteudo_pastas = {}
+
+    try:
+        if 'GOOGLE_CREDENTIALS' in os.environ:
+            credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
+            credenciais = Credentials.from_service_account_info(
+                credenciais_dict,
+                scopes=escopos
+            )
+        else:
+            credenciais = Credentials.from_service_account_file(
+                "credenciais.json",
+                scopes=escopos
+            )
+
+        service = build('drive', 'v3', credentials=credenciais)
+
+        # Busca todos os arquivos não excluídos aos quais a conta de serviço
+        # tem acesso. Paginação evita perder arquivos quando há muitos itens.
+        page_token = None
+
+        while True:
+            resposta = service.files().list(
+                q="trashed = false",
+                fields="nextPageToken, files(id, name, mimeType, webViewLink, parents)",
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+
+            for arquivo in resposta.get("files", []):
+                nome = str(arquivo.get("name", "")).strip()
+                if not nome:
+                    continue
+
+                nome_chave = nome.lower()
+                link = arquivo.get("webViewLink", "")
+
+                # Para arquivos que não retornarem webViewLink, monta um
+                # endereço padrão de visualização pelo ID.
+                if not link and arquivo.get("id"):
+                    link = f"https://drive.google.com/open?id={arquivo['id']}"
+
+                if link:
+                    mapa_drive[nome_chave] = link
+
+                    # Também permite encontrar o arquivo sem a extensão.
+                    if "." in nome:
+                        nome_sem_extensao = nome.rsplit(".", 1)[0].strip().lower()
+                        if nome_sem_extensao and nome_sem_extensao not in mapa_drive:
+                            mapa_drive[nome_sem_extensao] = link
+
+                pasta = "Raiz"
+                if arquivo.get("parents"):
+                    pasta = str(arquivo["parents"][0])
+
+                conteudo_pastas.setdefault(pasta, []).append({
+                    "id": arquivo.get("id", ""),
+                    "nome": nome,
+                    "mimeType": arquivo.get("mimeType", ""),
+                    "link": link
+                })
+
+            page_token = resposta.get("nextPageToken")
+            if not page_token:
+                break
+
+        return conteudo_pastas, mapa_drive
+
+    except Exception as e:
+        print(f"Erro ao obter conteúdo das pastas do Drive: {e}")
+        traceback.print_exc()
+
+        # O sistema continua funcionando mesmo se o Drive estiver
+        # temporariamente indisponível.
+        return {}, {}
+
+def importar_relatorios_drive_vendas():
+    """
+    Varre a pasta 'Rel_Vendas' no Google Drive ignorando arquivos já rotulados como [IMPORTADO],
+    padroniza Vendedores (aba Usuarios) e Modelos (aba Modelos),
+    evita duplicatas e insere os registros pendentes de forma otimizada e rápida.
+    """
     try:
         if 'GOOGLE_CREDENTIALS' in os.environ:
             credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
             credenciais = Credentials.from_service_account_info(credenciais_dict, scopes=escopos)
         else:
             credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
-        
+
         service = build('drive', 'v3', credentials=credenciais)
-        
-        lista_arquivos = []
-        mapa_links = {}
-        page_token = None
-        
-        while True:
-            results = service.files().list(
-                pageSize=1000,
-                fields="nextPageToken, files(id, name, mimeType, webViewLink)",
-                pageToken=page_token
-            ).execute()
+
+        if 'GOOGLE_CREDENTIALS' in os.environ:
+            gc = gspread.authorize(Credentials.from_service_account_info(json.loads(os.environ['GOOGLE_CREDENTIALS']), scopes=escopos))
+        else:
+            gc = gspread.authorize(Credentials.from_service_account_file("credenciais.json", scopes=escopos))
+
+        planilha = gc.open("PM e RIO Novo")
+
+        query_folder = "name = 'Rel_Vendas' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        folders_res = service.files().list(q=query_folder, fields="files(id, name)").execute()
+        folders = folders_res.get('files', [])
+
+        if not folders:
+            return "Pasta Rel_Vendas não encontrada no Drive."
+
+        folder_id = folders[0]['id']
+
+        # Busca apenas arquivos que NÃO contêm '[IMPORTADO]' no nome para garantir máxima velocidade
+        query_files = f"'{folder_id}' in parents and not name contains '[IMPORTADO]' and trashed = false"
+        files_res = service.files().list(q=query_files, fields="files(id, name, mimeType)").execute()
+        files = files_res.get('files', [])
+
+        if not files:
+            return "Nenhum arquivo novo para importar."
+
+        try:
+            aba_negocios = planilha.worksheet("Negocios_PM")
+        except gspread.exceptions.WorksheetNotFound:
+            aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=10)
+            aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "PLANO DE MANUTENÇÃO"])
+
+        # Carrega registros existentes para evitar duplicatas por chave única
+        registros_existentes = aba_negocios.get_all_values()
+        chaves_cadastradas = set()
+        for r in registros_existentes[1:]:
+            if len(r) >= 5:
+                chave = f"{str(r[1]).strip()}_{str(r[2]).strip()}_{str(r[3]).strip()}_{str(r[4]).strip()}".upper()
+                chaves_cadastradas.add(chave)
+
+        # Carrega mapa de Vendedores da aba 'Usuarios'
+        try:
+            aba_usuarios = planilha.worksheet("Usuarios")
+            regs_u = obter_registros_seguros(aba_usuarios)
+            mapa_usuarios = {}
+            for u in regs_u:
+                nome_u = str(u.get("NOME", "")).strip()
+                if nome_u:
+                    mapa_usuarios[nome_u.upper()] = nome_u
+                    partes = nome_u.upper().split()
+                    if len(partes) > 1:
+                        mapa_usuarios[f"{partes[0]} {partes[-1]}"] = nome_u
+        except Exception:
+            mapa_usuarios = {}
+
+        def identificar_vendedor(nome_bruto):
+            if not nome_bruto:
+                return None
+            n_limpo = str(nome_bruto).strip().upper()
             
-            files = results.get('files', [])
+            # 1. Tenta correspondência exata
+            if n_limpo in mapa_usuarios:
+                return mapa_usuarios[n_limpo]
             
-            for f in files:
-                nome = f.get('name')
-                link = f.get('webViewLink', '')
-                mime = f.get('mimeType', '')
-                lista_arquivos.append(f"- Arquivo: {nome} | Tipo: {mime}")
-                if nome:
-                    mapa_links[nome.strip().lower()] = link
+            # 2. Tenta correspondência parcial e inteligente
+            for chave, real in mapa_usuarios.items():
+                # Bate se for uma parte exata da string (ex: "JOAO" em "JOAO SILVA")
+                if chave in n_limpo or n_limpo in chave:
+                    return real
                     
-            page_token = results.get('nextPageToken')
-            if not page_token:
-                break
-                
-        return "\n".join(lista_arquivos), mapa_links
+                # 3. Resolve o problema do nome resumido vs completo!
+                # Se a chave for "ANDRE SANTANA", verifica se "ANDRE" e "SANTANA" existem no nome do Excel
+                partes_chave = chave.split()
+                if len(partes_chave) > 1:
+                    if all(parte in n_limpo for parte in partes_chave):
+                        return real
+                        
+            return None
+        
+        # Carrega mapa de Modelos da aba 'Modelos' (abrangendo todos os caminhões e ônibus cadastrados)
+        try:
+            aba_modelos = planilha.worksheet("Modelos")
+            regs_m = obter_registros_seguros(aba_modelos)
+            mapa_modelos = {}
+            for m in regs_m:
+                mod_nome = str(m.get("MODELO", "") or m.get("NOME", "") or m.get("DESCRICAO", "")).strip()
+                if mod_nome:
+                    mapa_modelos[mod_nome.upper()] = mod_nome
+        except Exception:
+            mapa_modelos = {}
+
+        def identificar_modelo(modelo_bruto):
+            if not modelo_bruto or str(modelo_bruto).lower() == 'nan':
+                return ""
+            
+            m_bruto_str = str(modelo_bruto).upper()
+            
+            # 1. Tenta correspondência exata limpa primeiro
+            m_limpo = m_bruto_str.replace(".", "").replace("-", "").replace(" ", "").replace("/", "")
+            for chave, real in mapa_modelos.items():
+                chave_limpa = chave.upper().replace(".", "").replace("-", "").replace(" ", "").replace("/", "")
+                if m_limpo == chave_limpa or m_limpo in chave_limpa or chave_limpa in m_limpo:
+                    return real
+
+            # 2. DETETIVE DE NÚMEROS: Extrai qualquer bloco numérico relevante (ex: 9170, 9180, 27320, 31320)
+            import re
+            # Procura por padrões de números com ponto ou traço (ex: 9.170, 11.180, 27.320)
+            padrao_num = re.search(r'\d{1,2}\.\d{3}|\d{5}', m_bruto_str)
+            if padrao_num:
+                num_encontrado = padrao_num.group(0).replace(".", "") # Ex: "9170" ou "11180"
+                for chave, real in mapa_modelos.items():
+                    c_limpa = chave.upper().replace(".", "").replace("-", "").replace(" ", "")
+                    if num_encontrado in c_limpa:
+                        return real
+
+            # 3. Procura por qualquer número de 4 ou 5 dígitos isolado no texto (ex: 9170, 26260)
+            tokens = re.findall(r'\d{4,5}', m_bruto_str)
+            for token in tokens:
+                for chave, real in mapa_modelos.items():
+                    if token in chave.replace(".", ""):
+                        return real
+
+            # 4. Fallback: Se não achar pelo número, tenta varrer palavras-chave textuais (ex: Express, e-Delivery)
+            for chave, real in mapa_modelos.items():
+                palavras_chave = [p for p in chave.upper().split() if len(p) > 2]
+                if palavras_chave and all(p in m_bruto_str for p in palavras_chave):
+                    return real
+
+            # 5. Se absolutamente tudo falhar, retorna o limpo ou original
+            return str(modelo_bruto).strip()
+                    
+        import io
+        import pandas as pd
+
+        importados_count = 0
+        novas_linhas_lote = []
+
+        for f in files:
+            file_name = f['name']
+            file_id = f['id']
+            
+            request_file = service.files().get_media(fileId=file_id)
+            fh = io.BytesIO(request_file.execute())
+            
+            try:
+                df_rel = pd.read_excel(fh, engine='xlrd')
+            except Exception:
+                try:
+                    fh.seek(0)
+                    df_rel = pd.read_excel(fh)
+                except Exception as ex_excel:
+                    print(f"Erro ao ler arquivo excel {file_name}: {ex_excel}")
+                    continue
+            
+            if df_rel is not None and not df_rel.empty:
+                df_rel.columns = [str(c).strip().upper() for c in df_rel.columns]
+
+                for i, row in df_rel.iterrows():
+                    cliente = str(row.get('CLIENTE', '')).strip()
+                    if not cliente or cliente.lower() == 'nan':
+                        continue
+                    
+                    vendedor_bruto = row.get('VENDEDOR', '')
+                    vendedor_encontrado = identificar_vendedor(vendedor_bruto)
+                    
+                    if not vendedor_encontrado:
+                        continue
+                    
+                    modelo_bruto = row.get('MODELO', '')
+                    modelo_encontrado = identificar_modelo(modelo_bruto)
+                    
+                    raw_data = row.get('DATA', datetime.now().strftime('%d/%m/%Y'))
+                    
+                    if hasattr(raw_data, 'strftime'):
+                        data_venda = raw_data.strftime('%d/%m/%Y')
+                    else:
+                        d_str = str(raw_data).split()[0]
+                        try:
+                            # Se o excel mandar 2026-08-10, converte para 10/08/2026
+                            from datetime import datetime as dt
+                            d_obj = dt.strptime(d_str, '%Y-%m-%d')
+                            data_venda = d_obj.strftime('%d/%m/%Y')
+                        except:
+                            data_venda = datetime.now().strftime('%d/%m/%Y')
+
+                    # (A chave_unica vem logo abaixo dessa linha no seu código)
+
+                    chave_unica = f"{data_venda}_{vendedor_encontrado}_{cliente}_{modelo_encontrado}".upper()
+
+                    if chave_unica in chaves_cadastradas:
+                        continue
+
+                    chaves_cadastradas.add(chave_unica)
+                    novas_linhas_lote.append([
+                        "Frio", data_venda, vendedor_encontrado, cliente, modelo_encontrado, "", "", "", "", ""
+                    ])
+                    importados_count += 1
+
+            # Renomeia imediatamente o arquivo no Drive para '[IMPORTADO] ...' para nunca mais ser lido
+            try:
+                novo_nome = f"[IMPORTADO] {file_name}"
+                service.files().update(fileId=file_id, body={'name': novo_nome}).execute()
+            except Exception as ex_ren:
+                print(f"Erro ao renomear arquivo no Drive: {ex_ren}")
+
+        if novas_linhas_lote:
+            aba_negocios.append_rows(novas_linhas_lote)
+
+        return f"Sincronização concluída! {importados_count} novos registros importados."
+    
     except Exception as e:
-        return f"Não foi possível listar os arquivos do Drive: {e}", {}
+        import traceback
+        print(f"Erro ao sincronizar relatórios do Drive: {e}")
+        traceback.print_exc()
+        return f"Erro ao sincronizar relatórios: {e}"
 
 def registrar_log_acesso(nome_usuario, acao_texto="Login efetuado via Flask"):
     try:
@@ -895,29 +1174,18 @@ TEMPLATE_HTML = r"""
                 </li>
                 {% endif %}
                 {% if session.get('perm_argumentos') %}
-                <li class="drawer-item {% if modulo_ativo == 'argumentos' %}active{% endif %}">
+                <li class="drawer-item {% if modulo_ativo == 'argumentos' %}active{% endif %}" style="border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; margin-bottom: 4px;">
                     <a href="/modulo/argumentos" onclick="closeDrawer()"><span class="drawer-icon">💡</span> Argumentos de Venda</a>
                 </li>
                 {% endif %}
-
-                <li class="drawer-item {% if modulo_ativo == 'simulador' %}active{% endif %}">
-                    <a href="/modulo/simulador" onclick="closeDrawer()">
-                        <span class="drawer-icon">
-                            <img src="{{ url_for('static', filename='Traton.png') }}" style="width: 22px; height: auto; object-fit: contain; vertical-align: middle;">
-                        </span> 
-                        Simulador TRATON
-                    </a>
-                </li>
-
-                <!-- DESATIVADO TEMPORARIAMENTE
-                <li class="drawer-item {% if modulo_ativo == 'linksuteis' %}active{% endif %}" style="border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; margin-bottom: 4px;">
-                    <a href="/modulo/linksuteis" onclick="closeDrawer()"><span class="drawer-icon">🔗</span> Links Úteis</a>
-                </li>
-                -->
-
                 {% if session.get('perm_negocios') %}
                 <li class="drawer-item {% if modulo_ativo == 'negocios' %}active{% endif %}">
                     <a href="/modulo/negocios" onclick="closeDrawer()"><span class="drawer-icon">🤝</span> Negócios em Andamento</a>
+                </li>
+                {% endif %}
+                {% if session.get('perm_visitas') %}
+                <li class="drawer-item {% if modulo_ativo == 'visitas' %}active{% endif %}">
+                    <a href="/modulo/visitas" onclick="closeDrawer()"><span class="drawer-icon">📍</span> Visitas e Acompanhamento</a>
                 </li>
                 {% endif %}
                 {% if session.get('perm_vendas') %}
@@ -948,6 +1216,17 @@ TEMPLATE_HTML = r"""
                 </li>
                 {% endif %}
 
+                {% if session.get('perm_traton') %}
+                <li class="drawer-item {% if modulo_ativo == 'traton' %}active{% endif %}">
+                    <a href="/modulo/traton" onclick="closeDrawer()">
+                        <span class="drawer-icon" style="display:flex; align-items:center; justify-content:center;">
+                            <img src="{{ url_for('static', filename='traton.png') }}" style="max-width:20px; max-height:20px;" alt="Traton">
+                        </span>
+                        Simulador Traton
+                    </a>
+                </li>
+                {% endif %}
+
                 <li class="drawer-item" style="margin-top: 10px; border-top: 1px solid #edf2f7;">
                     <button type="button" onclick="limparCacheIA()" style="color: #2b6cb0;"><span class="drawer-icon">🔄</span> Atualizar Base IA</button>
                 </li>
@@ -958,6 +1237,18 @@ TEMPLATE_HTML = r"""
                 </li>
             </ul>
         </aside>
+
+        
+        {% if session.get('perm_traton') %}
+                <li class="drawer-item {% if modulo_ativo == 'traton' %}active{% endif %}">
+                    <a href="/modulo/traton" onclick="closeDrawer()">
+                        <span class="drawer-icon" style="display:flex; align-items:center; justify-content:center;">
+                            <img src="{{ url_for('static', filename='traton.png') }}" style="max-width:20px; max-height:20px;" alt="Traton">
+                        </span>
+                        Simulador Traton
+                    </a>
+                </li>
+                {% endif %}
 
         <main class="main-content">
             {% if conteudo_modulo %}
@@ -1069,12 +1360,15 @@ def login():
                         return False
 
                     session["perm_rio"] = tem_permissao(["TELEMETRIA RIO", "RIO"])
-                    session["perm_pm"] = tem_permissao(["PLANO DE MANUTENCAO", "PM"])
-                    session["perm_valores"] = tem_permissao(["TABELA DE VALORES", "TABELAS DE VALORES", "VALORES"])
-                    session["perm_informes"] = tem_permissao(["INFORME E CIRCULARES", "INFORMES"])
+                    session["perm_pm"] = tem_permissao(["PLANO DE MANUTENCAO", "PLANO DE MANUTENÇAO", "PM"])
+                    session["perm_valores"] = tem_permissao(["TABELAS DE VALORES", "TABELA DE VALORES", "VALORES"])
+                    session["perm_informes"] = tem_permissao(["INFORME E CIRCULARES", "INFORME E CIRCULAR", "INFORMES"])
                     session["perm_fichatecnica"] = tem_permissao(["FICHA TECNICA", "FICHATECNICA"])
                     session["perm_argumentos"] = tem_permissao(["ARGUMENTOS DE VENDA", "ARGUMENTOS"])
-                    session["perm_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO", "NEGOCIOS EM ANDAMENTO_1", "NEGOCIOS"])
+                    session["perm_visitas"] = tem_permissao(["VISITAS"])
+                    session["perm_traton"] = tem_permissao(["TRATON", "SIMULADOR TRATON"])
+                    
+                    session["perm_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO", "NEGOCIOS"])
                     
                     val_vendas = False
                     for k_norm, v_val in user_norm_keys.items():
@@ -1082,14 +1376,14 @@ def login():
                             if v_val in ["X", "SIM", "S", "V", "TRUE", "1", "OK"]:
                                 val_vendas = True
                                 break
-                    session["perm_vendas"] = val_vendas
+                    session["perm_vendas"] = val_vendas or tem_permissao(["VENDAS"])
 
                     session["perm_locacao_vendas"] = tem_permissao(["LOCACAO", "LOCACAO VENDAS"])
                     session["perm_locacao_negocios"] = tem_permissao(["EM ANDAMENTO LOCACAO", "NEGOCIOS EM ANDAMENTO LOCACAO"])
-                    
-                    session["perm_consorcio_vendas"] = tem_permissao(["CONSORCIOCO", "CONSORCIO"])
-                    session["perm_consorcio_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO CONSORCIO", "NEGOCIOS CONSORCIO", "NEGOCIOS EM ANDAMENTO CONSORCIO_1"])
 
+                    session["perm_consorcio_vendas"] = tem_permissao(["CONSORCIOCO", "CONSORCIO"])
+                    session["perm_consorcio_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO CONSORCIO", "NEGOCIOS CONSORCIO"])
+                    session["perm_traton"] = tem_permissao(["TRATON", "SIMULADOR", "SIMULADOR TRATON"]) or session.get("perm_vendas", False) or session.get("perm_negocios", False)
                     session.pop("historico_ia", None)
                     
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
@@ -1106,7 +1400,7 @@ def login():
                         restantes = 3 - tentativas
                         erro = f"E-mail ou Senha incorretos. Você tem mais {restantes} tentativa(s) antes do bloqueio."
             except Exception as e:
-                erro = f"Erro de conexão ou processamento: {e}"
+                erro = f"Erro ao conectar com a planilha: {e}"
 
         elif acao == "redefinir":
             input_email = session.get("email_bloqueado", "").strip().lower()
@@ -1187,13 +1481,13 @@ def acessar_modulo(nome_modulo):
         "fichatecnica": session.get("perm_fichatecnica", False),
         "argumentos": session.get("perm_argumentos", False),
         "negocios": session.get("perm_negocios", False),
+        "visitas": session.get("perm_visitas", False),
         "vendas": session.get("perm_vendas", False),
         "locacao_vendas": session.get("perm_locacao_vendas", False),
         "locacao_negocios": session.get("perm_locacao_negocios", False),
         "consorcio_vendas": session.get("perm_consorcio_vendas", False),
         "consorcio_negocios": session.get("perm_consorcio_negocios", False),
-        "simulador": True,
-        "linksuteis": True
+        "traton": session.get("perm_traton", False)  # <--- ADICIONE ESTA LINHA
     }
 
     if not permissoes_map.get(nome_modulo, False):
@@ -1209,7 +1503,137 @@ def acessar_modulo(nome_modulo):
     _, mapa_drive = obter_conteudo_pastas_drive()
     nome_usuario_logado = session.get('nome', 'Usuário')
 
-    if nome_modulo in ["locacao_vendas", "consorcio_vendas"]:
+    # ADICIONE ESTE BLOCO AQUI:
+    if nome_modulo == "traton":
+        conteudo = f"""
+        <div style="height: calc(100vh - 90px); width: 100%; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); background-color: #ffffff;">
+            <iframe src="https://tratonfs.github.io/finance-simulator/" style="width: 100%; height: 100%; border: none;" allowfullscreen></iframe>
+        </div>
+        """
+
+    elif nome_modulo == "visitas":
+        try:
+            planilha = conectar_google_sheets()
+            try:
+                aba_negocios = planilha.worksheet("Negocios_PM")
+            except gspread.exceptions.WorksheetNotFound:
+                aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=10)
+                aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS"])
+
+            usuario_logado = str(session.get("nome", "")).strip().upper()
+            linhas_brutas = aba_negocios.get_all_values()
+
+            kpis = {"total": 0, "super quente": 0, "quente": 0, "morno": 0, "frio": 0}
+            registros_visitas = []
+
+            if len(linhas_brutas) > 1:
+                cabecalhos = [c.upper().strip() for c in linhas_brutas[0]]
+                for idx_linha, linha in enumerate(linhas_brutas[1:], start=2):
+                    item_dict = {"_index_planilha": idx_linha}
+                    for i, val in enumerate(linha):
+                        if i < len(cabecalhos) and cabecalhos[i]:
+                            item_dict[cabecalhos[i]] = val
+
+                    vend_val = str(item_dict.get('VENDEDOR', '')).strip().upper()
+                    temp_val = str(item_dict.get('TEMPERATURA', '')).strip()
+                    temp_lower = temp_val.lower()
+
+                    # Restrição: Apenas registros do usuário logado E remove fechados e perdidas
+                    if vend_val == usuario_logado and temp_lower not in ["fechado", "perdida"]:
+                        registros_visitas.append(item_dict)
+                        kpis["total"] += 1
+                        if temp_lower in kpis:
+                            kpis[temp_lower] += 1
+
+            tabela_visitas_linhas = ""
+            for reg in registros_visitas:
+                temp = reg.get('TEMPERATURA', '')
+                dt = reg.get('DATA', '')
+                vend = reg.get('VENDEDOR', '')
+                cli = reg.get('CLIENTE', '')
+                mod = reg.get('MODELO', '')
+                plano = reg.get('PLANO DE MANUTENÇÃO', '')
+                rio = reg.get('RIO', '')
+                contato = reg.get('CONTATO DO CLIENTE', '')
+                tel = reg.get('TELEFONE', '')
+                com = reg.get('COMENTÁRIOS', '')
+
+                tabela_visitas_linhas += f"""
+                <tr>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;"><b>{temp}</b></td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{dt}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{vend}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{cli}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{mod}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{plano}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{rio}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{contato}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{tel}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7; font-size: 12px;">{com}</td>
+                </tr>
+                """
+
+            if not tabela_visitas_linhas:
+                tabela_visitas_linhas = '<tr><td colspan="10" style="padding: 20px; text-align: center; color: #718096;">Nenhum negócio ativo encontrado para o seu usuário.</td></tr>'
+
+            conteudo = f"""
+            <div>
+                <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 14px; font-size: 17px;">{modulo_titulo}</h2>
+                <p style="color: #4a5568; font-size: 13px; margin-bottom: 15px;">Acompanhamento exclusivo dos seus negócios ativos (excluindo fechados e perdidos):</p>
+
+                <!-- KPIs Estilo Painel -->
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 15px;">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #3182ce;">
+                        <div style="font-size:10px; color:#718096; font-weight:700;">TOTAL ATIVOS</div>
+                        <div style="font-size:20px; font-weight:bold; color:#2d3748;">{kpis['total']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #e53e3e;">
+                        <div style="font-size:10px; color:#e53e3e; font-weight:700;">SUPER QUENTE</div>
+                        <div style="font-size:20px; font-weight:bold; color:#e53e3e;">{kpis['super quente']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #dd6b20;">
+                        <div style="font-size:10px; color:#dd6b20; font-weight:700;">QUENTE</div>
+                        <div style="font-size:20px; font-weight:bold; color:#dd6b20;">{kpis['quente']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #d69e2e;">
+                        <div style="font-size:10px; color:#d69e2e; font-weight:700;">MORNO</div>
+                        <div style="font-size:20px; font-weight:bold; color:#d69e2e;">{kpis['morno']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #4a5568;">
+                        <div style="font-size:10px; color:#4a5568; font-weight:700;">FRIO</div>
+                        <div style="font-size:20px; font-weight:bold; color:#4a5568;">{kpis['frio']}</div>
+                    </div>
+                </div>
+
+                <!-- Tabela de Acompanhamento (Somente Leitura) -->
+                <div class="produto-detalhe-card">
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
+                            <thead>
+                                <tr style="background: #002244; color: #ffffff;">
+                                    <th style="padding: 10px;">Temp.</th>
+                                    <th style="padding: 10px;">Data</th>
+                                    <th style="padding: 10px;">Vendedor</th>
+                                    <th style="padding: 10px;">Cliente</th>
+                                    <th style="padding: 10px;">Modelo</th>
+                                    <th style="padding: 10px;">Plano</th>
+                                    <th style="padding: 10px;">RIO</th>
+                                    <th style="padding: 10px;">Contato</th>
+                                    <th style="padding: 10px;">Telefone</th>
+                                    <th style="padding: 10px;">Comentários</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {tabela_visitas_linhas}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            """
+        except Exception as e:
+            conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px;"><b>Erro ao carregar Visitas:</b> {e}</div>'
+    elif nome_modulo in ["locacao_vendas", "consorcio_vendas"]:
         nome_aba_planilha = "Vendas_LOC" if nome_modulo == "locacao_vendas" else "Vendas_Consorcio"
         try:
             planilha = conectar_google_sheets()
@@ -1611,13 +2035,19 @@ def acessar_modulo(nome_modulo):
 
             aba_modelos = planilha.worksheet("Modelos")
             registros_modelos = obter_registros_seguros(aba_modelos)
+            # 2. Busca dinâmica de Modelos
             lista_modelos = []
-            for m in registros_modelos:
-                m_nome = str(m.get("MODELO", "")).strip()
-                if m_nome and m_nome not in lista_modelos:
-                    lista_modelos.append(m_nome)
+            try:
+                aba_modelos = planilha.worksheet("Modelos")
+                regs_m = obter_registros_seguros(aba_modelos)
+                for rm in regs_m:
+                    val_m = str(rm.get("MODELO", list(rm.values())[1] if len(rm) > 1 else (list(rm.values())[0] if rm else ""))).strip()
+                    if val_m and val_m not in lista_modelos and val_m.upper() != "PRODUTO":
+                        lista_modelos.append(val_m)
+            except Exception:
+                pass
             if not lista_modelos:
-                lista_modelos = ["Delivery 11.180", "Constellation 24.280"]
+                lista_modelos = ["Delivery 11.180", "Constellation 24.280", "Meteor 28.460", "Meteor 29.530", "26.260 6x2", "30.320 8x2", "EXPRESS"]
 
             lista_planos_manutencao = ["PREV", "MAX", "PLUS"]
             lista_tipos_rio = ["Contrato Padrão", "Especial"]
@@ -1840,12 +2270,14 @@ def acessar_modulo(nome_modulo):
 
     elif nome_modulo == "vendas":
         try:
+            # Sincronização automática dos relatórios da pasta Rel_Vendas do Drive
+         
             planilha = conectar_google_sheets()
             try:
                 aba_vendas = planilha.worksheet("Vendas_PM")
             except gspread.exceptions.WorksheetNotFound:
-                aba_vendas = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=9)
-                aba_vendas.append_row(["CLIENTE", "PRODUTO", "DATA DA VENDA", "MODELO", "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "ANEXO 3"])
+                aba_vendas = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=7)
+                aba_vendas.append_row(["CLIENTE", "PRODUTO", "DATA DA VENDA", "MODELO", "QUANTIDADE", "VENDEDOR", "ANEXO 1"])
 
             mapa_vendedor_estado = {}
             try:
@@ -1899,10 +2331,23 @@ def acessar_modulo(nome_modulo):
                             rio_n = str(rn.get("RIO", "")).strip()
                             prod_n = f"{pm_n} / {rio_n}".strip(" /")
                             
-                            aba_vendas.append_row([cli_n, prod_n, data_n, mod_n, "1", vend_n, "", "", ""])
+                            aba_vendas.append_row([cli_n, prod_n, data_n, mod_n, "1", vend_n, ""])
                             clientes_ja_em_vendas.add(cli_n.lower())
             except Exception as e_sync_retroativa:
                 print(f"Aviso sync retroativa: {e_sync_retroativa}")
+
+            # Busca dinâmica de Vendedores (Apenas quem tem CONSULTOR no perfil)
+            aba_usuarios = planilha.worksheet("Usuarios")
+            registros_usuarios = obter_registros_seguros(aba_usuarios)
+            lista_consultores = []
+            for u in registros_usuarios:
+                perfil_u = str(u.get("PERFIL", "")).strip().upper()
+                nome_u = str(u.get("NOME", "")).strip()
+                if "CONSULTOR" in perfil_u and nome_u:
+                    if nome_u not in lista_consultores:
+                        lista_consultores.append(nome_u)
+            if not lista_consultores:
+                lista_consultores = [session.get("nome", "Usuário")]
 
             sucesso_msg = None
             erro_msg = None
@@ -1923,33 +2368,29 @@ def acessar_modulo(nome_modulo):
                     qtd_v = request.form.get("quantidade", "").strip()
                     vendedor_v = request.form.get("vendedor", "").strip()
                     
-                    anexos = ["", "", ""]
+                    anexo_1_url = ""
                     if index_edicao:
                         try:
                             linha_atual = aba_vendas.row_values(int(index_edicao))
-                            if len(linha_atual) >= 7: anexos[0] = linha_atual[6]
-                            if len(linha_atual) >= 8: anexos[1] = linha_atual[7]
-                            if len(linha_atual) >= 9: anexos[2] = linha_atual[8]
+                            if len(linha_atual) >= 7: anexo_1_url = linha_atual[6]
                         except Exception:
                             pass
 
-                    for idx_file in range(3):
-                        file_key = f"anexo_{idx_file+1}"
-                        if file_key in request.files:
-                            file_obj = request.files[file_key]
-                            if file_obj and file_obj.filename:
-                                filename_seguro = f"{int(time.time())}_{file_obj.filename}"
-                                upload_folder = os.path.join("static", "uploads")
-                                os.makedirs(upload_folder, exist_ok=True)
-                                caminho_completo = os.path.join(upload_folder, filename_seguro)
-                                file_obj.save(caminho_completo)
-                                anexos[idx_file] = f"/static/uploads/{filename_seguro}"
+                    if "anexo_1" in request.files:
+                        file_obj = request.files["anexo_1"]
+                        if file_obj and file_obj.filename:
+                            filename_seguro = f"{int(time.time())}_{file_obj.filename}"
+                            upload_folder = os.path.join("static", "uploads")
+                            os.makedirs(upload_folder, exist_ok=True)
+                            caminho_completo = os.path.join(upload_folder, filename_seguro)
+                            file_obj.save(caminho_completo)
+                            anexo_1_url = f"/static/uploads/{filename_seguro}"
 
                     if cliente_v:
-                        dados_venda_linha = [cliente_v, produto_v, data_v, modelo_v, qtd_v, vendedor_v, anexos[0], anexos[1], anexos[2]]
+                        dados_venda_linha = [cliente_v, produto_v, data_v, modelo_v, qtd_v, vendedor_v, anexo_1_url]
                         if index_edicao:
                             idx_int = int(index_edicao)
-                            aba_vendas.update(f"A{idx_int}:I{idx_int}", [dados_venda_linha])
+                            aba_vendas.update(f"A{idx_int}:G{idx_int}", [dados_venda_linha])
                             sucesso_msg = "Venda atualizada com sucesso!"
                         else:
                             aba_vendas.append_row(dados_venda_linha)
@@ -1958,24 +2399,48 @@ def acessar_modulo(nome_modulo):
                         erro_msg = "Informe o cliente para registrar a venda."
 
             linhas_vendas_brutas = aba_vendas.get_all_values()
-            mes_selecionado = request.args.get("mes", "todos").strip().lower()
+            
+            # Captura de Filtros padronizados
+            busca_cliente = request.args.get("busca", "").strip().lower()
+            vend_selecionado = request.args.get("vend", "todos").strip().lower()
+            ano_selecionado = request.args.get("ano", str(datetime.now().year)).strip()
+            periodo_selecionado = request.args.get("periodo", "anointeiro").strip().lower()
 
-            meses_nomes = {
-                "anual": "Anual (Todos)",
-                "semestre1": "1º Semestre (Jan a Jun)",
-                "semestre2": "2º Semestre (Jul a Dez)",
+            options_filtro_vend = '<option value="todos"' + (' selected' if vend_selecionado == 'todos' else '') + '>Todos Vendedores</option>'
+            for c in lista_consultores:
+                sel_v = ' selected' if vend_selecionado == c.lower() else ''
+                options_filtro_vend += f'<option value="{c}"{sel_v}>{c}</option>'
+
+            anos_disponiveis = {str(datetime.now().year)}
+            if len(linhas_vendas_brutas) > 1:
+                cab_scan_v = [c.upper().strip() for c in linhas_vendas_brutas[0]]
+                idx_dt_scan_v = cab_scan_v.index("DATA DA VENDA") if "DATA DA VENDA" in cab_scan_v else 2
+                for l in linhas_vendas_brutas[1:]:
+                    if len(l) > idx_dt_scan_v:
+                        m_a = re.search(r'/\d{2}/(\d{4}|\d{2})', l[idx_dt_scan_v])
+                        if m_a:
+                            a_val = m_a.group(1)
+                            if len(a_val) == 2: a_val = "20" + a_val
+                            anos_disponiveis.add(a_val)
+
+            options_anos = ""
+            for a_op in sorted(list(anos_disponiveis), reverse=True):
+                sel_a = ' selected' if ano_selecionado == a_op else ''
+                options_anos += f'<option value="{a_op}"{sel_a}>{a_op}</option>'
+
+            meses_dict = {
                 "01": "Janeiro", "02": "Fevereiro", "03": "Março", "04": "Abril",
                 "05": "Maio", "06": "Junho", "07": "Julho", "08": "Agosto",
                 "09": "Setembro", "10": "Outubro", "11": "Novembro", "12": "Dezembro"
             }
-            options_meses = ''
-            for k, v in meses_nomes.items():
-                sel = ' selected' if mes_selecionado == k else ''
-                options_meses += f'<option value="{k}"{sel}>{v}</option>'
+
+            options_periodo = f'<option value="anointeiro" {"selected" if periodo_selecionado == "anointeiro" else ""}>Ano Inteiro</option>'
+            options_periodo += f'<option value="semestre1" {"selected" if periodo_selecionado == "semestre1" else ""}>1º Semestre</option>'
+            options_periodo += f'<option value="semestre2" {"selected" if periodo_selecionado == "semestre2" else ""}>2º Semestre</option>'
+            for m_num, m_nome in meses_dict.items():
+                options_periodo += f'<option value="{m_num}" {"selected" if periodo_selecionado == m_num else ""}>{m_nome}</option>'
 
             titulo_relatorio_txt = f"RELATÓRIO DE VENDAS E COMISSÕES"
-            if mes_selecionado in meses_nomes and mes_selecionado != "todos" and mes_selecionado != "anual":
-                titulo_relatorio_txt += f" ({meses_nomes[mes_selecionado]})"
 
             registros_vendas_filtrados = []
             if len(linhas_vendas_brutas) > 1:
@@ -1986,30 +2451,47 @@ def acessar_modulo(nome_modulo):
                         if i < len(cab_v) and cab_v[i]:
                             dict_v[cab_v[i]] = val
 
-                    data_venda_val = dict_v.get('DATA DA VENDA', '').strip()
-                    match_mes = re.search(r'^\d{1,2}/(\d{1,2})/(?:\d{2}|\d{4})', data_venda_val)
-                    mes_item = match_mes.group(1).zfill(2) if match_mes else ""
+                    cli_val = str(dict_v.get('CLIENTE', '')).strip().lower()
+                    vend_val = str(dict_v.get('VENDEDOR', '')).strip().lower()
+                    data_venda_val = str(dict_v.get('DATA DA VENDA', '')).strip()
 
-                    incluir_registro = False
-                    if mes_selecionado in ["todos", "anual", ""]:
-                        incluir_registro = True
-                    elif mes_selecionado == "semestre1" and mes_item in ["01","02","03","04","05","06"]:
-                        incluir_registro = True
-                    elif mes_selecionado == "semestre2" and mes_item in ["07","08","09","10","11","12"]:
-                        incluir_registro = True
-                    elif mes_selecionado == mes_item:
-                        incluir_registro = True
+                    dt_obj = datetime.max
+                    ano_item = ""
+                    mes_item = ""
+                    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+                        try:
+                            dt_obj = datetime.strptime(data_venda_val, fmt)
+                            mes_item = f"{dt_obj.month:02d}"
+                            ano_item = str(dt_obj.year)
+                            break
+                        except ValueError:
+                            pass
 
-                    if incluir_registro:
-                        dt_obj = datetime.max
-                        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d/%m/%G", "%d/%m/%g"):
-                            try:
-                                dt_obj = datetime.strptime(data_venda_val, fmt)
-                                break
-                            except ValueError:
-                                pass
-                        dict_v["_dt_obj"] = dt_obj
-                        registros_vendas_filtrados.append(dict_v)
+                    if not ano_item:
+                        m_ano = re.search(r'/(\d{4}|\d{2})$', data_venda_val)
+                        if m_ano:
+                            a = m_ano.group(1)
+                            ano_item = "20" + a if len(a) == 2 else a
+                        m_mes = re.search(r'^\d{1,2}/(\d{1,2})/', data_venda_val)
+                        mes_item = m_mes.group(1).zfill(2) if m_mes else ""
+
+                    if ano_selecionado and ano_item != ano_selecionado:
+                        continue
+
+                    if periodo_selecionado == "semestre1" and mes_item not in ["01","02","03","04","05","06"]:
+                        continue
+                    elif periodo_selecionado == "semestre2" and mes_item not in ["07","08","09","10","11","12"]:
+                        continue
+                    elif len(periodo_selecionado) == 2 and periodo_selecionado.isdigit() and mes_item != periodo_selecionado:
+                        continue
+
+                    if busca_cliente and busca_cliente not in cli_val:
+                        continue
+                    if vend_selecionado != "todos" and vend_val != vend_selecionado:
+                        continue
+
+                    dict_v["_dt_obj"] = dt_obj
+                    registros_vendas_filtrados.append(dict_v)
 
             registros_vendas_filtrados.sort(key=lambda x: x["_dt_obj"])
 
@@ -2123,15 +2605,14 @@ def acessar_modulo(nome_modulo):
                 dados_dashboard["vendedores"][vend]["qtd"] += qtd_num
                 dados_dashboard["vendedores"][vend]["comissao"] += total_comissao_vend
 
+                link_anexo_1 = reg.get('ANEXO 1', '')
                 anexos_html = ""
-                for anexo_idx in range(1, 4):
-                    link_anexo = reg.get(f'ANEXO {anexo_idx}', '')
-                    if link_anexo:
-                        anexos_html += f'''
-                        <div onclick="abrirImagemModal('{link_anexo}')" title="Clique para ampliar" style="display: inline-block; margin-right: 12px; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
-                            <img src="{link_anexo}" alt="Anexo {anexo_idx}" class="img-comprovacao">
-                        </div>
-                        '''
+                if link_anexo_1:
+                    anexos_html = f'''
+                    <div onclick="abrirImagemModal('{link_anexo_1}')" title="Clique para ampliar" style="display: inline-block; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
+                        <img src="{link_anexo_1}" alt="Anexo 1" class="img-comprovacao">
+                    </div>
+                    '''
 
                 botoes_v = f"""
                 <div style="display: flex; gap: 4px;">
@@ -2153,7 +2634,7 @@ def acessar_modulo(nome_modulo):
                 </tr>
                 <tr style="background-color: #fafbfc;">
                     <td colspan="8" style="padding: 8px 10px 12px 10px; border-bottom: 1px solid #edf2f7;">
-                        <span style="font-size: 11px; font-weight: 700; color: #4a5568; text-transform: uppercase; display: block; margin-bottom: 4px;">Comprovações / Anexos:</span>
+                        <span style="font-size: 11px; font-weight: 700; color: #4a5568; text-transform: uppercase; display: block; margin-bottom: 4px;">Comprovação (Anexo 1):</span>
                         {anexos_html if anexos_html else '<span style="color: #a0aec0; font-size: 12px;">Nenhum anexo enviado.</span>'}
                     </td>
                 </tr>
@@ -2235,73 +2716,87 @@ def acessar_modulo(nome_modulo):
                 {f'<div class="sucesso">{sucesso_msg}</div>' if sucesso_msg else ''}
                 {f'<div class="error">{erro_msg}</div>' if erro_msg else ''}
 
-                <div class="produto-detalhe-card" style="margin-bottom: 20px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                        <h3 id="tituloFormVendaCard" style="font-size: 15px; color: #002244; margin: 0;">Registrar Nova Venda / Comprovação</h3>
-                        <button type="button" id="btnCancelarEdicaoVenda" onclick="cancelarEdicaoVenda()" style="display: none; background: #cbd5e0; border: none; padding: 4px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 600;">Cancelar Edição</button>
-                    </div>
+                <!-- Botões de Ação Externa (Gerar PDF e Ver Gráficos) -->
+                <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                    <button type="button" onclick="gerarPDFRelatorio()" class="btn-acao btn-pdf" style="flex: 1; height: 46px; font-size: 13px; font-weight: 600; margin: 0;">📄 Gerar PDF (Comissões)</button>
+                    <button type="button" onclick="alternarVisaoDashboard()" id="btnAlternarVisao" class="btn-acao btn-graficos" style="flex: 1; height: 46px; font-size: 13px; font-weight: 600; margin: 0;">📊 Ver Gráficos</button>
+                </div>
 
-                    <form method="POST" enctype="multipart/form-data">
-                        <input type="hidden" name="acao_form" value="cadastrar">
-                        <input type="hidden" id="editVendaIndexInput" name="index_edicao" value="">
+                <!-- Formulário Retrátil / Sanfona (Igual a Negócios em Andamento) -->
+                <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 6px; margin-bottom: 15px; overflow: hidden;">
+                    <button type="button" onclick="toggleFormularioVenda()" style="width: 100%; background: #f7fafc; border: none; padding: 12px 16px; text-align: left; font-weight: 700; color: #002244; cursor: pointer; display: flex; align-items: center; gap: 8px;">
+                        <span id="iconeSanfonaVenda">▶</span> <span id="tituloFormVendaCard">➕ Registrar Nova Venda / Comprovação</span>
+                    </button>
+                    
+                    <div id="containerFormularioVenda" style="display: none; padding: 16px; border-top: 1px solid #e2e8f0; background: #fff;">
+                        <form method="POST" enctype="multipart/form-data">
+                            <input type="hidden" name="acao_form" value="cadastrar">
+                            <input type="hidden" id="editVendaIndexInput" name="index_edicao" value="">
 
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Cliente</label>
-                                <input type="text" name="cliente" placeholder="Nome do Cliente / Empresa" required>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
+                                <div>
+                                    <label>Cliente</label>
+                                    <input type="text" name="cliente" placeholder="Nome do Cliente / Empresa" required>
+                                </div>
+                                <div>
+                                    <label>Produto (Plano / RIO)</label>
+                                    <input type="text" name="produto" placeholder="Ex: PREV / RIO" required>
+                                </div>
                             </div>
-                            <div>
-                                <label>Produto (Plano / RIO)</label>
-                                <input type="text" name="produto" placeholder="Ex: PREV / RIO" required>
-                            </div>
-                        </div>
 
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Data da Venda</label>
-                                <input type="text" name="data_venda" value="{datetime.now().strftime('%d/%m/%Y')}" required>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
+                                <div>
+                                    <label>Data da Venda</label>
+                                    <input type="text" name="data_venda" value="{datetime.now().strftime('%d/%m/%Y')}" required>
+                                </div>
+                                <div>
+                                    <label>Modelo do Veículo</label>
+                                    <input type="text" name="modelo" placeholder="Ex: Delivery 11.180 / Meteor">
+                                </div>
                             </div>
-                            <div>
-                                <label>Modelo do Veículo</label>
-                                <input type="text" name="modelo" placeholder="Ex: Delivery 11.180 / Meteor">
-                            </div>
-                        </div>
 
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Quantidade</label>
-                                <input type="text" name="quantidade" placeholder="Ex: 2 veículos" required>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
+                                <div>
+                                    <label>Quantidade</label>
+                                    <input type="text" name="quantidade" placeholder="Ex: 2 veículos" required>
+                                </div>
+                                <div>
+                                    <label>Vendedor</label>
+                                    <input type="text" name="vendedor" value="{nome_usuario_logado}" readonly style="background-color: #edf2f7;">
+                                </div>
                             </div>
-                            <div>
-                                <label>Vendedor</label>
-                                <input type="text" name="vendedor" value="{nome_usuario_logado}" readonly style="background-color: #edf2f7;">
-                            </div>
-                        </div>
 
-                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Anexo 1 (Câmera / Galeria)</label>
+                            <div style="margin-bottom: 10px;">
+                                <label>Anexo 1 (Comprovação / Imagem)</label>
                                 <input type="file" name="anexo_1" accept="image/*" capture="environment">
                             </div>
-                            <div>
-                                <label>Anexo 2 (Opcional)</label>
-                                <input type="file" name="anexo_2" accept="image/*" capture="environment">
-                            </div>
-                            <div>
-                                <label>Anexo 3 (Opcional)</label>
-                                <input type="file" name="anexo_3" accept="image/*" capture="environment">
-                            </div>
-                        </div>
 
-                        <div style="display: flex; gap: 10px; align-items: center; margin-top: 15px; flex-wrap: wrap;">
-                            <button type="submit" id="btnSubmitVendaForm" class="btn-login" style="flex: 2; margin: 0;">Salvar Venda</button>
-                            <select id="filtroMesSelect" onchange="window.location.href='/modulo/vendas?mes=' + this.value" style="flex: 1; padding: 12px; font-size: 14px; border-radius: 6px; border: 1px solid #cbd5e0; background: #fff; font-weight: 600; height: 46px; margin: 0;">
-                                {options_meses}
-                            </select>
-                            <button type="button" onclick="gerarPDFRelatorio()" class="btn-acao btn-pdf" style="flex: 1.5; height: 46px; font-size: 13px; font-weight: 600; margin: 0;">📄 Gerar PDF (Comissões)</button>
-                            <button type="button" onclick="alternarVisaoDashboard()" id="btnAlternarVisao" class="btn-acao btn-graficos" style="flex: 1.5; height: 46px; font-size: 13px; font-weight: 600; margin: 0;">📊 Ver Gráficos</button>
-                        </div>
-                    </form>
+                            <div style="display: flex; gap: 10px; margin-top: 15px;">
+                                <button type="submit" id="btnSubmitVendaForm" class="btn-login" style="width: auto; padding: 10px 24px;">Salvar Venda</button>
+                                <button type="button" id="btnCancelarEdicaoVenda" onclick="cancelarEdicaoVenda()" style="display:none; background:#cbd5e0; border:none; padding:10px 16px; border-radius:6px; cursor:pointer; font-weight:600;">Cancelar Edição</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Barra de Filtros Padronizada -->
+                <div class="produto-detalhe-card" style="padding: 12px; margin-bottom: 15px;">
+                    <div style="font-weight:700; color:#002244; margin-bottom:8px; font-size:13px;">Lista de Vendas</div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <input type="text" id="filtroBusca" value="{busca_cliente}" placeholder="🔍 Buscar cliente..." style="flex: 2; min-width: 200px; padding: 10px;" onkeypress="if(event.key === 'Enter') aplicarFiltrosVendas()">
+                        
+                        <select id="filtroVend" style="flex: 1; min-width: 140px; padding: 10px;" onchange="aplicarFiltrosVendas()">
+                            {options_filtro_vend}
+                        </select>
+
+                        <select id="filtroAno" style="flex: 0.8; min-width: 90px; padding: 10px;" onchange="aplicarFiltrosVendas()">
+                            {options_anos}
+                        </select>
+
+                        <select id="filtroPeriodo" style="flex: 1; min-width: 130px; padding: 10px;" onchange="aplicarFiltrosVendas()">
+                            {options_periodo}
+                        </select>
+                    </div>
                 </div>
 
                 <div id="secaoRelatorioPDF" class="produto-detalhe-card">
@@ -2345,7 +2840,7 @@ def acessar_modulo(nome_modulo):
 
                 <div id="secaoDashboard" class="produto-detalhe-card" style="display: none;">
                     <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #002244; padding-bottom: 10px; margin-bottom: 20px;">
-                        <h3 style="font-size: 16px; color: #002244; margin: 0;">📊 Dashboard Inteligente ({meses_nomes.get(mes_selecionado, mes_selecionado)})</h3>
+                        <h3 style="font-size: 16px; color: #002244; margin: 0;">📊 Dashboard Inteligente</h3>
                     </div>
 
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 25px;">
@@ -2381,6 +2876,60 @@ def acessar_modulo(nome_modulo):
             </div>
 
             <script>
+                function toggleFormularioVenda() {{
+                    var container = document.getElementById('containerFormularioVenda');
+                    var icone = document.getElementById('iconeSanfonaVenda');
+                    if (container.style.display === 'none') {{
+                        container.style.display = 'block';
+                        icone.innerHTML = '▼';
+                    }} else {{
+                        container.style.display = 'none';
+                        icone.innerHTML = '▶';
+                    }}
+                }}
+
+                function carregarVendaParaEdicao(idx, cliente, produto, dataVenda, modelo, quantidade, vendedor) {{
+                    var container = document.getElementById('containerFormularioVenda');
+                    container.style.display = 'block';
+                    document.getElementById('iconeSanfonaVenda').innerHTML = '▼';
+
+                    document.getElementById('editVendaIndexInput').value = idx;
+                    document.getElementById('tituloFormVendaCard').innerText = "✏️ Alterar Venda / Comprovação (Linha " + idx + ")";
+                    document.getElementById('btnSubmitVendaForm').innerText = "Atualizar Venda";
+                    document.getElementById('btnCancelarEdicaoVenda').style.display = "inline-block";
+
+                    document.querySelector('[name="cliente"]').value = cliente;
+                    document.querySelector('[name="produto"]').value = produto;
+                    document.querySelector('[name="data_venda"]').value = dataVenda;
+                    document.querySelector('[name="modelo"]').value = modelo;
+                    document.querySelector('[name="quantidade"]').value = quantidade;
+                    document.querySelector('[name="vendedor"]').value = vendedor;
+
+                    window.scrollTo({{ top: 0, behavior: 'smooth' }});
+                }}
+
+                function cancelarEdicaoVenda() {{
+                    document.getElementById('editVendaIndexInput').value = "";
+                    document.getElementById('tituloFormVendaCard').innerText = "➕ Registrar Nova Venda / Comprovação";
+                    document.getElementById('btnSubmitVendaForm').innerText = "Salvar Venda";
+                    document.getElementById('btnCancelarEdicaoVenda').style.display = "none";
+                    document.getElementById('containerFormularioVenda').style.display = 'none';
+                    document.getElementById('iconeSanfonaVenda').innerHTML = '▶';
+
+                    document.querySelector('[name="cliente"]').value = "";
+                    document.querySelector('[name="produto"]').value = "";
+                    document.querySelector('[name="modelo"]').value = "";
+                    document.querySelector('[name="quantidade"]').value = "";
+                }}
+
+                function aplicarFiltrosVendas() {{
+                    var busca = document.getElementById('filtroBusca').value;
+                    var vend = document.getElementById('filtroVend').value;
+                    var ano = document.getElementById('filtroAno').value;
+                    var periodo = document.getElementById('filtroPeriodo').value;
+                    window.location.href = '/modulo/vendas?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
+                }}
+
                 var graficosIniciados = false;
                 var dadosPainel = {json_dashboard_data};
 
@@ -2516,16 +3065,79 @@ def acessar_modulo(nome_modulo):
 
     elif nome_modulo == "negocios":
         try:
+            # Sincroniza o Drive apenas se entrou na página direto (sem filtros ativos na URL)
+            if not request.args:
+                msg_sync = importar_relatorios_drive_vendas()
+                print(msg_sync)
+
             planilha = conectar_google_sheets()
-            
+
             try:
                 aba_negocios = planilha.worksheet("Negocios_PM")
             except gspread.exceptions.WorksheetNotFound:
-                aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=9)
-                aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "COMENTÁRIOS"])
+                aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=10)
+                aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS"])
             
             sucesso_msg = None
             erro_msg = None
+
+            # 1. Busca dinâmica de Vendedores (Apenas quem tem CONSULTOR no perfil)
+            aba_usuarios = planilha.worksheet("Usuarios")
+            registros_usuarios = obter_registros_seguros(aba_usuarios)
+            lista_consultores = []
+            for u in registros_usuarios:
+                perfil_u = str(u.get("PERFIL", "")).strip().upper()
+                nome_u = str(u.get("NOME", "")).strip()
+                if "CONSULTOR" in perfil_u and nome_u:
+                    if nome_u not in lista_consultores:
+                        lista_consultores.append(nome_u)
+            if not lista_consultores:
+                lista_consultores = [session.get("nome", "Usuário")]
+
+            # 2. Busca dinâmica de Modelos
+            lista_modelos = []
+            try:
+                aba_modelos = planilha.worksheet("Modelos")
+                regs_m = obter_registros_seguros(aba_modelos)
+                for rm in regs_m:
+                    val_m = str(rm.get("MODELO", list(rm.values())[1] if len(rm) > 1 else (list(rm.values())[0] if rm else ""))).strip()
+                    if val_m and val_m not in lista_modelos and val_m.upper() != "PRODUTO":
+                        lista_modelos.append(val_m)
+            except Exception:
+                pass
+            
+            if not lista_modelos:
+                lista_modelos = ["Delivery 11.180", "Constellation 24.280", "Meteor 28.460", "Meteor 29.530", "26.260 6x2", "30.320 8x2", "EXPRESS"]
+
+            # 3. Busca dinâmica de Planos de Manutenção (Lendo estritamente a Coluna B / PRODUTO da aba PM)
+            lista_planos_manutencao = []
+            try:
+                aba_pm = planilha.worksheet("PM")
+                regs_pm = obter_registros_seguros(aba_pm)
+                for rp in regs_pm:
+                    # Pega o valor da coluna PRODUTO (ou a 2ª coluna do dicionário)
+                    val_p = str(rp.get("PRODUTO", list(rp.values())[1] if len(rp) > 1 else (list(rp.values())[0] if rp else ""))).strip()
+                    if val_p and val_p not in lista_planos_manutencao and val_p.upper() != "PRODUTO":
+                        lista_planos_manutencao.append(val_p)
+            except Exception:
+                pass
+            if not lista_planos_manutencao:
+                lista_planos_manutencao = ["VolksTotal PRE Prevenção e Economia", "VolksTotal MAX", "VolksTotal PLUS", "PREV", "MAX", "PLUS"]
+
+            # 4. Busca dinâmica de RIO (Lendo estritamente a Coluna B / PRODUTO da aba RIO)
+            lista_tipos_rio = []
+            try:
+                aba_rio_origem = planilha.worksheet("RIO")
+                regs_rio = obter_registros_seguros(aba_rio_origem)
+                for rr in regs_rio:
+                    # Pega o valor da coluna PRODUTO (ou a 2ª coluna do dicionário)
+                    val_r = str(rr.get("PRODUTO", list(rr.values())[1] if len(rr) > 1 else (list(rr.values())[0] if rr else ""))).strip()
+                    if val_r and val_r not in lista_tipos_rio and val_r.upper() != "PRODUTO":
+                        lista_tipos_rio.append(val_r)
+            except Exception:
+                pass
+            if not lista_tipos_rio:
+                lista_tipos_rio = ["Diagnóstico Remoto", "Análise de Eficiência", "Performance", "RIO GEO", "Relatório de Bloqueio"]
 
             if request.method == "POST" and "acao_form" in request.form:
                 acao_form = request.form.get("acao_form", "").strip()
@@ -2545,97 +3157,67 @@ def acessar_modulo(nome_modulo):
                     plano_manutencao = request.form.get("plano_manutencao", "").strip()
                     rio_val = request.form.get("rio", "").strip()
                     contato = request.form.get("contato", "").strip()
+                    telefone = request.form.get("telefone", "").strip()
                     comentarios = request.form.get("comentarios", "").strip()
 
                     if cliente and vendedor_form:
-                        dados_linha = [temperatura, data_neg, vendedor_form, cliente, modelo, plano_manutencao, rio_val, contato, comentarios]
+                        dados_linha = [temperatura, data_neg, vendedor_form, cliente, modelo, plano_manutencao, rio_val, contato, telefone, comentarios]
                         if index_edicao:
                             idx_int = int(index_edicao)
-                            aba_negocios.update(f"A{idx_int}:I{idx_int}", [dados_linha])
+                            aba_negocios.update(f"A{idx_int}:J{idx_int}", [dados_linha])
                             sucesso_msg = "Negócio atualizado com sucesso!"
                         else:
                             aba_negocios.append_row(dados_linha)
                             sucesso_msg = "Negócio cadastrado com sucesso!"
-
-                        if temperatura.strip().lower() == "fechado":
-                            try:
-                                try:
-                                    aba_vendas_sync = planilha.worksheet("Vendas_PM")
-                                except gspread.exceptions.WorksheetNotFound:
-                                    aba_vendas_sync = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=9)
-                                    aba_vendas_sync.append_row(["CLIENTE", "PRODUTO", "DATA DA VENDA", "MODELO", "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "ANEXO 3"])
-                                
-                                produto_combinado = f"{plano_manutencao} / {rio_val}".strip(" /")
-                                aba_vendas_sync.append_row([cliente, produto_combinado, data_neg, modelo, "1", vendedor_form, "", "", ""])
-                                sucesso_msg += " Negócio fechado sincronizado automaticamente para Vendas!"
-                            except Exception as sync_err:
-                                print(f"Erro ao sincronizar venda: {sync_err}")
                     else:
                         erro_msg = "Preencha ao menos o Cliente e o Vendedor."
 
-            aba_usuarios = planilha.worksheet("Usuarios")
-            registros_usuarios = obter_registros_seguros(aba_usuarios)
-            lista_consultores = []
-            for u in registros_usuarios:
-                perfil_u = str(u.get("PERFIL", "")).strip().upper()
-                nome_u = str(u.get("NOME", "")).strip()
-                if "CONSULTOR" in perfil_u and nome_u:
-                    lista_consultores.append(nome_u)
-            if not lista_consultores:
-                lista_consultores = [session.get("nome", "Usuário")]
-
-            aba_modelos = planilha.worksheet("Modelos")
-            registros_modelos = obter_registros_seguros(aba_modelos)
-            lista_modelos = []
-            for m in registros_modelos:
-                m_nome = str(m.get("MODELO", "")).strip()
-                if m_nome and m_nome not in lista_modelos:
-                    lista_modelos.append(m_nome)
-            if not lista_modelos:
-                lista_modelos = ["Delivery 11.180", "Constellation 24.280"]
-
-            lista_planos_manutencao = ["PREV", "MAX", "PLUS"]
-
-            try:
-                aba_rio_dados = planilha.worksheet("RIO")
-                registros_rio = obter_registros_seguros(aba_rio_dados)
-                lista_tipos_rio = []
-                for item in registros_rio:
-                    p_nome = str(item.get("PRODUTO", "")).strip()
-                    if p_nome and p_nome not in lista_tipos_rio:
-                        lista_tipos_rio.append(p_nome)
-                if not lista_tipos_rio:
-                    lista_tipos_rio = ["RIO", "Diagnóstico Remoto", "RIO Geo"]
-            except Exception:
-                lista_tipos_rio = ["RIO", "Diagnóstico Remoto", "RIO Geo"]
-
-            lista_temperaturas = ["Fechado", "Quente", "Super Quente", "Frio", "Morno"]
-
+            lista_temperaturas = ["Super Quente", "Quente", "Morno", "Frio", "Perdida", "Fechado"]
             linhas_brutas = aba_negocios.get_all_values()
             
-            mes_selecionado = request.args.get("mes", "todos").strip().lower()
+            # Captura de Filtros via URL
+            busca_cliente = request.args.get("busca", "").strip().lower()
+            vend_selecionado = request.args.get("vend", "todos").strip().lower()
+            ano_selecionado = request.args.get("ano", str(datetime.now().year)).strip()
+            periodo_selecionado = request.args.get("periodo", "anointeiro").strip().lower()
+            temp_selecionada = request.args.get("temp", "todas").strip().lower()
 
-            options_consultores = "".join([f'<option value="{c}">{c}</option>' for c in lista_consultores])
-            options_modelos = "".join([f'<option value="{m}">{m}</option>' for m in lista_modelos])
-            options_planos_manutencao = "".join([f'<option value="{p}">{p}</option>' for p in lista_planos_manutencao])
-            options_rio = "".join([f'<option value="{r}">{r}</option>' for r in lista_tipos_rio])
-            options_temperaturas = "".join([f'<option value="{t}">{t}</option>' for t in lista_temperaturas])
+            options_filtro_vend = '<option value="todos"' + (' selected' if vend_selecionado == 'todos' else '') + '>Todos Vendedores</option>'
+            for c in lista_consultores:
+                sel_v = ' selected' if vend_selecionado == c.lower() else ''
+                options_filtro_vend += f'<option value="{c}"{sel_v}>{c}</option>'
 
-            meses_nomes = {
+            anos_disponiveis = {str(datetime.now().year)}
+            if len(linhas_brutas) > 1:
+                cab_scan = [c.upper().strip() for c in linhas_brutas[0]]
+                idx_dt_scan = cab_scan.index("DATA") if "DATA" in cab_scan else 1
+                for l in linhas_brutas[1:]:
+                    if len(l) > idx_dt_scan:
+                        m_a = re.search(r'/\d{2}/(\d{4}|\d{2})', l[idx_dt_scan])
+                        if m_a:
+                            a_val = m_a.group(1)
+                            if len(a_val) == 2: a_val = "20" + a_val
+                            anos_disponiveis.add(a_val)
+
+            options_anos = ""
+            for a_op in sorted(list(anos_disponiveis), reverse=True):
+                sel_a = ' selected' if ano_selecionado == a_op else ''
+                options_anos += f'<option value="{a_op}"{sel_a}>{a_op}</option>'
+
+            meses_dict = {
                 "01": "Janeiro", "02": "Fevereiro", "03": "Março", "04": "Abril",
                 "05": "Maio", "06": "Junho", "07": "Julho", "08": "Agosto",
                 "09": "Setembro", "10": "Outubro", "11": "Novembro", "12": "Dezembro"
             }
-            options_meses = '<option value="todos"' + (' selected' if mes_selecionado == 'todos' else '') + '>Todos os Meses</option>'
-            for k, v in meses_nomes.items():
-                sel = ' selected' if mes_selecionado == k else ''
-                options_meses += f'<option value="{k}"{sel}>{v}</option>'
 
-            titulo_relatorio_txt = f"RELATÓRIO DE NEGÓCIOS EM ANDAMENTO"
-            if mes_selecionado != "todos" and mes_selecionado in meses_nomes:
-                titulo_relatorio_txt += f" ({meses_nomes[mes_selecionado]})"
+            options_periodo = f'<option value="anointeiro" {"selected" if periodo_selecionado == "anointeiro" else ""}>Ano Inteiro</option>'
+            options_periodo += f'<option value="semestre1" {"selected" if periodo_selecionado == "semestre1" else ""}>1º Semestre</option>'
+            options_periodo += f'<option value="semestre2" {"selected" if periodo_selecionado == "semestre2" else ""}>2º Semestre</option>'
+            for m_num, m_nome in meses_dict.items():
+                options_periodo += f'<option value="{m_num}" {"selected" if periodo_selecionado == m_num else ""}>{m_nome}</option>'
 
-            registros_filtrados_ordenados = []
+            kpis = {"total": 0, "fechado": 0, "super quente": 0, "quente": 0, "morno": 0, "perdida": 0, "frio": 0}
+            registros_filtrados = []
 
             if len(linhas_brutas) > 1:
                 cabecalhos = [c.upper().strip() for c in linhas_brutas[0]]
@@ -2645,183 +3227,216 @@ def acessar_modulo(nome_modulo):
                         if i < len(cabecalhos) and cabecalhos[i]:
                             item_dict[cabecalhos[i]] = val
 
-                    temp_val = item_dict.get('TEMPERATURA','')
-                    data_val = item_dict.get('DATA','').strip()
+                    temp_val = str(item_dict.get('TEMPERATURA', '')).strip()
+                    temp_lower = temp_val.lower()
+                    data_val = str(item_dict.get('DATA', '')).strip()
+                    vend_val = str(item_dict.get('VENDEDOR', '')).strip().lower()
+                    cli_val = str(item_dict.get('CLIENTE', '')).strip().lower()
 
-                    match_mes = re.search(r'^\d{1,2}/(\d{1,2})/(?:\d{2}|\d{4})', data_val)
-                    mes_item = match_mes.group(1).zfill(2) if match_mes else ""
+                    dt_obj = datetime.max
+                    ano_item = ""
+                    mes_item = ""
+                    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+                        try:
+                            dt_obj = datetime.strptime(data_val, fmt)
+                            mes_item = f"{dt_obj.month:02d}"
+                            ano_item = str(dt_obj.year)
+                            break
+                        except ValueError:
+                            pass
 
-                    if temp_val.strip().lower() != "fechado":
-                        if mes_selecionado == "todos" or mes_item == mes_selecionado:
-                            dt_obj = datetime.max
-                            for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d/%m/%G", "%d/%m/%g"):
-                                try:
-                                    dt_obj = datetime.strptime(data_val, fmt)
-                                    break
-                                except ValueError:
-                                    pass
-                            
-                            item_dict["_dt_obj"] = dt_obj
-                            registros_filtrados_ordenados.append(item_dict)
+                    if not ano_item:
+                        m_ano = re.search(r'/(\d{4}|\d{2})$', data_val)
+                        if m_ano:
+                            a = m_ano.group(1)
+                            ano_item = "20" + a if len(a) == 2 else a
+                        m_mes = re.search(r'^\d{1,2}/(\d{1,2})/', data_val)
+                        mes_item = m_mes.group(1).zfill(2) if mes_item else ""
 
-            registros_filtrados_ordenados.sort(key=lambda x: x["_dt_obj"])
+                    if ano_selecionado and ano_item != ano_selecionado:
+                        continue
+
+                    if periodo_selecionado == "semestre1" and mes_item not in ["01","02","03","04","05","06"]:
+                        continue
+                    elif periodo_selecionado == "semestre2" and mes_item not in ["07","08","09","10","11","12"]:
+                        continue
+                    elif len(periodo_selecionado) == 2 and periodo_selecionado.isdigit() and mes_item != periodo_selecionado:
+                        continue
+
+                    kpis["total"] += 1
+                    if temp_lower in kpis:
+                        kpis[temp_lower] += 1
+
+                    if busca_cliente and busca_cliente not in cli_val:
+                        continue
+                    if vend_selecionado != "todos" and vend_val != vend_selecionado:
+                        continue
+                    if temp_selecionada != "todas" and temp_lower != temp_selecionada:
+                        continue
+
+                    item_dict["_dt_obj"] = dt_obj
+                    registros_filtrados.append(item_dict)
+
+            registros_filtrados.sort(key=lambda x: x["_dt_obj"], reverse=True)
 
             tabela_linhas = ""
-            contador_ativos = 0
+            for reg in registros_filtrados:
+                idx_l = reg["_index_planilha"]
+                temp = reg.get('TEMPERATURA', '')
+                dt = reg.get('DATA', '')
+                vend = reg.get('VENDEDOR', '')
+                cli = reg.get('CLIENTE', '')
+                mod = reg.get('MODELO', '')
+                plano = reg.get('PLANO DE MANUTENÇÃO', '')
+                rio = reg.get('RIO', '')
+                contato = reg.get('CONTATO DO CLIENTE', '')
+                tel = reg.get('TELEFONE', '')
+                com = reg.get('COMENTÁRIOS', '')
 
-            for reg in registros_filtrados_ordenados:
-                contador_ativos += 1
-                idx_linha = reg["_index_planilha"]
-                temp_val = reg.get('TEMPERATURA','')
-                data_val = reg.get('DATA','')
-                vend_val = reg.get('VENDEDOR','')
-                cli_val = reg.get('CLIENTE','')
-                mod_val = reg.get('MODELO','')
-                pm_val = reg.get('PLANO DE MANUTENÇÃO','')
-                rio_val = reg.get('RIO','')
-                cont_val = reg.get('CONTATO DO CLIENTE','')
-                com_val = reg.get('COMENTÁRIOS','')
+                btn_venda_direta = ""
+                if temp.strip().lower() == "fechado":
+                    btn_venda_direta = f'<button type="button" class="btn-acao" style="background:#2f855a; color:#fff;" onclick="sincronizarParaVendas({idx_l}, \'{cli}\', \'{plano} / {rio}\', \'{dt}\', \'{mod}\', \'{vend}\')">✔ Venda</button>'
 
-                botoes_acoes_html = f"""
-                <div style="display: flex; gap: 4px;">
-                    <button type="button" class="btn-acao btn-editar no-print" onclick="carregarParaEdicao({idx_linha}, '{temp_val}', '{data_val}', '{vend_val}', '{cli_val}', '{mod_val}', '{pm_val}', '{rio_val}', '{cont_val}', '', '{com_val}')">Alterar</button>
-                    <button type="button" class="btn-acao btn-excluir no-print" onclick="excluirNegocio({idx_linha}, 'negocios')">Excluir</button>
+                botoes_acoes = f"""
+                <div style="display: flex; gap: 4px; align-items: center; justify-content: flex-end;">
+                    {btn_venda_direta}
+                    <button type="button" class="btn-acao btn-editar" onclick="carregarParaEdicao({idx_l}, '{temp}', '{dt}', '{vend}', '{cli}', '{mod}', '{plano}', '{rio}', '{contato}', '{tel}', '{com}')">Alterar</button>
+                    <button type="button" class="btn-acao btn-excluir" onclick="excluirNegocio({idx_l})">Excluir</button>
                 </div>
                 """
 
                 tabela_linhas += f"""
                 <tr>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;"><b>{temp_val}</b></td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{data_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{vend_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{cli_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{mod_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{pm_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{rio_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{cont_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7; font-size: 12px;">{com_val}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{botoes_acoes_html}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;"><b>{temp}</b></td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{dt}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{vend}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{cli}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{mod}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{plano}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{rio}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{contato}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{tel}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7; font-size: 12px;">{com}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{botoes_acoes}</td>
                 </tr>
                 """
 
-            if contador_ativos == 0:
-                tabela_linhas = '<tr><td colspan="10" style="padding: 20px; text-align: center; color: #718096;">Nenhum negócio encontrado para este filtro.</td></tr>'
+            if not tabela_linhas:
+                tabela_linhas = '<tr><td colspan="11" style="padding: 20px; text-align: center; color: #718096;">Nenhum registro encontrado.</td></tr>'
 
             conteudo = f"""
             <div>
-                <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 14px; font-size: 17px;">Negócios em Andamento (Gerência / Consultores)</h2>
-                
+                <!-- KPIs Estilo Painel -->
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 15px;">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #3182ce; cursor:pointer;" onclick="filtrarTemp('todas')">
+                        <div style="font-size:10px; color:#718096; font-weight:700;">TOTAL</div>
+                        <div style="font-size:20px; font-weight:bold; color:#2d3748;">{kpis['total']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #2f855a; cursor:pointer;" onclick="filtrarTemp('fechado')">
+                        <div style="font-size:10px; color:#2f855a; font-weight:700;">FECHADO</div>
+                        <div style="font-size:20px; font-weight:bold; color:#2f855a;">{kpis['fechado']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #e53e3e; cursor:pointer;" onclick="filtrarTemp('sup. quente')">
+                        <div style="font-size:10px; color:#e53e3e; font-weight:700;">SUPER QUENTE</div>
+                        <div style="font-size:20px; font-weight:bold; color:#e53e3e;">{kpis['super quente']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #dd6b20; cursor:pointer;" onclick="filtrarTemp('quente')">
+                        <div style="font-size:10px; color:#dd6b20; font-weight:700;">QUENTE</div>
+                        <div style="font-size:20px; font-weight:bold; color:#dd6b20;">{kpis['quente']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #d69e2e; cursor:pointer;" onclick="filtrarTemp('morno')">
+                        <div style="font-size:10px; color:#d69e2e; font-weight:700;">MORNO</div>
+                        <div style="font-size:20px; font-weight:bold; color:#d69e2e;">{kpis['morno']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #742a2a; cursor:pointer;" onclick="filtrarTemp('perdida')">
+                        <div style="font-size:10px; color:#742a2a; font-weight:700;">PERDIDA</div>
+                        <div style="font-size:20px; font-weight:bold; color:#742a2a;">{kpis['perdida']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #4a5568; cursor:pointer;" onclick="filtrarTemp('frio')">
+                        <div style="font-size:10px; color:#4a5568; font-weight:700;">FRIO</div>
+                        <div style="font-size:20px; font-weight:bold; color:#4a5568;">{kpis['frio']}</div>
+                    </div>
+                </div>
+
                 {f'<div class="sucesso">{sucesso_msg}</div>' if sucesso_msg else ''}
                 {f'<div class="error">{erro_msg}</div>' if erro_msg else ''}
 
-                <div class="produto-detalhe-card" style="margin-bottom: 20px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                        <h3 id="tituloFormCard" style="font-size: 15px; color: #002244; margin: 0;">Registrar Nova Negociação</h3>
-                        <button type="button" id="btnCancelarEdicao" onclick="cancelarEdicao()" style="display: none; background: #cbd5e0; border: none; padding: 4px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 600;">Cancelar Edição</button>
+                <!-- Botão Oculto / Sanfona para Registrar Nova Negociação -->
+                <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 6px; margin-bottom: 15px; overflow: hidden;">
+                    <button type="button" onclick="toggleFormularioNegocio()" style="width: 100%; background: #f7fafc; border: none; padding: 12px 16px; text-align: left; font-weight: 700; color: #002244; cursor: pointer; display: flex; align-items: center; gap: 8px;">
+                        <span id="iconeSanfona">▶</span> <span id="tituloBotaoSanfona">➕ Registrar Nova Negociação</span>
+                    </button>
+                    
+                    <div id="containerFormulario" style="display: none; padding: 16px; border-top: 1px solid #e2e8f0; background: #fff;">
+                        <form method="POST">
+                            <input type="hidden" name="acao_form" value="cadastrar">
+                            <input type="hidden" id="editIndexInput" name="index_edicao" value="">
+
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 10px;">
+                                <div><label>Temperatura</label><select name="temperatura" required>{"".join([f'<option value="{t}">{t}</option>' for t in lista_temperaturas])}</select></div>
+                                <div><label>Data</label><input type="text" name="data" value="{datetime.now().strftime('%d/%m/%Y')}" required></div>
+                                <div><label>Vendedor</label><select name="vendedor" required>{"".join([f'<option value="{c}">{c}</option>' for c in lista_consultores])}</select></div>
+                                <div><label>Cliente</label><input type="text" name="cliente" placeholder="Nome do Cliente" required></div>
+                                <div><label>Modelo</label><select name="modelo"><option value="">Selecione...</option>{"".join([f'<option value="{m}">{m}</option>' for m in lista_modelos])}</select></div>
+                                <div><label>Plano</label><select name="plano_manutencao"><option value="">Nenhum</option>{"".join([f'<option value="{p}">{p}</option>' for p in lista_planos_manutencao])}</select></div>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 10px;">
+                                <div><label>RIO</label><select name="rio"><option value="">Nenhum</option>{"".join([f'<option value="{r}">{r}</option>' for r in lista_tipos_rio])}</select></div>
+                                <div><label>Contato</label><input type="text" name="contato" placeholder="Nome do contato"></div>
+                                <div><label>Telefone</label><input type="text" name="telefone" placeholder="(00) 00000-0000"></div>
+                            </div>
+
+                            <div class="input-group">
+                                <label>Comentários</label>
+                                <textarea name="comentarios" rows="2" placeholder="Detalhes da negociação..."></textarea>
+                            </div>
+
+                            <div style="display: flex; gap: 10px; margin-top: 10px;">
+                                <button type="submit" id="btnSubmitForm" class="btn-login" style="width: auto; padding: 10px 24px;">Salvar Nova Negociação</button>
+                                <button type="button" id="btnCancelarEdicao" onclick="cancelarEdicao()" style="display:none; background:#cbd5e0; border:none; padding:10px 16px; border-radius:6px; cursor:pointer; font-weight:600;">Cancelar Edição</button>
+                            </div>
+                        </form>
                     </div>
-
-                    <form method="POST">
-                        <input type="hidden" name="acao_form" value="cadastrar">
-                        <input type="hidden" id="editIndexInput" name="index_edicao" value="">
-
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Temperatura</label>
-                                <select name="temperatura" required>
-                                    {options_temperaturas}
-                                </select>
-                            </div>
-                            <div>
-                                <label>Data</label>
-                                <input type="text" name="data" value="{datetime.now().strftime('%d/%m/%Y')}" required>
-                            </div>
-                        </div>
-
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Vendedor (Consultor)</label>
-                                <select name="vendedor" required>
-                                    {options_consultores}
-                                </select>
-                            </div>
-                            <div>
-                                <label>Cliente</label>
-                                <input type="text" name="cliente" placeholder="Nome do Cliente / Empresa" required>
-                            </div>
-                        </div>
-
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Modelo (Veículo)</label>
-                                <select name="modelo" required>
-                                    {options_modelos}
-                                </select>
-                            </div>
-                            <div>
-                                <label>Plano de Manutenção</label>
-                                <select name="plano_manutencao">
-                                    <option value="">Nenhum</option>
-                                    {options_planos_manutencao}
-                                </select>
-                            </div>
-                        </div>
-
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px;">
-                            <div>
-                                <label>Telemetria RIO</label>
-                                <select name="rio">
-                                    <option value="">Nenhum</option>
-                                    {options_rio}
-                                </select>
-                            </div>
-                            <div>
-                                <label>Contato do Cliente</label>
-                                <input type="text" name="contato" placeholder="Nome do contato">
-                            </div>
-                        </div>
-
-                        <div class="input-group">
-                            <label>Comentários / Acompanhamento</label>
-                            <textarea name="comentarios" rows="3" placeholder="Descreva o andamento da negociação..."></textarea>
-                        </div>
-
-                        <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap;">
-                            <button type="submit" id="btnSubmitForm" class="btn-login" style="flex: 2; margin: 0;">Salvar Negociação</button>
-                            <select id="filtroMesSelect" onchange="window.location.href='/modulo/negocios?mes=' + this.value" style="flex: 1; padding: 12px; font-size: 14px; border-radius: 6px; border: 1px solid #cbd5e0; background: #fff; font-weight: 600; height: 46px; margin: 0;">
-                                {options_meses}
-                            </select>
-                            <button type="button" onclick="gerarPDFRelatorio()" class="btn-acao btn-pdf" style="flex: 1.5; height: 46px; font-size: 13px; font-weight: 600; margin: 0;">📄 Gerar PDF</button>
-                        </div>
-                    </form>
                 </div>
 
-                <div id="secaoRelatorioPDF" class="produto-detalhe-card">
-                    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #002244; padding-bottom: 10px; margin-bottom: 14px;">
-                        <div>
-                            <h3 style="font-size: 16px; color: #002244; margin: 0 0 4px 0;">{titulo_relatorio_txt}</h3>
-                            <p style="font-size: 12px; color: #4a5568; margin: 0;">Emitido por: <b>{nome_usuario_logado}</b> em {datetime.now().strftime('%d/%m/%Y às %H:%M')}</p>
-                        </div>
-                        <div>
-                            <img src="{url_for('static', filename='logo.png')}" alt="Novo Mundo" style="max-height: 40px; width: auto;">
-                        </div>
+                <!-- Barra de Filtros -->
+                <div class="produto-detalhe-card" style="padding: 12px; margin-bottom: 15px;">
+                    <div style="font-weight:700; color:#002244; margin-bottom:8px; font-size:13px;">Lista de Negócios</div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <input type="text" id="filtroBusca" value="{busca_cliente}" placeholder="🔍 Buscar cliente..." style="flex: 2; min-width: 200px; padding: 10px;" onkeypress="if(event.key === 'Enter') aplicarFiltrosNegocios()">
+                        
+                        <select id="filtroVend" style="flex: 1; min-width: 140px; padding: 10px;" onchange="aplicarFiltrosNegocios()">
+                            {options_filtro_vend}
+                        </select>
+
+                        <select id="filtroAno" style="flex: 0.8; min-width: 90px; padding: 10px;" onchange="aplicarFiltrosNegocios()">
+                            {options_anos}
+                        </select>
+
+                        <select id="filtroPeriodo" style="flex: 1; min-width: 130px; padding: 10px;" onchange="aplicarFiltrosNegocios()">
+                            {options_periodo}
+                        </select>
                     </div>
+                </div>
 
-                    <p class="no-print" style="font-size: 11px; color: #718096; margin-bottom: 12px;">*Nota: Exclui automaticamente os negócios com temperatura "Fechado", respeita o mês filtrado e ordena por data.</p>
-
+                <!-- Tabela de Negócios -->
+                <div class="produto-detalhe-card">
                     <div style="overflow-x: auto;">
-                        <table id="tabelaNegocios" style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;" data-sort-dir="asc">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
                             <thead>
-                                <tr style="background: #002244; color: #ffffff; border-bottom: 2px solid #001529;">
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 0, 'text')">Temp. ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 1, 'data')">Data ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 2, 'text')">Vendedor ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 3, 'text')">Cliente ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 4, 'text')">Modelo ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 5, 'text')">Plano M. ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 6, 'text')">RIO ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 7, 'text')">Contato ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaNegocios', 8, 'text')">Comentários ↕</th>
-                                    <th style="padding: 10px;" class="no-print">Ações</th>
+                                <tr style="background: #002244; color: #ffffff;">
+                                    <th style="padding: 10px;">Temp.</th>
+                                    <th style="padding: 10px;">Data</th>
+                                    <th style="padding: 10px;">Vendedor</th>
+                                    <th style="padding: 10px;">Cliente</th>
+                                    <th style="padding: 10px;">Modelo</th>
+                                    <th style="padding: 10px;">Plano</th>
+                                    <th style="padding: 10px;">RIO</th>
+                                    <th style="padding: 10px;">Contato</th>
+                                    <th style="padding: 10px;">Telefone</th>
+                                    <th style="padding: 10px;">Comentários</th>
+                                    <th style="padding: 10px; text-align: right;">Ações</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -2831,9 +3446,99 @@ def acessar_modulo(nome_modulo):
                     </div>
                 </div>
             </div>
+
+            <script>
+                function toggleFormularioNegocio() {{
+                    var container = document.getElementById('containerFormulario');
+                    var icone = document.getElementById('iconeSanfona');
+                    if (container.style.display === 'none') {{
+                        container.style.display = 'block';
+                        icone.innerHTML = '▼';
+                    }} else {{
+                        container.style.display = 'none';
+                        icone.innerHTML = '▶';
+                    }}
+                }}
+
+                function carregarParaEdicao(idx, temp, dt, vend, cli, mod, plano, rio, contato, tel, com) {{
+                    var container = document.getElementById('containerFormulario');
+                    container.style.display = 'block';
+                    document.getElementById('iconeSanfona').innerHTML = '▼';
+
+                    document.getElementById('editIndexInput').value = idx;
+                    document.getElementById('tituloBotaoSanfona').innerText = "✏️ Alterar Negociação (Linha " + idx + ")";
+                    document.getElementById('btnSubmitForm').innerText = "Atualizar Negociação";
+                    document.getElementById('btnCancelarEdicao').style.display = "inline-block";
+
+                    document.querySelector('[name="temperatura"]').value = temp;
+                    document.querySelector('[name="data"]').value = dt;
+                    document.querySelector('[name="vendedor"]').value = vend;
+                    document.querySelector('[name="cliente"]').value = cli;
+                    document.querySelector('[name="modelo"]').value = mod;
+                    document.querySelector('[name="plano_manutencao"]').value = plano;
+                    document.querySelector('[name="rio"]').value = rio;
+                    document.querySelector('[name="contato"]').value = contato;
+                    document.querySelector('[name="telefone"]').value = tel;
+                    document.querySelector('[name="comentarios"]').value = com;
+
+                    window.scrollTo({{ top: 0, behavior: 'smooth' }});
+                }}
+
+                function cancelarEdicao() {{
+                    document.getElementById('editIndexInput').value = "";
+                    document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
+                    document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
+                    document.getElementById('btnCancelarEdicao').style.display = "none";
+                    document.getElementById('containerFormulario').style.display = 'none';
+                    document.getElementById('iconeSanfona').innerHTML = '▶';
+                }}
+
+                function aplicarFiltrosNegocios() {{
+                    var busca = document.getElementById('filtroBusca').value;
+                    var vend = document.getElementById('filtroVend').value;
+                    var ano = document.getElementById('filtroAno').value;
+                    var periodo = document.getElementById('filtroPeriodo').value;
+                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
+                }}
+
+                function filtrarTemp(temp) {{
+                    var busca = document.getElementById('filtroBusca').value;
+                    var vend = document.getElementById('filtroVend').value;
+                    var ano = document.getElementById('filtroAno').value;
+                    var periodo = document.getElementById('filtroPeriodo').value;
+                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
+                }}
+
+                function excluirNegocio(idx) {{
+                    if (confirm("Deseja realmente excluir este negócio?")) {{
+                        var form = document.createElement('form');
+                        form.method = 'POST';
+                        form.action = '/modulo/negocios';
+                        
+                        var inputAcao = document.createElement('input');
+                        inputAcao.type = 'hidden';
+                        inputAcao.name = 'acao_form';
+                        inputAcao.value = 'excluir';
+                        form.appendChild(inputAcao);
+
+                        var inputIdx = document.createElement('input');
+                        inputIdx.type = 'hidden';
+                        inputIdx.name = 'index_linha';
+                        inputIdx.value = idx;
+                        form.appendChild(inputIdx);
+
+                        document.body.appendChild(form);
+                        form.submit();
+                    }}
+                }}
+
+                function sincronizarParaVendas(idx, cliente, produto, data, modelo, vendedor) {{
+                    // Opcional para negócios fechados
+                }}
+            </script>
             """
         except Exception as e:
-            conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar Negócios:</b> {e}</div>'
+            conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px;"><b>Erro ao carregar Negócios:</b> {e}</div>'
 
     elif nome_modulo == "rio":
         produto_selecionado = request.args.get("produto")
@@ -3582,46 +4287,6 @@ def acessar_modulo(nome_modulo):
                     """
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar os dados da aba Modelos:</b> {e}</div>'
-            
-    elif nome_modulo == "simulador":
-        conteudo = f"""
-        <div style="display: flex; flex-direction: column; height: 85vh; width: 100%;">
-            <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Simulador Financeiro TRATON</h2>
-            
-            <iframe src="https://tratonfs.github.io/finance-simulator/" style="flex-grow: 1; width: 100%; border: 1px solid #cbd5e0; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05);" allowfullscreen></iframe>
-        </div>
-        """
-
-    elif nome_modulo == "linksuteis":
-        conteudo = f"""
-        <div>
-            <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 12px; font-size: 17px;">Links e Contatos Úteis</h2>
-            
-            <div class="produto-detalhe-card" style="margin-bottom: 15px;">
-                <h3 style="font-size: 15px; color: #002244; margin-bottom: 10px;">🏦 Contatos de Bancos e Financeiras</h3>
-                
-                <div class="detalhe-linha">
-                    <div class="detalhe-label">Banco Volkswagen</div>
-                    <div class="detalhe-valor" style="font-weight: 600;">0800 770 1936</div>
-                    <div class="detalhe-valor" style="font-size: 12px; color: #4a5568;">Suporte a Financiamentos, Leasing e CDC</div>
-                </div>
-
-                <div class="detalhe-linha" style="border-bottom: none; margin-bottom: 0; padding-bottom: 0;">
-                    <div class="detalhe-label">Consórcio VW (Exemplo)</div>
-                    <div class="detalhe-valor" style="font-weight: 600;">0800 019 5775</div>
-                    <div class="detalhe-valor" style="font-size: 12px; color: #4a5568;">Atendimento a cotas, lances e contemplações</div>
-                </div>
-            </div>
-
-            <div class="produto-detalhe-card">
-                <h3 style="font-size: 15px; color: #002244; margin-bottom: 10px;">🔗 Sistemas e Portais</h3>
-                <div class="acoes-ficha-tecnica">
-                    <a href="https://veiculos.fipe.org.br/" target="_blank" class="btn-acao-ficha btn-abrir-pdf">Consultar Tabela FIPE</a>
-                    <a href="#" target="_blank" class="btn-acao-ficha btn-wpp-pdf">Portal da Montadora</a>
-                </div>
-            </div>
-        </div>
-        """
 
     else:
         conteudo = f"""
@@ -3672,20 +4337,17 @@ def chat_ia():
     try:
         agora = time.time()
         
-        # Cache inteligente de 30 minutos
         if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > 1800):
             print("🔄 IA: Atualizando cache otimizado...")
             planilha = conectar_google_sheets()
             contexto_abas = []
             
-            # Incluímos Informes e Argumentos para a IA saber responder sobre circulares e dúvidas
             abas_essenciais = ["PM", "RIO", "PM_Precos", "Informes", "Argumentos","Modelos"]
             
             for nome_aba in abas_essenciais:
                 try:
                     aba = planilha.worksheet(nome_aba)
                     registros = obter_registros_seguros(aba)
-                    # Limitamos a 15 registros por aba para manter o chat extremamente rápido
                     linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros[:15]]
                     contexto_abas.append(f"### {nome_aba}\n" + "\n".join(linhas_texto))
                 except Exception:
@@ -3707,7 +4369,6 @@ def chat_ia():
         prompt_completo = f"{CACHE_IA['contexto_sistema']}\n\nPergunta do Usuário: {pergunta_usuario}\nResposta:"
         
         resposta_ia = None
-        # Tentativa com os modelos 3.5 / 3.6 atualizados
         modelos_para_tentar = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"]
         
         ultimo_erro = None

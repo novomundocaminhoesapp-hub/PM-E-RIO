@@ -4045,7 +4045,7 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
-            dados_argumentos = obter_registros_com_cache(planilha, "PM") # (ou "Argumentos", conforme a aba)
+            dados_argumentos = obter_registros_com_cache(planilha, "Argumentos")
 
             pilulas_argumentos = []
             for item in dados_argumentos:

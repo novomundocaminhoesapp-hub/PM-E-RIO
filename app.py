@@ -1243,7 +1243,7 @@ TEMPLATE_HTML = r"""
                 <li class="drawer-item {% if modulo_ativo == 'traton' %}active{% endif %}">
                     <a href="/modulo/traton" onclick="closeDrawer()">
                         <span class="drawer-icon" style="display:flex; align-items:center; justify-content:center;">
-                            <img src="{{ url_for('static', filename='traton.png') }}" style="max-width:20px; max-height:20px;" alt="Traton">
+                            <img src="{{ url_for('static', filename='traton.png') }}" alt="Traton" style="width: 20px; height: 20px; object-fit: contain;">
                         </span>
                         Simulador Traton
                     </a>

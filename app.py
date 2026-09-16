@@ -1218,11 +1218,8 @@ TEMPLATE_HTML = r"""
 
                 {% if session.get('perm_traton') %}
                 <li class="drawer-item {% if modulo_ativo == 'traton' %}active{% endif %}">
-                    <a href="/modulo/traton" onclick="closeDrawer()">
-                        <span class="drawer-icon" style="display:flex; align-items:center; justify-content:center;">
-                            <img src="{{ url_for('static', filename='traton.png') }}" alt="Traton" style="width: 22px; height: 22px; object-fit: contain;">
-                        </span>
-                        Simulador Traton
+                    <a href="/modulo/traton" onclick="closeDrawer()" style="display: flex; justify-content: center; align-items: center; padding: 12px 10px;">
+                        <img src="{{ url_for('static', filename='traton.png') }}" alt="Traton" style="max-height: 24px; width: auto; object-fit: contain;">
                     </a>
                 </li>
                 {% endif %}
@@ -1237,16 +1234,8 @@ TEMPLATE_HTML = r"""
                 </li>
             </ul>
         </aside>
-
+      
         
-        {% if session.get('perm_traton') %}
-                <li class="drawer-item {% if modulo_ativo == 'traton' %}active{% endif %}">
-                    <a href="/modulo/traton" onclick="closeDrawer()" style="display: flex; justify-content: center; align-items: center; padding: 12px 10px;">
-                        <img src="{{ url_for('static', filename='traton.png') }}" alt="Simulador Traton" style="max-height: 28px; width: auto; object-fit: contain;">
-                    </a>
-                </li>
-                {% endif %}
-
         <main class="main-content">
             {% if conteudo_modulo %}
                 {{ conteudo_modulo | safe }}

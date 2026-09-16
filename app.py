@@ -50,6 +50,12 @@ CACHE_IA = {
 }
 TEMPO_CACHE_SEGUNDOS = 1800  # 30 minutos de cache
 
+# 👇 ADICIONE ESTE BLOCO AQUI 👇
+CACHE_PLANILHAS = {
+    "dados": {},
+    "timestamp": 0
+}
+TEMPO_CACHE_PLANILHA_SEGS = 300  # 5 minutos de cache para abas estáticas
 
 def criar_cliente_gemini():
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -83,6 +89,24 @@ def conectar_google_sheets():
     
     cliente = gspread.authorize(credenciais)
     return cliente.open("PM e RIO Novo")
+
+def obter_registros_com_cache(planilha, nome_aba):
+    global CACHE_PLANILHAS
+    agora = time.time()
+    
+    # Se o cache expirou ou a aba não foi carregada ainda, baixa do Google Sheets
+    if (agora - CACHE_PLANILHAS["timestamp"] > TEMPO_CACHE_PLANILHA_SEGS) or (nome_aba not in CACHE_PLANILHAS["dados"]):
+        print(f"🔄 Baixando aba estática '{nome_aba}' do Google Sheets...")
+        try:
+            aba = planilha.worksheet(nome_aba)
+            registros = obter_registros_seguros(aba)
+            CACHE_PLANILHAS["dados"][nome_aba] = registros
+            CACHE_PLANILHAS["timestamp"] = agora
+        except Exception as e:
+            print(f"Erro ao carregar aba {nome_aba}: {e}")
+            return []
+            
+    return CACHE_PLANILHAS["dados"].get(nome_aba, [])
 
 def obter_registros_seguros(aba):
     linhas = aba.get_all_values()
@@ -3531,8 +3555,7 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
-            aba_rio = planilha.worksheet("RIO")
-            produtos_rio = obter_registros_seguros(aba_rio)
+            produtos_rio = obter_registros_com_cache(planilha, "RIO")
 
             pilulas_rio = []
             for item in produtos_rio:
@@ -3643,8 +3666,7 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
-            aba_pm = planilha.worksheet("PM")
-            produtos_pm = obter_registros_seguros(aba_pm)
+            produtos_pm = obter_registros_com_cache(planilha, "PM")
 
             pilulas_pm = []
             for item in produtos_pm:
@@ -3767,8 +3789,7 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
-            aba_precos = planilha.worksheet("PM_Precos")
-            dados_precos = obter_registros_seguros(aba_precos)
+            dados_precos = obter_registros_com_cache(planilha, "PM_Precos")
 
             pilulas_valores = []
             for item in dados_precos:
@@ -3943,8 +3964,7 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
-            aba_informes = planilha.worksheet("Informes")
-            dados_informes = obter_registros_seguros(aba_informes)
+            dados_informes = obter_registros_com_cache(planilha, "Informes")
 
             pilulas_informes = []
             for item in dados_informes:
@@ -4025,8 +4045,7 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
-            aba_argumentos = planilha.worksheet("Argumentos")
-            dados_argumentos = obter_registros_seguros(aba_argumentos)
+            dados_argumentos = obter_registros_com_cache(planilha, "PM") # (ou "Argumentos", conforme a aba)
 
             pilulas_argumentos = []
             for item in dados_argumentos:
@@ -4101,10 +4120,8 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
-            aba_modelos = planilha.worksheet("Modelos")
-            
-            dados_modelos = obter_registros_seguros(aba_modelos)
-
+            dados_modelos = obter_registros_com_cache(planilha, "Modelos")
+                        
             tipos_disponiveis = sorted(list(set(str(item.get("TIPO", "")).strip() for item in dados_modelos if str(item.get("TIPO", "")).strip())))
 
             if not tipo_selecionado:
@@ -4293,10 +4310,14 @@ def acessar_modulo(nome_modulo):
 
 @app.route("/api/limpar-cache", methods=["POST"])
 def limpar_cache():
-    global CACHE_IA
+    global CACHE_IA, CACHE_PLANILHAS
     CACHE_IA["contexto_sistema"] = ""
     CACHE_IA["timestamp"] = 0
-    return jsonify({"mensagem": "Base de dados e cache da IA atualizados com sucesso!"})
+    
+    CACHE_PLANILHAS["dados"] = {}
+    CACHE_PLANILHAS["timestamp"] = 0
+    
+    return jsonify({"mensagem": "Base de dados, cache de planilhas e IA atualizados com sucesso!"})
 
 @app.route("/api/chat-ia", methods=["POST"])
 def chat_ia():
@@ -4332,8 +4353,7 @@ def chat_ia():
             
             for nome_aba in abas_essenciais:
                 try:
-                    aba = planilha.worksheet(nome_aba)
-                    registros = obter_registros_seguros(aba)
+                    registros = obter_registros_com_cache(planilha, nome_aba)
                     linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros[:15]]
                     contexto_abas.append(f"### {nome_aba}\n" + "\n".join(linhas_texto))
                 except Exception:

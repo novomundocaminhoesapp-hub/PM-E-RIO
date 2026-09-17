@@ -6,6 +6,7 @@ import urllib.parse
 import traceback
 import json
 import unicodedata
+import html
 from google import genai
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
@@ -14,7 +15,7 @@ from googleapiclient.discovery import build
 import gspread
 
 app = Flask(__name__)
-app.secret_key = "chave_secreta_pm_rio"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "troque-esta-chave-em-producao")
 
 MESES_PT = {
     1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
@@ -32,10 +33,12 @@ NOMES_MODULOS = {
     "negocios": "Negócios em Andamento",
     "visitas": "Visitas e Acompanhamento",
     "vendas": "Vendas Fechadas",
+    "dashboard": "Dashboard Executivo",
     "locacao_vendas": "Locação - Vendas",
     "locacao_negocios": "Locação - Negócios",
     "consorcio_vendas": "Consórcio - Vendas",
     "consorcio_negocios": "Consórcio - Negócios",
+    "camp_vw_prev": "Campanhas",
     "traton": "Simulador Traton"
 }
 
@@ -44,23 +47,74 @@ escopos = [
     "https://www.googleapis.com/auth/drive"
 ]
 
+def conectar_google_sheets():
+    """
+    Conecta à planilha "PM e RIO Novo".
+
+    Em produção (Render), usa GOOGLE_CREDENTIALS quando configurada.
+    Localmente, mantém o funcionamento usando credenciais.json.
+    """
+    if "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
+        credenciais_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+        credenciais = Credentials.from_service_account_info(
+            credenciais_dict,
+            scopes=escopos
+        )
+    else:
+        credenciais = Credentials.from_service_account_file(
+            "credenciais.json",
+            scopes=escopos
+        )
+
+    cliente = gspread.authorize(credenciais)
+    return cliente.open("PM e RIO Novo")
+
 CACHE_IA = {
     "contexto_sistema": "",
     "timestamp": 0
 }
-TEMPO_CACHE_SEGUNDOS = 1800  # 30 minutos de cache
+TEMPO_CACHE_SEGUNDOS = 600  # 10 minutos de cache da IA
 
 # 👇 ADICIONE ESTE BLOCO AQUI 👇
 CACHE_PLANILHAS = {
     "dados": {},
-    "timestamp": 0
+    "timestamps": {}
 }
-TEMPO_CACHE_PLANILHA_SEGS = 300  # 5 minutos de cache para abas estáticas
+TEMPO_CACHE_PLANILHA_SEGS = 300  # 5 minutos por aba
+CACHE_PLANILHA_CLIENTE = {"cliente": None, "timestamp": 0}
+TEMPO_CACHE_CLIENTE_SEGS = 300
+CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
+TEMPO_CACHE_DRIVE_SEGS = 600
 
 def criar_cliente_gemini():
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = (
+        os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+    )
     if not api_key:
-        api_key = ""
+        for caminho_env in (
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+            os.path.join(os.getcwd(), ".env"),
+        ):
+            try:
+                if not os.path.exists(caminho_env):
+                    continue
+                with open(caminho_env, "r", encoding="utf-8") as f:
+                    for linha in f:
+                        linha = linha.strip()
+                        if "=" not in linha or linha.startswith("#"):
+                            continue
+                        chave, valor = linha.split("=", 1)
+                        valor = valor.strip().strip('"').strip("'")
+                        if chave.strip() in ("GEMINI_API_KEY", "GOOGLE_API_KEY") and valor:
+                            api_key = valor
+                            break
+                if api_key:
+                    break
+            except Exception:
+                pass
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY não configurada no ambiente ou .env.")
     return genai.Client(api_key=api_key)
 
 
@@ -80,34 +134,64 @@ def validar_cpf(cpf_input):
             
     return True
 
-def conectar_google_sheets():
-    if 'GOOGLE_CREDENTIALS' in os.environ:
-        credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
-        credenciais = Credentials.from_service_account_info(credenciais_dict, scopes=escopos)
-    else:
-        credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
-    
-    cliente = gspread.authorize(credenciais)
-    return cliente.open("PM e RIO Novo")
+CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
+TEMPO_CACHE_LOGIN_SEGS = 300
 
-def obter_registros_com_cache(planilha, nome_aba):
+def carregar_dados_login():
+    """
+    Pré-carrega as abas usadas pelo Dashboard/IA em uma única conexão.
+    Depois do primeiro carregamento, as requisições reutilizam o cache.
+    """
+    global CACHE_LOGIN_DADOS
+    agora = time.time()
+    usuario = str(session.get("usuario", "") or session.get("email", "") or "")
+
+    if (
+        CACHE_LOGIN_DADOS["dados"]
+        and CACHE_LOGIN_DADOS["usuario"] == usuario
+        and agora - CACHE_LOGIN_DADOS["timestamp"] < TEMPO_CACHE_LOGIN_SEGS
+    ):
+        return CACHE_LOGIN_DADOS["dados"]
+
+    planilha = conectar_google_sheets()
+    abas = ["PM", "RIO", "PM_Precos", "Informes", "Argumentos", "Modelos",
+            "Negocios_PM", "Vendas_PM", "Vendas_LOC", "Negocio_LOC",
+            "Vendas_Consorcio", "Negocios_Consorcio"]
+
+    dados = {}
+    for nome_aba in abas:
+        try:
+            dados[nome_aba] = obter_registros_com_cache(planilha, nome_aba, ttl=TEMPO_CACHE_LOGIN_SEGS)
+        except Exception as e:
+            print(f"⚠️ Pré-carga da aba {nome_aba}: {e}")
+            dados[nome_aba] = []
+
+    CACHE_LOGIN_DADOS = {
+        "dados": dados,
+        "timestamp": agora,
+        "usuario": usuario,
+    }
+    return dados
+
+
+def obter_registros_com_cache(planilha, nome_aba, ttl=None):
+    """Lê uma aba com cache independente por aba."""
     global CACHE_PLANILHAS
     agora = time.time()
-    
-    # Se o cache expirou ou a aba não foi carregada ainda, baixa do Google Sheets
-    if (agora - CACHE_PLANILHAS["timestamp"] > TEMPO_CACHE_PLANILHA_SEGS) or (nome_aba not in CACHE_PLANILHAS["dados"]):
-        print(f"🔄 Baixando aba estática '{nome_aba}' do Google Sheets...")
+    ttl = TEMPO_CACHE_PLANILHA_SEGS if ttl is None else ttl
+    timestamp = CACHE_PLANILHAS["timestamps"].get(nome_aba, 0)
+
+    if (nome_aba not in CACHE_PLANILHAS["dados"]) or (agora - timestamp > ttl):
+        print(f"🔄 Baixando aba '{nome_aba}' do Google Sheets...")
         try:
             aba = planilha.worksheet(nome_aba)
             registros = obter_registros_seguros(aba)
             CACHE_PLANILHAS["dados"][nome_aba] = registros
-            CACHE_PLANILHAS["timestamp"] = agora
+            CACHE_PLANILHAS["timestamps"][nome_aba] = agora
         except Exception as e:
             print(f"Erro ao carregar aba {nome_aba}: {e}")
             return []
-            
     return CACHE_PLANILHAS["dados"].get(nome_aba, [])
-
 def obter_registros_seguros(aba):
     linhas = aba.get_all_values()
     if not linhas or len(linhas) <= 1:
@@ -142,6 +226,10 @@ def obter_conteudo_pastas_drive():
     O segundo item é usado pelos módulos que precisam transformar o nome
     de uma Circular/Ficha Técnica em um link do Google Drive.
     """
+    agora = time.time()
+    if CACHE_DRIVE["timestamp"] and agora - CACHE_DRIVE["timestamp"] < TEMPO_CACHE_DRIVE_SEGS:
+        return CACHE_DRIVE["conteudo"], CACHE_DRIVE["mapa"]
+
     mapa_drive = {}
     conteudo_pastas = {}
 
@@ -209,6 +297,9 @@ def obter_conteudo_pastas_drive():
             if not page_token:
                 break
 
+        CACHE_DRIVE["conteudo"] = conteudo_pastas
+        CACHE_DRIVE["mapa"] = mapa_drive
+        CACHE_DRIVE["timestamp"] = agora
         return conteudo_pastas, mapa_drive
 
     except Exception as e:
@@ -250,7 +341,7 @@ def importar_relatorios_drive_vendas():
 
         folder_id = folders[0]['id']
 
-        # Busca apenas arquivos que NÃO contêm '[IMPORTADO]' no nome para garantir máxima velocidade
+        # Busca apenas arquivos que NÃO contêm '[IMPORTADO]' no nome.
         query_files = f"'{folder_id}' in parents and not name contains '[IMPORTADO]' and trashed = false"
         files_res = service.files().list(q=query_files, fields="files(id, name, mimeType)").execute()
         files = files_res.get('files', [])
@@ -258,13 +349,28 @@ def importar_relatorios_drive_vendas():
         if not files:
             return "Nenhum arquivo novo para importar."
 
+        # ============================================================
+        # ABA NEGOCIOS_PM
+        # ============================================================
         try:
             aba_negocios = planilha.worksheet("Negocios_PM")
         except gspread.exceptions.WorksheetNotFound:
-            aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=10)
-            aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "PLANO DE MANUTENÇÃO"])
+            aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=11)
+            aba_negocios.append_row([
+                "TEMPERATURA",
+                "DATA",
+                "VENDEDOR",
+                "CLIENTE",
+                "MODELO",
+                "CHASSIS",
+                "PLANO DE MANUTENÇÃO",
+                "RIO",
+                "CONTATO DO CLIENTE",
+                "TELEFONE",
+                "COMENTÁRIOS"
+            ])
 
-        # Carrega registros existentes para evitar duplicatas por chave única
+        # Carrega registros existentes para evitar duplicatas por chave única.
         registros_existentes = aba_negocios.get_all_values()
         chaves_cadastradas = set()
         for r in registros_existentes[1:]:
@@ -272,7 +378,9 @@ def importar_relatorios_drive_vendas():
                 chave = f"{str(r[1]).strip()}_{str(r[2]).strip()}_{str(r[3]).strip()}_{str(r[4]).strip()}".upper()
                 chaves_cadastradas.add(chave)
 
-        # Carrega mapa de Vendedores da aba 'Usuarios'
+        # ============================================================
+        # MAPA DE VENDEDORES
+        # ============================================================
         try:
             aba_usuarios = planilha.worksheet("Usuarios")
             regs_u = obter_registros_seguros(aba_usuarios)
@@ -291,27 +399,24 @@ def importar_relatorios_drive_vendas():
             if not nome_bruto:
                 return None
             n_limpo = str(nome_bruto).strip().upper()
-            
-            # 1. Tenta correspondência exata
+
             if n_limpo in mapa_usuarios:
                 return mapa_usuarios[n_limpo]
-            
-            # 2. Tenta correspondência parcial e inteligente
+
             for chave, real in mapa_usuarios.items():
-                # Bate se for uma parte exata da string (ex: "JOAO" em "JOAO SILVA")
                 if chave in n_limpo or n_limpo in chave:
                     return real
-                    
-                # 3. Resolve o problema do nome resumido vs completo!
-                # Se a chave for "ANDRE SANTANA", verifica se "ANDRE" e "SANTANA" existem no nome do Excel
+
                 partes_chave = chave.split()
                 if len(partes_chave) > 1:
                     if all(parte in n_limpo for parte in partes_chave):
                         return real
-                        
+
             return None
-        
-        # Carrega mapa de Modelos da aba 'Modelos' (abrangendo todos os caminhões e ônibus cadastrados)
+
+        # ============================================================
+        # MAPA DE MODELOS
+        # ============================================================
         try:
             aba_modelos = planilha.worksheet("Modelos")
             regs_m = obter_registros_seguros(aba_modelos)
@@ -326,57 +431,59 @@ def importar_relatorios_drive_vendas():
         def identificar_modelo(modelo_bruto):
             if not modelo_bruto or str(modelo_bruto).lower() == 'nan':
                 return ""
-            
+
             m_bruto_str = str(modelo_bruto).upper()
-            
-            # 1. Tenta correspondência exata limpa primeiro
+
             m_limpo = m_bruto_str.replace(".", "").replace("-", "").replace(" ", "").replace("/", "")
             for chave, real in mapa_modelos.items():
                 chave_limpa = chave.upper().replace(".", "").replace("-", "").replace(" ", "").replace("/", "")
                 if m_limpo == chave_limpa or m_limpo in chave_limpa or chave_limpa in m_limpo:
                     return real
 
-            # 2. DETETIVE DE NÚMEROS: Extrai qualquer bloco numérico relevante (ex: 9170, 9180, 27320, 31320)
             import re
-            # Procura por padrões de números com ponto ou traço (ex: 9.170, 11.180, 27.320)
             padrao_num = re.search(r'\d{1,2}\.\d{3}|\d{5}', m_bruto_str)
             if padrao_num:
-                num_encontrado = padrao_num.group(0).replace(".", "") # Ex: "9170" ou "11180"
+                num_encontrado = padrao_num.group(0).replace(".", "")
                 for chave, real in mapa_modelos.items():
                     c_limpa = chave.upper().replace(".", "").replace("-", "").replace(" ", "")
                     if num_encontrado in c_limpa:
                         return real
 
-            # 3. Procura por qualquer número de 4 ou 5 dígitos isolado no texto (ex: 9170, 26260)
             tokens = re.findall(r'\d{4,5}', m_bruto_str)
             for token in tokens:
                 for chave, real in mapa_modelos.items():
                     if token in chave.replace(".", ""):
                         return real
 
-            # 4. Fallback: Se não achar pelo número, tenta varrer palavras-chave textuais (ex: Express, e-Delivery)
             for chave, real in mapa_modelos.items():
                 palavras_chave = [p for p in chave.upper().split() if len(p) > 2]
                 if palavras_chave and all(p in m_bruto_str for p in palavras_chave):
                     return real
 
-            # 5. Se absolutamente tudo falhar, retorna o limpo ou original
             return str(modelo_bruto).strip()
-                    
+
         import io
         import pandas as pd
 
         importados_count = 0
         novas_linhas_lote = []
 
+        # ============================================================
+        # PROCESSA OS RELATÓRIOS DO DRIVE
+        # ============================================================
         for f in files:
             file_name = f['name']
             file_id = f['id']
-            
-            request_file = service.files().get_media(fileId=file_id)
-            fh = io.BytesIO(request_file.execute())
-            
+
             try:
+                request_file = service.files().get_media(fileId=file_id)
+                fh = io.BytesIO(request_file.execute())
+            except Exception as ex_download:
+                print(f"Erro ao baixar arquivo {file_name}: {ex_download}")
+                continue
+
+            try:
+                fh.seek(0)
                 df_rel = pd.read_excel(fh, engine='xlrd')
             except Exception:
                 try:
@@ -385,7 +492,7 @@ def importar_relatorios_drive_vendas():
                 except Exception as ex_excel:
                     print(f"Erro ao ler arquivo excel {file_name}: {ex_excel}")
                     continue
-            
+
             if df_rel is not None and not df_rel.empty:
                 df_rel.columns = [str(c).strip().upper() for c in df_rel.columns]
 
@@ -393,55 +500,83 @@ def importar_relatorios_drive_vendas():
                     cliente = str(row.get('CLIENTE', '')).strip()
                     if not cliente or cliente.lower() == 'nan':
                         continue
-                    
+
                     vendedor_bruto = row.get('VENDEDOR', '')
                     vendedor_encontrado = identificar_vendedor(vendedor_bruto)
-                    
+
                     if not vendedor_encontrado:
                         continue
-                    
+
                     modelo_bruto = row.get('MODELO', '')
                     modelo_encontrado = identificar_modelo(modelo_bruto)
-                    
+
+                    # CHASSIS é o nome principal. CHASSI também é aceito
+                    # para não perder o valor caso o relatório use esse cabeçalho.
+                    chassis_bruto = row.get('CHASSIS', '')
+                    if not chassis_bruto or str(chassis_bruto).strip().lower() == 'nan':
+                        chassis_bruto = row.get('CHASSI', '')
+
+                    if not chassis_bruto or str(chassis_bruto).strip().lower() == 'nan':
+                        chassis_bruto = ""
+                    else:
+                        chassis_bruto = str(chassis_bruto).strip()
+
                     raw_data = row.get('DATA', datetime.now().strftime('%d/%m/%Y'))
-                    
+
                     if hasattr(raw_data, 'strftime'):
                         data_venda = raw_data.strftime('%d/%m/%Y')
                     else:
                         d_str = str(raw_data).split()[0]
                         try:
-                            # Se o excel mandar 2026-08-10, converte para 10/08/2026
                             from datetime import datetime as dt
                             d_obj = dt.strptime(d_str, '%Y-%m-%d')
                             data_venda = d_obj.strftime('%d/%m/%Y')
-                        except:
+                        except Exception:
                             data_venda = datetime.now().strftime('%d/%m/%Y')
 
-                    # (A chave_unica vem logo abaixo dessa linha no seu código)
-
+                    # Chave única continua baseada nos campos originais,
+                    # sem alterar a regra de duplicidade existente.
                     chave_unica = f"{data_venda}_{vendedor_encontrado}_{cliente}_{modelo_encontrado}".upper()
 
                     if chave_unica in chaves_cadastradas:
                         continue
 
                     chaves_cadastradas.add(chave_unica)
+
+                    # Mantém TEMPERATURA = Frio e acrescenta CHASSIS
+                    # na posição correta da aba Negocios_PM.
                     novas_linhas_lote.append([
-                        "Frio", data_venda, vendedor_encontrado, cliente, modelo_encontrado, "", "", "", "", ""
+                        "Frio",
+                        data_venda,
+                        vendedor_encontrado,
+                        cliente,
+                        modelo_encontrado,
+                        chassis_bruto,
+                        "",
+                        "",
+                        "",
+                        "",
+                        ""
                     ])
+
                     importados_count += 1
 
-            # Renomeia imediatamente o arquivo no Drive para '[IMPORTADO] ...' para nunca mais ser lido
+            # Renomeia imediatamente o arquivo no Drive para '[IMPORTADO]'
+            # para manter o comportamento original do sistema.
             try:
                 novo_nome = f"[IMPORTADO] {file_name}"
                 service.files().update(fileId=file_id, body={'name': novo_nome}).execute()
             except Exception as ex_ren:
                 print(f"Erro ao renomear arquivo no Drive: {ex_ren}")
 
+        # ============================================================
+        # GRAVA OS REGISTROS NO GOOGLE SHEETS
+        # ============================================================
         if novas_linhas_lote:
             aba_negocios.append_rows(novas_linhas_lote)
 
         return f"Sincronização concluída! {importados_count} novos registros importados."
-    
+
     except Exception as e:
         import traceback
         print(f"Erro ao sincronizar relatórios do Drive: {e}")
@@ -487,6 +622,146 @@ def converter_para_embed(url):
             return f"{url}/preview" if not url.endswith("/") else f"{url}preview"
 
     return url
+
+
+def converter_numero(valor):
+    """Converte números em formatos BR/US sem quebrar valores já numéricos."""
+    if valor is None:
+        return None
+    s = str(valor).strip()
+    if not s or s.lower() in {"nan", "none", "-"}:
+        return None
+    try:
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        elif "," in s:
+            s = s.replace(",", ".")
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def obter_top3_planos_melhor_preco(registros):
+    """Seleciona 3 modelos distintos de PREV, MAX e PLUS.
+
+    A leitura das colunas é feita de forma tolerante porque o Google Sheets
+    pode devolver cabeçalhos repetidos com sufixos diferentes (.1, .2, _1,
+    _2 etc.). Assim, o dashboard não fica limitado ao PREV quando os nomes
+    das colunas de MAX/PLUS variam.
+    """
+    import re
+
+    def normalizar_chave(chave):
+        return re.sub(r"[^A-Z0-9]", "", str(chave).upper())
+
+    def encontrar_coluna(chaves, base, indice):
+        # 1) Preferência pelos nomes já utilizados no sistema.
+        candidatos_exatos = {
+            "PREV": ["VALOR MENSAL", "VALOR MENSAL.0", "VALOR MENSAL_0"],
+            "MAX": ["VALOR MENSAL.1", "VALOR MENSAL_1"],
+            "PLUS": ["VALOR MENSAL.2", "VALOR MENSAL_2"],
+        }
+        for nome in candidatos_exatos.get(base, []):
+            if nome in chaves:
+                return nome
+
+        # 2) Procura por VALOR MENSAL + índice, aceitando .1, _1, espaço 1 etc.
+        alvo = normalizar_chave("VALORMENSAL")
+        encontrados = []
+        for k in chaves:
+            nk = normalizar_chave(k)
+            if nk == alvo and indice == 0:
+                encontrados.append(k)
+            elif nk.startswith(alvo):
+                sufixo = nk[len(alvo):]
+                if sufixo.isdigit() and int(sufixo) == indice:
+                    encontrados.append(k)
+        if encontrados:
+            return encontrados[0]
+        return None
+
+    def encontrar_coluna_relacionada(chaves, palavras, indice, fallback_base):
+        # Primeiro tenta os nomes tradicionais do arquivo.
+        for k in chaves:
+            nk = normalizar_chave(k)
+            if fallback_base and nk == normalizar_chave(fallback_base):
+                return k
+
+        # Depois aceita variações com o mesmo índice.
+        for k in chaves:
+            nk = normalizar_chave(k)
+            if not any(normalizar_chave(palavra) in nk for palavra in palavras):
+                continue
+            # Remove o nome-base e identifica o índice final.
+            numeros = re.findall(r"\d+$", nk)
+            idx = int(numeros[-1]) if numeros else 0
+            if idx == indice:
+                return k
+        return None
+
+    candidatos = {"PREV": [], "MAX": [], "PLUS": []}
+    configuracoes = (("PREV", 0), ("MAX", 1), ("PLUS", 2))
+
+    for r in registros:
+        chaves = list(r.keys())
+        modelo = str(r.get("MODELO", "") or r.get("PRODUTO", "")).strip()
+        if not modelo:
+            continue
+
+        km = str(r.get("KM", "")).strip()
+        periodo = str(r.get("PERIODO", "")).strip() or "12"
+
+        for tipo, indice in configuracoes:
+            col_valor = encontrar_coluna(chaves, tipo, indice)
+            if not col_valor:
+                continue
+
+            valor = converter_numero(r.get(col_valor))
+            if valor is None or valor <= 0:
+                continue
+
+            # KM e contrato acompanham a mesma posição do plano.
+            if tipo == "PREV":
+                col_km = encontrar_coluna_relacionada(chaves, ["PREV_VALOR KM", "VALOR KM"], 0, "PREV_VALOR KM")
+                col_total = encontrar_coluna_relacionada(chaves, ["TOTAL CONTRATO"], 0, "TOTAL CONTRATO")
+            elif tipo == "MAX":
+                col_km = encontrar_coluna_relacionada(chaves, ["MAX_VALOR KM", "VALOR KM"], 1, "MAX_VALOR KM")
+                col_total = encontrar_coluna_relacionada(chaves, ["TOTAL CONTRATO"], 1, "TOTAL CONTRATO.1")
+            else:
+                col_km = encontrar_coluna_relacionada(chaves, ["PLUS_VALOR KM", "VALOR KM"], 2, "PLUS_VALOR KM")
+                col_total = encontrar_coluna_relacionada(chaves, ["TOTAL CONTRATO"], 2, "TOTAL CONTRATO.2")
+
+            candidatos[tipo].append({
+                "tipo": tipo,
+                "plano": f"Plano {tipo}",
+                "modelo": modelo,
+                "valor": round(valor, 2),
+                "valor_km": converter_numero(r.get(col_km)) if col_km else None,
+                "total_contrato": converter_numero(r.get(col_total)) if col_total else None,
+                "periodo": periodo,
+                "km": km,
+            })
+
+    resultado = []
+    for tipo in ("PREV", "MAX", "PLUS"):
+        ordenados = sorted(candidatos[tipo], key=lambda x: (x["valor"], str(x["modelo"]).upper()))
+        vistos = set()
+        for item in ordenados:
+            chave = str(item["modelo"]).strip().upper()
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            resultado.append(item)
+            if len(vistos) >= 3:
+                break
+
+    print(
+        "Dashboard PM_Precos: "
+        f"PREV={len([x for x in resultado if x['tipo']=='PREV'])}, "
+        f"MAX={len([x for x in resultado if x['tipo']=='MAX'])}, "
+        f"PLUS={len([x for x in resultado if x['tipo']=='PLUS'])}"
+    )
+    return resultado
 
 def formatar_moeda(valor, manter_todos_decimais=False):
     if valor is None or str(valor).strip() in ["", "-"]:
@@ -599,6 +874,28 @@ TEMPLATE_HTML = r"""
         .menu-hamburger { background: none; border: none; color: #fff; font-size: 24px; cursor: pointer; padding: 4px; display: flex; align-items: center; }
         .topbar-title { font-size: 17px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
         .topbar-right button { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; }
+        .notificacao-badge {
+            display:inline-flex; align-items:center; justify-content:center;
+            min-width:17px; height:17px; padding:0 4px; margin-left:-5px;
+            border-radius:999px; background:#dc2626; color:#fff; font-size:10px; font-weight:800;
+            vertical-align:top;
+        }
+        .painel-notificacoes {
+            position:absolute; right:0; top:42px; width:min(390px, calc(100vw - 24px));
+            max-height:430px; overflow:auto; background:#fff; color:#1f2937;
+            border:1px solid #dbe3ec; border-radius:10px; box-shadow:0 12px 30px rgba(0,0,0,.18);
+            padding:8px; z-index:5000;
+        }
+        .notificacao-item {
+            display:block; padding:10px; border-radius:8px; text-decoration:none; color:#1f2937;
+            border-bottom:1px solid #eef2f7;
+        }
+        .notificacao-item:hover { background:#f8fafc; }
+        .notificacao-tipo { font-size:9px; font-weight:800; text-transform:uppercase; color:#2563eb; }
+        .notificacao-titulo { font-size:12px; font-weight:800; margin-top:2px; }
+        .notificacao-desc { font-size:11px; color:#64748b; margin-top:3px; line-height:1.35; }
+        .notificacao-vazia { padding:18px 10px; text-align:center; color:#64748b; font-size:12px; }
+
 
         .drawer-overlay {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -781,7 +1078,128 @@ TEMPLATE_HTML = r"""
             50% { transform: translateY(-5px); }
             100% { transform: translateY(0); }
         }
-    </style>
+    
+        /* ============================================================
+           Negócios: ações sempre visíveis mesmo quando a tabela é larga.
+           A tabela continua horizontalmente rolável, mas a última coluna
+           fica presa à direita da área visível.
+           ============================================================ */
+        .negocios-scroll-top {
+            display: block;
+            width: 100%;
+            height: 18px;
+            overflow-x: scroll !important;
+            overflow-y: hidden;
+            margin: 0 0 6px 0;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            background: #f1f5f9;
+            scrollbar-width: auto;
+            scrollbar-color: #64748b #e2e8f0;
+        }
+        .negocios-scroll-top::-webkit-scrollbar {
+            height: 14px;
+        }
+        .negocios-scroll-top::-webkit-scrollbar-track {
+            background: #e2e8f0;
+            border-radius: 6px;
+        }
+        .negocios-scroll-top::-webkit-scrollbar-thumb {
+            background: #64748b;
+            border-radius: 6px;
+            border: 2px solid #e2e8f0;
+        }
+        .negocios-scroll-top-inner {
+            height: 1px;
+            min-width: 1450px;
+        }
+        .negocios-tabela-wrap {
+            overflow-x: scroll !important;
+            overflow-y: visible;
+            position: relative;
+            width: 100%;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: auto;
+            scrollbar-color: #64748b #e2e8f0;
+        }
+        .negocios-tabela-wrap::-webkit-scrollbar {
+            height: 14px;
+        }
+        .negocios-tabela-wrap::-webkit-scrollbar-track {
+            background: #e2e8f0;
+        }
+        .negocios-tabela-wrap::-webkit-scrollbar-thumb {
+            background: #64748b;
+            border-radius: 6px;
+        }
+        .negocios-tabela {
+            width: 1450px !important;
+            min-width: 1450px !important;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-size: 13px;
+            text-align: left;
+        }
+        .negocios-tabela th,
+        .negocios-tabela td {
+            padding: 10px;
+            border-bottom: 1px solid #edf2f7;
+            vertical-align: middle;
+        }
+        .negocios-tabela th {
+            white-space: nowrap;
+        }
+        .negocios-tabela td {
+            max-width: 220px;
+            overflow-wrap: anywhere;
+        }
+        .negocios-tabela .coluna-acoes-header,
+        .negocios-tabela .coluna-acoes {
+            position: sticky;
+            right: 0;
+            z-index: 5;
+            min-width: 118px;
+            width: 118px;
+            background: #ffffff;
+            box-shadow: -6px 0 10px rgba(15,23,42,.08);
+            pointer-events: auto !important;
+        }
+        .negocios-tabela .coluna-acoes-header {
+            background: #002244;
+            color: #ffffff;
+            text-align: center;
+        }
+        .negocios-tabela .coluna-acoes > div {
+            display: flex !important;
+            flex-direction: column;
+            gap: 5px !important;
+            align-items: stretch !important;
+            justify-content: center !important;
+        }
+        .negocios-tabela .coluna-acoes .btn-acao {
+            width: 100%;
+            min-width: 94px;
+            margin: 0;
+            white-space: nowrap;
+        }
+        @media (max-width: 900px) {
+            .negocios-tabela {
+                width: 1450px !important;
+                min-width: 1450px !important;
+            }
+            .negocios-tabela .coluna-acoes-header,
+            .negocios-tabela .coluna-acoes {
+                min-width: 105px;
+                width: 105px;
+            }
+            .negocios-tabela .coluna-acoes .btn-acao {
+                min-width: 82px;
+                font-size: 11px;
+                padding: 6px 5px;
+            }
+        }
+
+</style>
     <script>
         function toggleDrawer() {
             var drawer = document.getElementById('drawerMenu');
@@ -1008,6 +1426,77 @@ TEMPLATE_HTML = r"""
             return new Date(0);
         }
 
+
+        function atualizarBadgeNotificacoes(lista) {
+            var badge = document.getElementById('contadorNotificacoes');
+            if (!badge) return;
+            var idsLidos = JSON.parse(localStorage.getItem('pmrio_notificacoes_lidas') || '[]');
+            var naoLidas = lista.filter(function(item) { return idsLidos.indexOf(item.id) === -1; }).length;
+            badge.textContent = naoLidas > 99 ? '99+' : naoLidas;
+            badge.style.display = naoLidas ? 'inline-flex' : 'none';
+        }
+
+        function renderizarNotificacoes(lista) {
+            var painel = document.getElementById('painelNotificacoes');
+            if (!painel) return;
+            if (!lista.length) {
+                painel.innerHTML = '<div class="notificacao-vazia">Nenhuma atualização encontrada.</div>';
+                return;
+            }
+            painel.innerHTML = lista.map(function(item) {
+                var href = item.link || '#';
+                var alvo = item.link ? ' target="_blank" rel="noopener noreferrer"' : '';
+                return '<a class="notificacao-item" href="' + href.replace(/"/g, '&quot;') + '"' + alvo +
+                    ' onclick="marcarNotificacaoLida(\'' + String(item.id).replace(/'/g, "\\'") + '\')">' +
+                    '<div class="notificacao-tipo">' + (item.tipo || 'Atualização') + '</div>' +
+                    '<div class="notificacao-titulo">' + (item.titulo || 'Atualização disponível') + '</div>' +
+                    '<div class="notificacao-desc">' + (item.descricao || '') + '</div>' +
+                    '</a>';
+            }).join('');
+        }
+
+        function marcarNotificacaoLida(id) {
+            var ids = JSON.parse(localStorage.getItem('pmrio_notificacoes_lidas') || '[]');
+            if (ids.indexOf(id) === -1) ids.push(id);
+            localStorage.setItem('pmrio_notificacoes_lidas', JSON.stringify(ids.slice(-100)));
+            carregarNotificacoes();
+        }
+
+        function carregarNotificacoes() {
+            fetch('/api/atualizacoes?limite=12', {cache:'no-store'})
+                .then(function(res) { return res.ok ? res.json() : {atualizacoes:[]}; })
+                .then(function(data) {
+                    var lista = data.atualizacoes || [];
+                    window.__notificacoes = lista;
+                    atualizarBadgeNotificacoes(lista);
+                    renderizarNotificacoes(lista);
+                })
+                .catch(function() {});
+        }
+
+        function toggleNotificacoes() {
+            var painel = document.getElementById('painelNotificacoes');
+            if (!painel) return;
+            var aberto = painel.style.display === 'block';
+            painel.style.display = aberto ? 'none' : 'block';
+            if (!aberto) carregarNotificacoes();
+        }
+
+        document.addEventListener('click', function(event) {
+            var painel = document.getElementById('painelNotificacoes');
+            var botao = document.getElementById('btnNotificacoes');
+            if (painel && botao && painel.style.display === 'block' &&
+                !painel.contains(event.target) && !botao.contains(event.target)) {
+                painel.style.display = 'none';
+            }
+        });
+
+        // Primeira verificação rápida e depois a cada 5 minutos.
+        document.addEventListener('DOMContentLoaded', function() {
+            carregarNotificacoes();
+            window.setInterval(carregarNotificacoes, 300000);
+        });
+
         function forcarAtualizacao() {
             var url = window.location.pathname + window.location.search;
             var separador = url.indexOf('?') !== -1 ? '&' : '?';
@@ -1151,8 +1640,12 @@ TEMPLATE_HTML = r"""
                 <button class="menu-hamburger" onclick="toggleDrawer()">☰</button>
                 <div class="topbar-title">{{ modulo_titulo }}</div>
             </div>
-            <div class="topbar-right">
-                <button onclick="forcarAtualizacao()" title="Atualizar">↻</button>
+            <div class="topbar-right" style="display:flex;align-items:center;gap:8px;position:relative;">
+                <button type="button" id="btnNotificacoes" onclick="toggleNotificacoes()" title="Atualizações" aria-label="Atualizações">
+                    🔔 <span id="contadorNotificacoes" class="notificacao-badge" style="display:none;">0</span>
+                </button>
+                <button type="button" onclick="forcarAtualizacao()" title="Atualizar">↻</button>
+                <div id="painelNotificacoes" class="painel-notificacoes" style="display:none;"></div>
             </div>
         </header>
 
@@ -1218,6 +1711,12 @@ TEMPLATE_HTML = r"""
                 </li>
                 {% endif %}
                 
+                {% if session.get('perm_dashboard') %}
+                <li class="drawer-item {% if modulo_ativo == 'dashboard' %}active{% endif %}">
+                    <a href="/modulo/dashboard" onclick="closeDrawer()"><span class="drawer-icon">📊</span> Dashboard</a>
+                </li>
+                {% endif %}
+
                 {% if session.get('perm_locacao_vendas') %}
                 <li class="drawer-item {% if modulo_ativo == 'locacao_vendas' %}active{% endif %}">
                     <a href="/modulo/locacao_vendas" onclick="closeDrawer()"><span class="drawer-icon">🔑</span> Locação - Vendas</a>
@@ -1237,6 +1736,12 @@ TEMPLATE_HTML = r"""
                 {% if session.get('perm_consorcio_negocios') %}
                 <li class="drawer-item {% if modulo_ativo == 'consorcio_negocios' %}active{% endif %}">
                     <a href="/modulo/consorcio_negocios" onclick="closeDrawer()"><span class="drawer-icon">🤝</span> Consórcio - Negócios</a>
+                </li>
+                {% endif %}
+
+                {% if session.get('perm_camp_vw_prev') %}
+                <li class="drawer-item {% if modulo_ativo == 'camp_vw_prev' %}active{% endif %}">
+                    <a href="/modulo/camp_vw_prev" onclick="closeDrawer()"><span class="drawer-icon">🚛</span> Campanha VW PREV</a>
                 </li>
                 {% endif %}
 
@@ -1376,8 +1881,9 @@ def login():
                     session["perm_fichatecnica"] = tem_permissao(["FICHA TECNICA", "FICHATECNICA"])
                     session["perm_argumentos"] = tem_permissao(["ARGUMENTOS DE VENDA", "ARGUMENTOS"])
                     session["perm_visitas"] = tem_permissao(["VISITAS"])
+                    session["perm_camp_vw_prev"] = tem_permissao(["CAMPANHAS", "CAMPANHA", "CAMPANHA VW PREV", "CAMP", "PREV"])
+                    session["perm_dashboard"] = tem_permissao(["DASHBORD", "DASHBOARD", "DASH"])
                     session["perm_traton"] = tem_permissao(["TRATON", "SIMULADOR TRATON"])
-                    
                     session["perm_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO", "NEGOCIOS"])
                     
                     val_vendas = False
@@ -1398,7 +1904,7 @@ def login():
                     
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
 
-                    return redirect(url_for("acessar_modulo", nome_modulo="rio"))
+                    return redirect(url_for("acessar_modulo", nome_modulo="dashboard"))
                 else:
                     tentativas = session.get("tentativas_erro", 0) + 1
                     session["tentativas_erro"] = tentativas
@@ -1493,11 +1999,13 @@ def acessar_modulo(nome_modulo):
         "negocios": session.get("perm_negocios", False),
         "visitas": session.get("perm_visitas", False),
         "vendas": session.get("perm_vendas", False),
+        "dashboard": session.get("perm_dashboard", False),
         "locacao_vendas": session.get("perm_locacao_vendas", False),
         "locacao_negocios": session.get("perm_locacao_negocios", False),
         "consorcio_vendas": session.get("perm_consorcio_vendas", False),
         "consorcio_negocios": session.get("perm_consorcio_negocios", False),
-        "traton": session.get("perm_traton", False)  # <--- ADICIONE ESTA LINHA
+        "camp_vw_prev": session.get("perm_camp_vw_prev", False),
+        "traton": session.get("perm_traton", False)
     }
 
     if not permissoes_map.get(nome_modulo, False):
@@ -1513,8 +2021,1369 @@ def acessar_modulo(nome_modulo):
     _, mapa_drive = obter_conteudo_pastas_drive()
     nome_usuario_logado = session.get('nome', 'Usuário')
 
-    # ADICIONE ESTE BLOCO AQUI:
-    if nome_modulo == "traton":
+    # ============================================================
+    # CAMPANHA VW PREV
+    # Usa os mesmos negócios ativos filtrados pelo vendedor logado
+    # no módulo "Visitas e Acompanhamento" e lê as regras da aba
+    # "Regras_Camp_VW" diretamente do Google Sheets.
+    # ============================================================
+    if nome_modulo == "camp_vw_prev":
+        global CACHE_CAMPANHAS
+        if 'CACHE_CAMPANHAS' not in globals():
+            CACHE_CAMPANHAS = {}
+
+        try:
+            planilha = conectar_google_sheets()
+
+            # Garante que a aba Campanhas_VW existe
+            try:
+                aba_campanhas_vw = planilha.worksheet("Campanhas_VW")
+            except gspread.exceptions.WorksheetNotFound:
+                aba_campanhas_vw = planilha.add_worksheet(title="Campanhas_VW", rows=1000, cols=10)
+                aba_campanhas_vw.append_row(["DATA", "CIRCULAR", "CONSULTOR", "EMPRESA", "CHASSIS", "MODELOS", "G MANUTENÇÃO", "PLANO DE MANUTENÇÃO", "RIO", "STATUS"])
+
+            sucesso_msg = None
+            erro_msg = None
+
+            perfil_usuario = str(session.get("perfil", "")).strip().upper()
+            usuario_logado = str(session.get("nome", "")).strip().upper()
+            is_adm = perfil_usuario in ["ADM", "DIRETOR", "GERENTE"]
+
+            # --------------------------------------------------------
+            # Tratamento de POST (Salvamento do Grupo)
+            # --------------------------------------------------------
+            if request.method == "POST" and "acao_form" in request.form:
+                acao_form = request.form.get("acao_form", "").strip()
+                if acao_form == "salvar_grupo":
+                    chassis_alvo = request.form.get("chassis", "").strip()
+                    grupo_manutencao = request.form.get("grupo_manutencao", "").strip()
+                    cliente_alvo = request.form.get("cliente", "").strip()
+                    modelo_alvo = request.form.get("modelo", "").strip()
+                    circular_alvo = request.form.get("circular", "").strip()
+                    plano_manutencao_salvar = request.form.get("plano_manutencao", "").strip()
+                    rio_salvar = request.form.get("rio", "").strip()
+                    vendedor_reg = request.form.get("vendedor_reg", "").strip() or session.get("nome", "Usuário")
+
+                    if grupo_manutencao in ["Rodoviário", "Misto", "Severo"]:
+                        data_atual = datetime.now().strftime("%d/%m/%Y")
+                        
+                        registros_camp_existentes = obter_registros_seguros(aba_campanhas_vw)
+                        encontrado_idx = None
+                        status_existente = "Aguardando Consultor"
+
+                        for idx_c, rc in enumerate(registros_camp_existentes, start=2):
+                            ch_plan = str(rc.get("CHASSIS", "")).strip().upper()
+                            cli_plan = str(rc.get("EMPRESA", "")).strip().upper()
+                            if chassis_alvo and ch_plan == chassis_alvo.upper():
+                                encontrado_idx = idx_c
+                                status_existente = str(rc.get("STATUS", "Aguardando Consultor")).strip() or "Aguardando Consultor"
+                                break
+                            elif not chassis_alvo and cli_plan == cliente_alvo.upper():
+                                encontrado_idx = idx_c
+                                status_existente = str(rc.get("STATUS", "Aguardando Consultor")).strip() or "Aguardando Consultor"
+                                break
+
+                        status_alvo = request.form.get("status", "").strip() if is_adm else (status_existente if status_existente != "Aguardando Consultor" else "Pendente")
+
+                        nova_linha_campanha = [data_atual, circular_alvo, vendedor_reg, cliente_alvo, chassis_alvo, modelo_alvo, grupo_manutencao, plano_manutencao_salvar, rio_salvar, status_alvo]
+
+                        if encontrado_idx:
+                            aba_campanhas_vw.update(f"A{encontrado_idx}:J{encontrado_idx}", [nova_linha_campanha])
+                        else:
+                            aba_campanhas_vw.append_row(nova_linha_campanha)
+
+                        if CACHE_CAMPANHAS is not None:
+                            CACHE_CAMPANHAS.clear()
+
+                        sucesso_msg = "Grupo de manutenção salvo e enviado com sucesso!"
+                    else:
+                        erro_msg = "Selecione um Grupo de Manutenção válido."
+
+            # --------------------------------------------------------
+            # Leitura com Cache Otimizado
+            # --------------------------------------------------------
+            cache_key = "dados_campanha_v2"
+            if cache_key in CACHE_CAMPANHAS:
+                regras, registros_usuarios, linhas_brutas_negocios, _ = CACHE_CAMPANHAS[cache_key]
+            else:
+                aba_regras = planilha.worksheet("Regras_Camp_VW")
+                regras = obter_registros_seguros(aba_regras)
+
+                aba_usuarios = planilha.worksheet("Usuarios")
+                registros_usuarios = obter_registros_seguros(aba_usuarios)
+
+                aba_negocios = planilha.worksheet("Negocios_PM")
+                linhas_brutas_negocios = aba_negocios.get_all_values()
+
+                CACHE_CAMPANHAS[cache_key] = (regras, registros_usuarios, linhas_brutas_negocios, [])
+
+            # Campanhas_VW é editada diretamente na planilha com frequência.
+            # Não usamos cache para STATUS/GRUPO: sempre lemos a versão atual.
+            registros_salvos_camp = obter_registros_seguros(aba_campanhas_vw)
+
+            # --------------------------------------------------------
+            # Carrega consultores com perfil CONSULTOR PE ou AL
+            # --------------------------------------------------------
+            lista_consultores = []
+            for u in registros_usuarios:
+                p_u = str(u.get("PERFIL", "")).strip().upper()
+                n_u = str(u.get("NOME", "")).strip()
+                if ("CONSULTOR PE" in p_u or "CONSULTOR AL" in p_u or "CONSULTOR" in p_u) and n_u:
+                    if n_u not in lista_consultores:
+                        lista_consultores.append(n_u)
+
+            # --------------------------------------------------------
+            # Parâmetros de Filtro
+            # --------------------------------------------------------
+            ano_atual_str = str(datetime.now().year)
+            vend_selecionado = request.args.get("vend", "todos" if is_adm else session.get("nome", "")).strip().lower()
+            ano_selecionado = request.args.get("ano", ano_atual_str).strip()
+            periodo_selecionado = request.args.get("periodo", "todos").strip().lower()
+
+            # Função inteligente que extrai Apenas a Raiz do Modelo (Ex: 29.530 4x4 -> 29530)
+            def extrair_modelo_base(val):
+                texto = str(val or "").strip()
+                match = re.search(r'(\d{1,2}\.?\d{3})', texto)
+                if match:
+                    return re.sub(r'\D', '', match.group(1))
+                return ""
+
+            mapa_regras_base = {}
+            for regra in regras:
+                m_regra = str(regra.get("MODELOS", "") or regra.get("MODELO", "")).strip()
+                m_base = extrair_modelo_base(m_regra)
+                if m_base:
+                    if m_base not in mapa_regras_base:
+                        mapa_regras_base[m_base] = []
+                    mapa_regras_base[m_base].append(regra)
+
+            def encontrar_regra_cruzada(modelo_negocio, mes_numero=""):
+                m_base_negocio = extrair_modelo_base(modelo_negocio)
+                if not m_base_negocio or m_base_negocio not in mapa_regras_base:
+                    return None
+
+                candidatas = mapa_regras_base[m_base_negocio]
+                return candidatas[0]
+
+            # --------------------------------------------------------
+            # Negócios: cruzando estritamente com os modelos da Regra
+            # --------------------------------------------------------
+            registros_campanha = []
+            anos_encontrados = set([ano_atual_str])
+
+            if len(linhas_brutas_negocios) > 1:
+                cabecalhos = [str(c).upper().strip() for c in linhas_brutas_negocios[0]]
+
+                for idx_linha, linha in enumerate(linhas_brutas_negocios[1:], start=2):
+                    item_dict = {"_index_planilha": idx_linha}
+
+                    for i, val in enumerate(linha):
+                        if i < len(cabecalhos) and cabecalhos[i]:
+                            item_dict[cabecalhos[i]] = val
+
+                    vend_val = str(item_dict.get("VENDEDOR", "")).strip()
+                    temp_val = str(item_dict.get("TEMPERATURA", "")).strip().lower()
+                    modelo_val = str(item_dict.get("MODELO", "")).strip()
+                    data_val = str(item_dict.get("DATA", "")).strip()
+
+                    if temp_val in ["fechado", "perdida"]:
+                        continue
+
+                    ano_item = ""
+                    mes_item = ""
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
+                        try:
+                            dt_obj = datetime.strptime(data_val.split()[0], fmt.split()[0])
+                            ano_item = str(dt_obj.year)
+                            mes_item = f"{dt_obj.month:02d}"
+                            break
+                        except ValueError:
+                            pass
+
+                    if not ano_item:
+                        m_ano = re.search(r'/(\d{4}|\d{2})$', data_val)
+                        if m_ano:
+                            a = m_ano.group(1)
+                            ano_item = "20" + a if len(a) == 2 else a
+                        m_mes = re.search(r'^\d{1,2}/(\d{1,2})/', data_val)
+                        mes_item = m_mes.group(1).zfill(2) if m_mes else ""
+
+                    if ano_item:
+                        anos_encontrados.add(ano_item)
+
+                    if ano_selecionado != "todos" and ano_item and ano_item != ano_selecionado:
+                        continue
+
+                    if periodo_selecionado == "semestre1" and mes_item not in ["01","02","03","04","05","06"]:
+                        continue
+                    elif periodo_selecionado == "semestre2" and mes_item not in ["07","08","09","10","11","12"]:
+                        continue
+                    elif len(periodo_selecionado) == 2 and periodo_selecionado.isdigit() and mes_item != periodo_selecionado:
+                        continue
+
+                    regra_associada = encontrar_regra_cruzada(modelo_val, mes_item)
+                    if not regra_associada:
+                        continue
+
+                    if not is_adm and vend_val.upper() != usuario_logado:
+                        continue
+
+                    if vend_selecionado != "todos" and vend_val.strip().lower() != vend_selecionado:
+                        continue
+
+                    item_dict["_regra"] = regra_associada
+                    registros_campanha.append(item_dict)
+
+            # Mapeia registros salvos em Campanhas_VW (KPIs + STATUS DA TABELA).
+            # Normaliza CHASSIS/EMPRESA para que pequenas diferenças de espaços,
+            # pontuação ou caixa não impeçam o STATUS salvo na planilha de aparecer.
+            mapa_dados_salvos = {}
+            kpis_status = {"Ativo": 0, "Pendente": 0, "Aguardando Consultor": 0, "Total": 0}
+
+            def chave_campanha(valor):
+                valor = unicodedata.normalize("NFKD", str(valor or ""))
+                valor = "".join(c for c in valor if not unicodedata.combining(c))
+                return re.sub(r"[^A-Z0-9]+", "", valor.upper())
+
+            for rc in registros_salvos_camp:
+                ch = str(rc.get("CHASSIS", "")).strip()
+                cli = str(rc.get("EMPRESA", "")).strip()
+                consultor_salvo = str(rc.get("CONSULTOR", "")).strip()
+                status_val = str(rc.get("STATUS", "")).strip() or "Aguardando Consultor"
+
+                if not is_adm and chave_campanha(consultor_salvo) != chave_campanha(usuario_logado):
+                    continue
+
+                status_norm = chave_campanha(status_val)
+                if status_norm == "ATIVO":
+                    status_val = "Ativo"
+                elif status_norm == "PENDENTE":
+                    status_val = "Pendente"
+                elif status_norm in ("AGUARDANDOCONSULTOR", "AGUARDANDO"):
+                    status_val = "Aguardando Consultor"
+
+                if status_val in kpis_status:
+                    kpis_status[status_val] += 1
+                kpis_status["Total"] += 1
+
+                dados_status = {
+                    "grupo": str(rc.get("G MANUTENÇÃO", "")).strip(),
+                    "status": status_val,
+                }
+                chave_chassis = chave_campanha(ch)
+                chave_cliente = chave_campanha(cli)
+                if chave_chassis:
+                    mapa_dados_salvos[f"CH:{chave_chassis}"] = dados_status
+                if chave_cliente:
+                    mapa_dados_salvos[f"CLI:{chave_cliente}"] = dados_status
+
+            kpis_status["Aguardando Consultor"] = max(
+                0, len(registros_campanha) - kpis_status["Ativo"] - kpis_status["Pendente"]
+            )
+
+            # --------------------------------------------------------
+            # Geração da Tabela Principal
+            # --------------------------------------------------------
+            linhas_campanha = ""
+            for reg in registros_campanha:
+                cliente = reg.get("CLIENTE", "")
+                modelo = reg.get("MODELO", "")
+                chassis = reg.get("CHASSIS", "") or reg.get("CHASSI", "")
+                vendedor_item = reg.get("VENDEDOR", session.get('nome', ''))
+                regra = reg.get("_regra")
+
+                circular = str(regra.get("CIRCULAR", "")).strip()
+                link_circular = str(regra.get("LINK_CIRCULAR", "")).strip()
+                mes_campanha = str(regra.get("MÊS", "") or regra.get("MES", "")).strip()
+                regra_prev = str(regra.get("REGRA PREV", "")).strip()
+                regra_rio = str(regra.get("REGRA RIO", "")).strip()
+                regra_prev_max = str(regra.get("REGRA PREV / MAX", "")).strip()
+
+                plano_manutencao_txt = f"{regra_prev} / {regra_prev_max}".strip(" /")
+                rio_txt = regra_rio
+
+                if not link_circular:
+                    link_circular = f"https://drive.google.com/drive/search?q={urllib.parse.quote(circular)}"
+
+                circular_html = f'<a href="{link_circular}" target="_blank" rel="noopener noreferrer" style="color: #0066cc; font-weight: 600;">{circular}</a>' if circular else "-"
+
+                chave_chassis_busca = chave_campanha(chassis)
+                chave_cliente_busca = chave_campanha(cliente)
+                dados_salvos = (
+                    mapa_dados_salvos.get(f"CH:{chave_chassis_busca}")
+                    if chave_chassis_busca else None
+                ) or (
+                    mapa_dados_salvos.get(f"CLI:{chave_cliente_busca}")
+                    if chave_cliente_busca else None
+                ) or {"grupo": "", "status": "Aguardando Consultor"}
+                grupo_atual = dados_salvos["grupo"]
+                status_atual = dados_salvos["status"]
+
+                if is_adm:
+                    opcoes_grupo = f"""
+                    <form method="POST" style="display: flex; gap: 4px; align-items: center; margin: 0; flex-wrap: wrap;">
+                        <input type="hidden" name="acao_form" value="salvar_grupo">
+                        <input type="hidden" name="chassis" value="{chassis}">
+                        <input type="hidden" name="cliente" value="{cliente}">
+                        <input type="hidden" name="modelo" value="{modelo}">
+                        <input type="hidden" name="circular" value="{circular}">
+                        <input type="hidden" name="plano_manutencao" value="{plano_manutencao_txt}">
+                        <input type="hidden" name="rio" value="{rio_txt}">
+                        <input type="hidden" name="vendedor_reg" value="{vendedor_item}">
+                        <select name="grupo_manutencao" required style="padding: 6px; font-size: 11px; border-radius: 4px; border: 1px solid #cbd5e0; background: #fff;">
+                            <option value="">Grupo...</option>
+                            <option value="Rodoviário" {"selected" if grupo_atual == "Rodoviário" else ""}>Rodoviário</option>
+                            <option value="Misto" {"selected" if grupo_atual == "Misto" else ""}>Misto</option>
+                            <option value="Severo" {"selected" if grupo_atual == "Severo" else ""}>Severo</option>
+                        </select>
+                        <select name="status" required style="padding: 6px; font-size: 11px; border-radius: 4px; border: 1px solid #cbd5e0; background: #fff;">
+                            <option value="Ativo" {"selected" if status_atual == "Ativo" else ""}>Ativo</option>
+                            <option value="Pendente" {"selected" if status_atual == "Pendente" else ""}>Pendente</option>
+                            <option value="Aguardando Consultor" {"selected" if status_atual == "Aguardando Consultor" else ""}>Aguardando Consultor</option>
+                        </select>
+                        <button type="submit" class="btn-acao btn-editar" style="padding: 6px 10px; font-size: 11px; background:#2b6cb0; border:none; color:white; border-radius:4px; cursor:pointer;">Salvar</button>
+                    </form>
+                    """
+                else:
+                    opcoes_grupo = f"""
+                    <form method="POST" style="display: flex; gap: 4px; align-items: center; margin: 0; flex-wrap: wrap;">
+                        <input type="hidden" name="acao_form" value="salvar_grupo">
+                        <input type="hidden" name="chassis" value="{chassis}">
+                        <input type="hidden" name="cliente" value="{cliente}">
+                        <input type="hidden" name="modelo" value="{modelo}">
+                        <input type="hidden" name="circular" value="{circular}">
+                        <input type="hidden" name="plano_manutencao" value="{plano_manutencao_txt}">
+                        <input type="hidden" name="rio" value="{rio_txt}">
+                        <input type="hidden" name="vendedor_reg" value="{vendedor_item}">
+                        <select name="grupo_manutencao" required style="padding: 6px; font-size: 11px; border-radius: 4px; border: 1px solid #cbd5e0; background: #fff;">
+                            <option value="">Grupo...</option>
+                            <option value="Rodoviário" {"selected" if grupo_atual == "Rodoviário" else ""}>Rodoviário</option>
+                            <option value="Misto" {"selected" if grupo_atual == "Misto" else ""}>Misto</option>
+                            <option value="Severo" {"selected" if grupo_atual == "Severo" else ""}>Severo</option>
+                        </select>
+                        <span style="font-size: 11px; padding: 6px 10px; background: #edf2f7; border-radius: 4px; color: #2d3748; font-weight:600;">Status: {status_atual}</span>
+                        <button type="submit" class="btn-acao btn-editar" style="padding: 6px 10px; font-size: 11px; background:#2b6cb0; border:none; color:white; border-radius:4px; cursor:pointer;">Salvar</button>
+                    </form>
+                    """
+
+                linhas_campanha += f"""
+                <tr>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7;"><b>{cliente}</b></td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7;">{modelo}</td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7;">{chassis}</td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7;">{vendedor_item}</td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7;">{mes_campanha}</td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7; color: #2b6cb0; font-weight: 600;">{plano_manutencao_txt}</td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7; color: #2f855a; font-weight: 600;">{rio_txt if rio_txt else '-'}</td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7;">{circular_html}</td>
+                    <td style="padding:12px 10px; border-bottom:1px solid #edf2f7; min-width: 280px;">{opcoes_grupo}</td>
+                </tr>
+                """
+
+            if not linhas_campanha:
+                linhas_campanha = '<tr><td colspan="9" style="padding:30px; text-align:center; color:#718096; font-size: 14px;">Nenhum negócio enquadrado nas regras da campanha para os filtros selecionados.</td></tr>'
+
+            options_vend = '<option value="todos"' + (' selected' if vend_selecionado == 'todos' else '') + '>Todos os Vendedores</option>'
+            for c in lista_consultores:
+                sel_v = ' selected' if vend_selecionado == c.lower() else ''
+                options_vend += f'<option value="{c}"{sel_v}>{c}</option>'
+
+            options_ano = ""
+            for a in sorted(list(anos_encontrados), reverse=True):
+                sel_a = ' selected' if ano_selecionado == a else ''
+                options_ano += f'<option value="{a}"{sel_a}>{a}</option>'
+
+            meses_dict = {
+                "01": "Janeiro", "02": "Fevereiro", "03": "Março", "04": "Abril",
+                "05": "Maio", "06": "Junho", "07": "Julho", "08": "Agosto",
+                "09": "Setembro", "10": "Outubro", "11": "Novembro", "12": "Dezembro"
+            }
+            options_periodo = f'<option value="todos" {"selected" if periodo_selecionado == "todos" else ""}>Todos os Meses / Semestres</option>'
+            options_periodo += f'<option value="semestre1" {"selected" if periodo_selecionado == "semestre1" else ""}>1º Semestre</option>'
+            options_periodo += f'<option value="semestre2" {"selected" if periodo_selecionado == "semestre2" else ""}>2º Semestre</option>'
+            for m_num, m_nome in meses_dict.items():
+                options_periodo += f'<option value="{m_num}" {"selected" if periodo_selecionado == m_num else ""}>{m_nome}</option>'
+
+            # --------------------------------------------------------
+            # Geração do Relatório PDF (Apenas Itens Salvos)
+            # --------------------------------------------------------
+            linhas_pdf = ""
+            for r in registros_salvos_camp:
+                consultor_salvo = str(r.get("CONSULTOR", "")).strip()
+                if not is_adm and consultor_salvo.upper() != usuario_logado:
+                    continue
+                
+                linhas_pdf += f"""
+                <tr>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('DATA', '')}</td>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('CIRCULAR', '')}</td>
+                    <td style="padding:6px; border:1px solid #333;">{consultor_salvo}</td>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('EMPRESA', '')}</td>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('CHASSIS', '')}</td>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('MODELOS', '')}</td>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('G MANUTENÇÃO', '')}</td>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('PLANO DE MANUTENÇÃO', '')}</td>
+                    <td style="padding:6px; border:1px solid #333;">{r.get('RIO', '')}</td>
+                    <td style="padding:6px; border:1px solid #333; font-weight:bold;">{r.get('STATUS', '')}</td>
+                </tr>
+                """
+
+            if not linhas_pdf:
+                linhas_pdf = '<tr><td colspan="10" style="text-align:center; padding:20px; border:1px solid #333;">Nenhum registro salvo ou enviado encontrado.</td></tr>'
+
+
+            conteudo = f"""
+            <div style="max-width: 1200px; margin: 0 auto; padding: 10px;">
+                <h2 style="color:#002244; border-bottom:2px solid #edf2f7; padding-bottom:8px; margin-bottom:8px; font-size:20px;">Campanha VW PREV</h2>
+                <p style="color:#4a5568; font-size:13px; margin-bottom:20px;">
+                    Usuário logado: <b>{session.get('nome', 'Usuário')}</b>. Gerencie e acompanhe os modelos da campanha.
+                </p>
+
+                <!-- Área de Filtros Responsiva -->
+                <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; margin-bottom: 20px; display: flex; flex-direction: column; gap: 15px;">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
+                        {f'<select id="filtroVend" style="padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 13px;" onchange="aplicarFiltrosCampanha()">{options_vend}</select>' if is_adm else ''}
+                        <select id="filtroAno" style="padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 13px;" onchange="aplicarFiltrosCampanha()">{options_ano}</select>
+                        <select id="filtroPeriodo" style="padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 13px;" onchange="aplicarFiltrosCampanha()">{options_periodo}</select>
+                    </div>
+                    <div style="display: flex; justify-content: flex-end;">
+                        <!-- Botão Gerar PDF sem erro 404 - Usa a área oculta -->
+                        <button onclick="window.print()" style="padding: 10px 20px; background: #c53030; color: white; border: none; border-radius: 6px; font-weight: bold; font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+                            📄 Imprimir / Gerar PDF
+                        </button>
+                    </div>
+                </div>
+
+                <!-- KPIs Responsivos -->
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px;">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:8px; padding:15px; border-left:4px solid #3182ce; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                        <div style="font-size:11px; color:#718096; font-weight:700; text-transform: uppercase;">Total a Trabalhar</div>
+                        <div style="font-size:24px; font-weight:bold; color:#2d3748; margin-top: 5px;">{len(registros_campanha)}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:8px; padding:15px; border-left:4px solid #38a169; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                        <div style="font-size:11px; color:#38a169; font-weight:700; text-transform: uppercase;">Ativo</div>
+                        <div style="font-size:24px; font-weight:bold; color:#276749; margin-top: 5px;">{kpis_status['Ativo']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:8px; padding:15px; border-left:4px solid #d69e2e; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                        <div style="font-size:11px; color:#d69e2e; font-weight:700; text-transform: uppercase;">Pendente</div>
+                        <div style="font-size:24px; font-weight:bold; color:#b7791f; margin-top: 5px;">{kpis_status['Pendente']}</div>
+                    </div>
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:8px; padding:15px; border-left:4px solid #e53e3e; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                        <div style="font-size:11px; color:#e53e3e; font-weight:700; text-transform: uppercase;">Aguardando Consultor</div>
+                        <div style="font-size:24px; font-weight:bold; color:#c53030; margin-top: 5px;">{kpis_status['Aguardando Consultor']}</div>
+                    </div>
+                </div>
+
+                {f'<div style="background:#c6f6d5; color:#22543d; padding:12px; border-radius:6px; margin-bottom:15px; font-size:13px; font-weight:bold;">{sucesso_msg}</div>' if sucesso_msg else ''}
+                {f'<div style="background:#fed7d7; color:#822727; padding:12px; border-radius:6px; margin-bottom:15px; font-size:13px; font-weight:bold;">{erro_msg}</div>' if erro_msg else ''}
+
+                <!-- Tabela de Dados Responsiva -->
+                <div style="background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom:20px; overflow: hidden;">
+                    <div style="padding:15px; font-weight:700; color:#002244; border-bottom:1px solid #e2e8f0; background: #f8fafc;">
+                        Modelos Enquadrados nas Regras da Campanha
+                    </div>
+                    <div style="overflow-x:auto;">
+                        <table style="width:100%; border-collapse:collapse; font-size:12px; text-align:left;">
+                            <thead>
+                                <tr style="background:#002244; color:#fff;">
+                                    <th style="padding:12px 10px;">Cliente</th>
+                                    <th style="padding:12px 10px;">Modelo</th>
+                                    <th style="padding:12px 10px;">Chassis</th>
+                                    <th style="padding:12px 10px;">Consultor</th>
+                                    <th style="padding:12px 10px;">Mês Campanha</th>
+                                    <th style="padding:12px 10px;">Plano de Manutenção</th>
+                                    <th style="padding:12px 10px;">RIO</th>
+                                    <th style="padding:12px 10px;">Circular</th>
+                                    <th style="padding:12px 10px;">Ação / Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>{linhas_campanha}</tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ÁREA DE IMPRESSÃO OCULTA: APENAS OS REGISTROS SALVOS -->
+            <div id="area-impressao-pdf" style="display: none;">
+                <h2 style="color: #002244; text-align: center; font-family: Arial, sans-serif;">Relatório de Campanhas VW - Itens Salvos</h2>
+                <p style="text-align: center; font-size: 12px; color: #666; font-family: Arial, sans-serif; margin-bottom: 20px;">
+                    Gerado por: {session.get('nome', 'Usuário')} em {datetime.now().strftime('%d/%m/%Y %H:%M')}
+                </p>
+                <table style="width: 100%; border-collapse: collapse; font-size: 11px; font-family: Arial, sans-serif;">
+                    <thead>
+                        <tr style="background: #002244; color: white; text-align: left;">
+                            <th style="padding: 8px; border: 1px solid #333;">Data</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Circular</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Consultor</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Empresa</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Chassis</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Modelos</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Grupo</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Plano</th>
+                            <th style="padding: 8px; border: 1px solid #333;">RIO</th>
+                            <th style="padding: 8px; border: 1px solid #333;">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {linhas_pdf}
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Estilo CSS Inteligente para o PDF -->
+            <style>
+                @media print {{
+                    body * {{ visibility: hidden !important; }}
+                    #area-impressao-pdf, #area-impressao-pdf * {{ visibility: visible !important; }}
+                    #area-impressao-pdf {{ 
+                        display: block !important; 
+                        position: absolute; 
+                        left: 0; 
+                        top: 0; 
+                        width: 100%; 
+                        padding: 20px;
+                        background: #fff;
+                    }}
+                }}
+            </style>
+
+            <script>
+                function aplicarFiltrosCampanha() {{
+                    var vendSelect = document.getElementById('filtroVend');
+                    var anoSelect = document.getElementById('filtroAno');
+                    var periodoSelect = document.getElementById('filtroPeriodo');
+                    var url = '/modulo/camp_vw_prev?ano=' + encodeURIComponent(anoSelect.value) + '&periodo=' + encodeURIComponent(periodoSelect.value);
+                    if (vendSelect) {{
+                        url += '&vend=' + encodeURIComponent(vendSelect.value);
+                    }}
+                    window.location.href = url;
+                }}
+            </script>
+            """
+
+        except Exception as e:
+            traceback.print_exc()
+            conteudo = f'<div style="color:#c53030; background:#fff5f5; padding:15px; border-radius:8px; margin: 15px;"><b>Erro ao carregar Campanha VW PREV:</b> {e}</div>'
+
+    elif nome_modulo == "dashboard":
+        try:
+            # ============================================================
+            # DASHBOARD 2 NÍVEIS
+            #   1) ADM / DIRETOR / GERENTE -> visão consolidada + filtro por consultor
+            #   2) CONSULTOR               -> somente os próprios registros
+            #
+            # Fonte dos dados:
+            #   Vendas_PM, Vendas_LOC, Vendas_Consorcio
+            #   Negocios_PM, Negocio_LOC, Negocios_Consorcio
+            #
+            # O dashboard não altera nenhuma planilha. Ele somente consolida
+            # os dados existentes e aplica os filtros no servidor.
+            # ============================================================
+            planilha = conectar_google_sheets()
+
+            perfil_usuario = str(session.get("perfil", "")).strip().upper()
+            usuario_logado = str(session.get("nome", "")).strip()
+            usuario_logado_norm = usuario_logado.upper()
+            perfis_gestao = {"ADM", "DIRETOR", "GERENTE"}
+            is_gestao = perfil_usuario in perfis_gestao
+
+            def norm(v):
+                txt = str(v if v is not None else "").strip()
+                return unicodedata.normalize("NFKD", txt).encode("ASCII", "ignore").decode("ASCII").upper()
+
+            def parse_data(valor):
+                if valor is None:
+                    return None
+                if hasattr(valor, "year") and hasattr(valor, "month"):
+                    try:
+                        return datetime(valor.year, valor.month, valor.day)
+                    except Exception:
+                        pass
+                s = str(valor).strip()
+                if not s or s.lower() in ("nan", "none", "-"):
+                    return None
+                formatos = (
+                    "%d/%m/%Y", "%d/%m/%y",
+                    "%Y-%m-%d", "%Y-%m-%d %H:%M:%S",
+                    "%d-%m-%Y", "%d-%m-%y",
+                    "%m/%d/%Y", "%m/%d/%y"
+                )
+                for fmt in formatos:
+                    try:
+                        return datetime.strptime(s.split(" ")[0] if " " in s and fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y", "%m/%d/%Y", "%m/%d/%y") else s, fmt)
+                    except Exception:
+                        continue
+                # Tentativa final para ISO com horário
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+                except Exception:
+                    return None
+
+            def qtd_valor(v):
+                s = str(v if v is not None else "").strip()
+                if not s or s.lower() == "nan":
+                    return 1
+                # aceita "10", "10 un", "10 veículos"
+                m = re.search(r"-?\d+(?:[.,]\d+)?", s.replace(".", "").replace(",", "."))
+                if not m:
+                    return 1
+                try:
+                    return max(0, int(float(m.group(0))))
+                except Exception:
+                    return 1
+
+            def carregar_aba(nome):
+                try:
+                    return obter_registros_com_cache(planilha, nome, ttl=60)
+                except Exception as e_aba:
+                    print(f"Dashboard: erro ao carregar {nome}: {e_aba}")
+                    return []
+
+            # Dashboard atual: somente Plano de Manutenção / RIO.
+            # Locação e Consórcio permanecem fora desta visão por enquanto.
+            vendas_pm = carregar_aba("Vendas_PM")
+            dados_login = carregar_dados_login()
+            neg_pm = dados_login.get("Negocios_PM", [])
+            usuarios = dados_login.get("Usuarios", [])
+            pm_precos_dashboard = dados_login.get("PM_Precos", [])
+            top3_planos = obter_top3_planos_melhor_preco(pm_precos_dashboard)
+            # Catálogo de produtos do dashboard:
+            # - PM: coluna PRODUTO da aba PM
+            # - RIO: coluna PRODUTO da aba RIO
+            catalogo_pm = []
+            catalogo_rio = []
+            for r in carregar_aba("PM"):
+                p = str(r.get("PRODUTO", "")).strip()
+                if p and norm(p) != "PRODUTO" and p not in catalogo_pm:
+                    catalogo_pm.append(p)
+            for r in carregar_aba("RIO"):
+                p = str(r.get("PRODUTO", "")).strip()
+                if p and norm(p) != "PRODUTO" and p not in catalogo_rio:
+                    catalogo_rio.append(p)
+            catalogo_pm.sort(key=lambda x: norm(x))
+            catalogo_rio.sort(key=lambda x: norm(x))
+
+            # Mapa de consultores e região/UF.
+            consultores = []
+            mapa_regiao = {}
+            for u in usuarios:
+                nome_u = str(u.get("NOME", "")).strip()
+                perfil_u = str(u.get("PERFIL", "")).strip()
+                if not nome_u:
+                    continue
+                if "CONSULTOR" in norm(perfil_u):
+                    if nome_u not in consultores:
+                        consultores.append(nome_u)
+                    pnorm = norm(perfil_u)
+                    mapa_regiao[norm(nome_u)] = "AL" if re.search(r"\bAL\b", pnorm) else "PE"
+
+            consultores.sort(key=lambda x: norm(x))
+
+            # ------------------------------------------------------------
+            # Filtros
+            # ------------------------------------------------------------
+            filtro_ano = request.args.get("ano", "").strip()
+            filtro_mes = request.args.get("mes", "").strip()
+            filtro_consultor = request.args.get("consultor", "").strip()
+            filtro_produto = request.args.get("produto", "").strip()
+            filtro_uf = request.args.get("uf", "").strip().upper()
+
+            anos = set()
+
+            def coletar_anos(registros):
+                for r in registros:
+                    dt = parse_data(r.get("DATA DA VENDA") or r.get("DATA"))
+                    if dt:
+                        anos.add(str(dt.year))
+
+            coletar_anos(vendas_pm)
+            coletar_anos(neg_pm)
+
+            ano_atual = str(datetime.now().year)
+            if not filtro_ano:
+                filtro_ano = ano_atual if ano_atual in anos else (max(anos) if anos else ano_atual)
+
+            # Consultor não pode escapar do próprio escopo.
+            if not is_gestao:
+                filtro_consultor = usuario_logado
+
+            def passa_data(dt):
+                if not dt:
+                    return False
+                if filtro_ano and str(dt.year) != filtro_ano:
+                    return False
+                if filtro_mes:
+                    if filtro_mes == "S1" and dt.month > 6:
+                        return False
+                    if filtro_mes == "S2" and dt.month <= 6:
+                        return False
+                    if filtro_mes.isdigit() and dt.month != int(filtro_mes):
+                        return False
+                return True
+
+            def passa_pessoa(vendedor):
+                if filtro_consultor and norm(filtro_consultor) != "TODOS":
+                    return norm(vendedor) == norm(filtro_consultor)
+                return True
+
+            def passa_uf(vendedor):
+                if not filtro_uf or filtro_uf == "TODOS":
+                    return True
+                return mapa_regiao.get(norm(vendedor), "") == filtro_uf
+
+            def passa_produto(produto, origem="", plano="", rio=""):
+                if not filtro_produto or norm(filtro_produto) == "TODOS":
+                    return True
+
+                fp = norm(filtro_produto)
+
+                # Filtros vindos do catálogo das abas PM/RIO.
+                # O valor enviado pelo select tem prefixo PM| ou RIO|.
+                if fp.startswith("PM|"):
+                    alvo = norm(filtro_produto.split("|", 1)[1])
+                    if origem == "PM":
+                        return alvo in norm(produto) or alvo in norm(plano)
+                    return False
+
+                if fp.startswith("RIO|"):
+                    alvo = norm(filtro_produto.split("|", 1)[1])
+                    if origem == "PM":
+                        return alvo in norm(produto) or alvo in norm(rio)
+                    return False
+
+                return fp in norm(produto) or fp in norm(plano) or fp in norm(rio)
+
+            # ------------------------------------------------------------
+            # Normalização das vendas
+            # ------------------------------------------------------------
+            fontes_vendas = (
+                ("Plano de Manutenção / RIO", "PM", vendas_pm),
+            )
+
+            vendas = []
+            for solucao, origem, registros in fontes_vendas:
+                for r in registros:
+                    vendedor = str(r.get("VENDEDOR", "")).strip()
+                    dt = parse_data(r.get("DATA DA VENDA"))
+                    produto = str(r.get("PRODUTO", "")).strip() or solucao
+                    plano_manutencao = str(
+                        r.get("PLANO DE MANUTENÇÃO", "")
+                        or r.get("PLANO")
+                        or r.get("PLANO MANUTENCAO", "")
+                    ).strip()
+                    if not passa_pessoa(vendedor) or not passa_uf(vendedor):
+                        continue
+                    if not passa_data(dt):
+                        continue
+                    if not passa_produto(produto, origem=origem, plano="", rio=""):
+                        continue
+
+                    qtd = qtd_valor(r.get("QUANTIDADE", 1))
+                    cliente = str(r.get("CLIENTE", "")).strip()
+                    modelo = str(r.get("MODELO", "")).strip()
+                    # Chave de duplicidade: não usa apenas cliente, pois o mesmo
+                    # cliente pode ter mais de uma venda legítima.
+                    chave = (
+                        norm(origem), norm(cliente), norm(produto),
+                        norm(modelo), norm(vendedor),
+                        dt.strftime("%Y-%m-%d") if dt else ""
+                    )
+                    vendas.append({
+                        "origem": origem,
+                        "solucao": solucao,
+                        "cliente": cliente,
+                        "produto": produto,
+                        "plano": plano_manutencao,
+                        "modelo": modelo,
+                        "qtd": qtd,
+                        "vendedor": vendedor,
+                        "data": dt,
+                        "data_txt": str(r.get("DATA DA VENDA", "")).strip(),
+                        "anexo": str(r.get("ANEXO 1", "")).strip(),
+                        "chave": chave,
+                    })
+
+            # Dedupe somente de registros efetivamente idênticos.
+            vendas_unicas = {}
+            duplicatas = 0
+            for v in vendas:
+                if v["chave"] in vendas_unicas:
+                    duplicatas += 1
+                    # Mantém o registro já conhecido para não inflar KPIs.
+                    continue
+                vendas_unicas[v["chave"]] = v
+            vendas = list(vendas_unicas.values())
+            vendas.sort(key=lambda x: x["data"] or datetime.min, reverse=True)
+
+            # ------------------------------------------------------------
+            # Normalização dos negócios/pipeline
+            # ------------------------------------------------------------
+            fontes_negocios = (
+                ("PM / RIO", "PM", neg_pm),
+            )
+
+            negocios = []
+            for solucao, origem, registros in fontes_negocios:
+                for r in registros:
+                    vendedor = str(r.get("VENDEDOR", "")).strip()
+                    dt = parse_data(r.get("DATA"))
+                    temperatura = str(r.get("TEMPERATURA", "")).strip()
+                    cliente = str(r.get("CLIENTE", "")).strip()
+                    modelo = str(r.get("MODELO", "")).strip()
+                    plano = str(r.get("PLANO DE MANUTENÇÃO", "")).strip()
+                    rio = str(r.get("RIO", "")).strip()
+                    produto = " / ".join([x for x in (plano, rio) if x]) or solucao
+
+                    if not passa_pessoa(vendedor) or not passa_uf(vendedor):
+                        continue
+                    if not passa_data(dt):
+                        continue
+                    if not passa_produto(produto, origem=origem, plano=plano, rio=rio):
+                        continue
+
+                    negocios.append({
+                        "origem": origem,
+                        "solucao": solucao,
+                        "temperatura": temperatura,
+                        "temperatura_norm": norm(temperatura),
+                        "cliente": cliente,
+                        "modelo": modelo,
+                        "produto": produto,
+                        "vendedor": vendedor,
+                        "data": dt,
+                        "data_txt": str(r.get("DATA", "")).strip(),
+                        "chassis": str(r.get("CHASSIS", "")).strip(),
+                        "comentarios": str(r.get("COMENTÁRIOS", "")).strip(),
+                    })
+
+            # ------------------------------------------------------------
+            # KPIs
+            # ------------------------------------------------------------
+            total_unidades = sum(v["qtd"] for v in vendas)
+            total_registros_venda = len(vendas)
+            total_pipeline = len(negocios)
+
+            fechados_pipeline = sum(1 for n in negocios if n["temperatura_norm"] == "FECHADO")
+            perdidos_pipeline = sum(1 for n in negocios if n["temperatura_norm"] == "PERDIDA")
+            ativos_pipeline = sum(
+                1 for n in negocios
+                if n["temperatura_norm"] not in ("FECHADO", "PERDIDA")
+            )
+
+            desfechos = fechados_pipeline + perdidos_pipeline
+            taxa_fechamento = (fechados_pipeline / desfechos * 100) if desfechos else 0.0
+
+            # PM/RIO usam a regra de comissão já existente no sistema.
+            qtd_pm = sum(v["qtd"] for v in vendas if v["origem"] == "PM")
+            comissao_apm_pm = qtd_pm * 250.0
+            comissao_vendedor_pm = qtd_pm * 150.0
+
+            # ------------------------------------------------------------
+            # Séries para gráficos
+            # ------------------------------------------------------------
+            meses = {str(i): {"nome": MESES_PT[i], "qtd": 0, "registros": 0} for i in range(1, 13)}
+            for v in vendas:
+                if v["data"]:
+                    k = str(v["data"].month)
+                    meses[k]["qtd"] += v["qtd"]
+                    meses[k]["registros"] += 1
+
+            por_consultor = {}
+            for v in vendas:
+                nome = v["vendedor"] or "Sem vendedor"
+                por_consultor.setdefault(nome, {"qtd": 0, "registros": 0})
+                por_consultor[nome]["qtd"] += v["qtd"]
+                por_consultor[nome]["registros"] += 1
+
+            por_solucao = {}
+            for v in vendas:
+                por_solucao.setdefault(v["solucao"], 0)
+                por_solucao[v["solucao"]] += v["qtd"]
+
+            por_produto = {}
+            for v in vendas:
+                por_produto.setdefault(v["produto"] or "Não informado", 0)
+                por_produto[v["produto"] or "Não informado"] += v["qtd"]
+
+            por_modelo = {}
+            for v in vendas:
+                por_modelo.setdefault(v["modelo"] or "Não informado", 0)
+                por_modelo[v["modelo"] or "Não informado"] += v["qtd"]
+
+            por_plano = {}
+            for v in vendas:
+                plano = v.get("plano") or v.get("produto") or "Plano não informado"
+                por_plano[plano] = por_plano.get(plano, 0) + v["qtd"]
+
+            # Resumo comercial por modalidade de manutenção.
+            por_modalidade = {"PREV": 0, "MAX": 0, "PLUS": 0}
+            for v in vendas:
+                texto_plano = norm(v.get("plano") or v.get("produto") or "")
+                if "PREV" in texto_plano:
+                    por_modalidade["PREV"] += v["qtd"]
+                elif "MAX" in texto_plano:
+                    por_modalidade["MAX"] += v["qtd"]
+                elif "PLUS" in texto_plano:
+                    por_modalidade["PLUS"] += v["qtd"]
+
+            por_uf = {"PE": 0, "AL": 0, "Não identificado": 0}
+            for v in vendas:
+                uf = mapa_regiao.get(norm(v["vendedor"]), "Não identificado")
+                por_uf[uf] = por_uf.get(uf, 0) + v["qtd"]
+
+            por_temp = {
+                "Super Quente": 0, "Quente": 0, "Morno": 0,
+                "Frio": 0, "Perdida": 0, "Fechado": 0
+            }
+            for n in negocios:
+                t = n["temperatura_norm"]
+                if t == "SUPER QUENTE":
+                    por_temp["Super Quente"] += 1
+                elif t == "QUENTE":
+                    por_temp["Quente"] += 1
+                elif t == "MORNO":
+                    por_temp["Morno"] += 1
+                elif t == "FRIO":
+                    por_temp["Frio"] += 1
+                elif t == "PERDIDA":
+                    por_temp["Perdida"] += 1
+                elif t == "FECHADO":
+                    por_temp["Fechado"] += 1
+
+            # Clientes ativos há mais tempo, usando a data do negócio.
+            hoje = datetime.now()
+            aging = {"0-30 dias": 0, "31-60 dias": 0, "61-90 dias": 0, "+90 dias": 0}
+            negocios_ativos = []
+            for n in negocios:
+                if n["temperatura_norm"] in ("FECHADO", "PERDIDA"):
+                    continue
+                negocios_ativos.append(n)
+                if n["data"]:
+                    dias = max(0, (hoje - n["data"]).days)
+                    if dias <= 30:
+                        aging["0-30 dias"] += 1
+                    elif dias <= 60:
+                        aging["31-60 dias"] += 1
+                    elif dias <= 90:
+                        aging["61-90 dias"] += 1
+                    else:
+                        aging["+90 dias"] += 1
+
+            # Top clientes por unidades vendidas.
+            por_cliente = {}
+            for v in vendas:
+                c = v["cliente"] or "Não informado"
+                por_cliente[c] = por_cliente.get(c, 0) + v["qtd"]
+            top_clientes = sorted(por_cliente.items(), key=lambda x: x[1], reverse=True)[:10]
+
+            # ------------------------------------------------------------
+            # Dados JSON enviados uma única vez para o navegador.
+            # ------------------------------------------------------------
+            dashboard_data = {
+                "resumo": {
+                    "unidades": total_unidades,
+                    "vendas": total_registros_venda,
+                    "pipeline": total_pipeline,
+                    "ativos": ativos_pipeline,
+                    "fechados_pipeline": fechados_pipeline,
+                    "perdidos_pipeline": perdidos_pipeline,
+                    "taxa_fechamento": round(taxa_fechamento, 1),
+                    "comissao_apm_pm": round(comissao_apm_pm, 2),
+                    "comissao_vendedor_pm": round(comissao_vendedor_pm, 2),
+                    "duplicatas_ignoradas": duplicatas,
+                },
+                "meses": meses,
+                "consultores": por_consultor,
+                "solucoes": por_solucao,
+                "produtos": por_produto,
+                "modelos": por_modelo,
+                "planos": por_plano,
+                "modalidades": por_modalidade,
+                "ufs": por_uf,
+                "temperaturas": por_temp,
+                "aging": aging,
+                "top_clientes": top_clientes,
+            }
+            json_dash = json.dumps(dashboard_data, ensure_ascii=False).replace("</", "<\\/")
+
+            anos_ordenados = sorted(anos, reverse=True) or [ano_atual]
+            op_anos = "".join(
+                f'<option value="{html.escape(a)}" {"selected" if a == filtro_ano else ""}>{html.escape(a)}</option>'
+                for a in anos_ordenados
+            )
+
+            op_mes = f'<option value="" {"selected" if not filtro_mes else ""}>Ano inteiro</option>'
+            op_mes += f'<option value="S1" {"selected" if filtro_mes == "S1" else ""}>1º semestre</option>'
+            op_mes += f'<option value="S2" {"selected" if filtro_mes == "S2" else ""}>2º semestre</option>'
+            for m, nome_m in MESES_PT.items():
+                op_mes += f'<option value="{m}" {"selected" if filtro_mes == str(m) else ""}>{nome_m.capitalize()}</option>'
+
+            op_consultores = '<option value="">Todos os consultores</option>'
+            if not is_gestao:
+                op_consultores = f'<option value="{html.escape(usuario_logado)}" selected>{html.escape(usuario_logado)}</option>'
+            else:
+                for c in consultores:
+                    op_consultores += (
+                        f'<option value="{html.escape(c)}" '
+                        f'{"selected" if norm(c) == norm(filtro_consultor) else ""}>{html.escape(c)}</option>'
+                    )
+
+            # Produto: catálogo real das abas PM e RIO.
+            # Usamos prefixo técnico no value para diferenciar nomes iguais
+            # que eventualmente existam nas duas abas.
+            op_produtos = '<option value="">Todos os produtos</option>'
+
+            if catalogo_pm:
+                op_produtos += '<optgroup label="Plano de Manutenção — aba PM">'
+                for p_nome in catalogo_pm:
+                    valor = "PM|" + p_nome
+                    selecionado = norm(valor) == norm(filtro_produto)
+                    op_produtos += (
+                        f'<option value="{html.escape(valor)}" '
+                        f'{"selected" if selecionado else ""}>{html.escape(p_nome)}</option>'
+                    )
+                op_produtos += '</optgroup>'
+
+            if catalogo_rio:
+                op_produtos += '<optgroup label="Telemetria RIO — aba RIO">'
+                for p_nome in catalogo_rio:
+                    valor = "RIO|" + p_nome
+                    selecionado = norm(valor) == norm(filtro_produto)
+                    op_produtos += (
+                        f'<option value="{html.escape(valor)}" '
+                        f'{"selected" if selecionado else ""}>{html.escape(p_nome)}</option>'
+                    )
+                op_produtos += '</optgroup>'
+
+            op_uf = ""
+            for uf in ("", "PE", "AL"):
+                rotulo = "Todos os estados" if not uf else uf
+                op_uf += f'<option value="{uf}" {"selected" if (filtro_uf == uf or (not filtro_uf and not uf)) else ""}>{rotulo}</option>'
+            if not is_gestao:
+                op_uf = f'<option value="{mapa_regiao.get(norm(usuario_logado), "")}" selected>{mapa_regiao.get(norm(usuario_logado), "Não identificado")}</option>'
+
+            titulo_visao = (
+                f"Visão gerencial consolidada — {perfil_usuario}"
+                if is_gestao
+                else f"Visão individual — {usuario_logado}"
+            )
+
+            linhas_vendas = ""
+            for v in vendas[:150]:
+                anexo = v["anexo"]
+                link_anexo = (
+                    f'<a href="{html.escape(anexo)}" target="_blank" rel="noopener noreferrer" '
+                    f'class="dash-link">Comprovante</a>'
+                    if anexo and anexo.lower() != "nan" else "-"
+                )
+                linhas_vendas += f"""
+                <tr>
+                    <td>{html.escape(v["cliente"] or "-")}</td>
+                    <td>{html.escape(v["modelo"] or "-")}</td>
+                    <td>{html.escape(v["produto"] or "-")}</td>
+                    <td class="num">{v["qtd"]}</td>
+                    <td>{html.escape(v["vendedor"] or "-")}</td>
+                    <td>{html.escape(v["data_txt"] or "-")}</td>
+                    <td>{link_anexo}</td>
+                </tr>
+                """
+            if not linhas_vendas:
+                linhas_vendas = '<tr><td colspan="7" class="empty">Nenhuma venda encontrada para os filtros atuais.</td></tr>'
+
+            linhas_pipeline = ""
+            for n in sorted(negocios_ativos, key=lambda x: x["data"] or datetime.min, reverse=True)[:100]:
+                linhas_pipeline += f"""
+                <tr>
+                    <td><span class="status status-{norm(n["temperatura"]).replace(" ", "-").lower()}">{html.escape(n["temperatura"] or "-")}</span></td>
+                    <td>{html.escape(n["cliente"] or "-")}</td>
+                    <td>{html.escape(n["modelo"] or "-")}</td>
+                    <td>{html.escape(n["produto"] or "-")}</td>
+                    <td>{html.escape(n["vendedor"] or "-")}</td>
+                    <td>{html.escape(n["data_txt"] or "-")}</td>
+                </tr>
+                """
+            if not linhas_pipeline:
+                linhas_pipeline = '<tr><td colspan="6" class="empty">Nenhum negócio ativo encontrado.</td></tr>'
+
+            # Tabela de preços: separa visualmente PREV, MAX e PLUS.
+            linhas_top3_planos = ""
+            ultimo_plano = None
+            for p_plano in top3_planos:
+                plano_atual = str(p_plano.get("plano", "")).strip().upper()
+                if ultimo_plano is not None and plano_atual != ultimo_plano:
+                    linhas_top3_planos += "<tr class=\"plano-separador\"><td colspan=\"5\"></td></tr>"
+                linhas_top3_planos += (
+                    f"<tr>"
+                    f"<td><b>{html.escape(str(p_plano['plano']))}</b></td>"
+                    f"<td>{html.escape(str(p_plano['modelo']))}</td>"
+                    f"<td class='num'>R$ {p_plano['valor']:,.2f}</td>"
+                    f"<td>{html.escape(str(p_plano['periodo'] or '-'))} meses</td>"
+                    f"<td>{html.escape(str(p_plano['km'] or '-'))}</td>"
+                    f"</tr>"
+                )
+                ultimo_plano = plano_atual
+            if not linhas_top3_planos:
+                linhas_top3_planos = '<tr><td colspan="5" class="empty">Nenhum preço mensal disponível na aba PM_Precos.</td></tr>'
+
+            html_dashboard = f"""
+            <style>
+                .dash-wrap{{max-width:1500px;margin:0 auto;padding:4px 0 40px}}
+                .dash-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:16px}}
+                .dash-head h2{{margin:0;color:#002244;font-size:23px;font-weight:800}}
+                .dash-head p{{margin:5px 0 0;color:#64748b;font-size:13px}}
+                .dash-badge{{background:#eef6ff;color:#155e9b;border:1px solid #bfdbfe;border-radius:999px;padding:7px 12px;font-size:11px;font-weight:800}}
+                .dash-filters{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:16px;box-shadow:0 2px 6px rgba(15,23,42,.04)}}
+                .dash-filters-grid{{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px}}
+                .dash-filters label{{display:block;font-size:10px;font-weight:800;color:#64748b;text-transform:uppercase;margin-bottom:5px}}
+                .dash-filters select{{font-size:13px;padding:9px 10px;background:#f8fafc}}
+                .dash-actions{{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}}
+                .dash-btn{{border:0;border-radius:7px;padding:9px 12px;font-weight:700;font-size:12px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px}}
+                .dash-btn-primary{{background:#002244;color:#fff}}
+                .dash-btn-light{{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1}}
+                .dash-kpis{{display:grid;grid-template-columns:repeat(6,minmax(145px,1fr));gap:10px;margin-bottom:16px}}
+                .dash-kpi{{background:#fff;border:1px solid #e2e8f0;border-radius:11px;padding:14px;box-shadow:0 2px 6px rgba(15,23,42,.04);min-height:95px}}
+                .dash-kpi small{{display:block;color:#64748b;font-size:10px;font-weight:800;text-transform:uppercase}}
+                .dash-kpi strong{{display:block;color:#0f172a;font-size:25px;line-height:1.1;margin-top:7px}}
+                .dash-kpi span{{font-size:11px;color:#94a3b8}}
+                .dash-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}}
+                .dash-card{{background:#fff;border:1px solid #e2e8f0;border-radius:11px;padding:14px;box-shadow:0 2px 6px rgba(15,23,42,.04);min-width:0}}
+                .dash-card h3{{font-size:13px;color:#002244;margin:0 0 10px;font-weight:800}}
+                .dash-chart{{height:280px;position:relative}}
+                .dash-table-card{{background:#fff;border:1px solid #e2e8f0;border-radius:11px;padding:14px;margin-bottom:14px}}
+                .dash-table-scroll{{overflow:auto;max-height:460px}}
+                .dash-table{{width:100%;border-collapse:collapse;font-size:12px;min-width:780px}}
+                .dash-table th{{position:sticky;top:0;background:#002244;color:#fff;padding:9px;text-align:left;z-index:1}}
+                .dash-table td{{padding:9px;border-bottom:1px solid #eef2f7;color:#334155}}
+                .dash-table tr.plano-separador td{{padding:0;height:8px;background:#f1f5f9;border-bottom:1px solid #cbd5e1}}
+                .dash-table .num{{text-align:center;font-weight:800}}
+                .dash-link{{color:#0066cc;font-weight:700;text-decoration:none}}
+                .empty{{text-align:center;color:#94a3b8;padding:22px!important}}
+                .status{{display:inline-block;border-radius:999px;padding:4px 7px;font-size:10px;font-weight:800;background:#f1f5f9}}
+                .status-super-quente{{background:#fee2e2;color:#991b1b}}
+                .status-quente{{background:#ffedd5;color:#9a3412}}
+                .status-morno{{background:#fef3c7;color:#92400e}}
+                .status-frio{{background:#e2e8f0;color:#475569}}
+                .dash-note{{font-size:11px;color:#64748b;margin-top:8px;line-height:1.45}}
+                .dash-mini-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}
+                .dash-mini{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px}}
+                .dash-mini b{{display:block;color:#002244;font-size:18px}}
+                .dash-mini span{{font-size:10px;color:#64748b}}
+                @media(max-width:1100px){{.dash-kpis{{grid-template-columns:repeat(3,1fr)}}.dash-filters-grid{{grid-template-columns:repeat(3,1fr)}}}}
+                @media(max-width:760px){{.dash-grid{{grid-template-columns:1fr}}.dash-kpis{{grid-template-columns:repeat(2,1fr)}}.dash-filters-grid{{grid-template-columns:1fr 1fr}}}}
+                @media(max-width:480px){{.dash-kpis{{grid-template-columns:1fr 1fr}}.dash-filters-grid{{grid-template-columns:1fr}}.dash-head h2{{font-size:19px}}}}
+            </style>
+
+            <div class="dash-wrap">
+                <div class="dash-head">
+                    <div>
+                        <h2>📊 Dashboard Executivo</h2>
+                        <p>{html.escape(titulo_visao)} · dados consolidados de Plano de Manutenção e RIO. O filtro Produto usa o catálogo das abas PM e RIO.</p>
+                    </div>
+                    <div class="dash-badge">{"GESTÃO GLOBAL" if is_gestao else "ACESSO INDIVIDUAL"}</div>
+                </div>
+
+                <form class="dash-filters" method="GET" action="/modulo/dashboard">
+                    <div class="dash-filters-grid">
+                        <div><label>Ano</label><select name="ano" onchange="this.form.submit()">{op_anos}</select></div>
+                        <div><label>Período</label><select name="mes" onchange="this.form.submit()">{op_mes}</select></div>
+                        <div><label>Consultor</label><select name="consultor" {"disabled" if not is_gestao else ""} onchange="this.form.submit()">{op_consultores}</select></div>
+                        <div><label>Produto</label><select name="produto" onchange="this.form.submit()">{op_produtos}</select></div>
+                        <div><label>Estado</label><select name="uf" {"disabled" if not is_gestao else ""} onchange="this.form.submit()">{op_uf}</select></div>
+                    </div>
+                    {"<input type='hidden' name='consultor' value='" + html.escape(usuario_logado) + "'>" if not is_gestao else ""}
+                    {"<input type='hidden' name='uf' value='" + html.escape(mapa_regiao.get(norm(usuario_logado), "")) + "'>" if not is_gestao else ""}
+                    <div class="dash-actions">
+                        <a class="dash-btn dash-btn-light" href="/modulo/dashboard">↺ Limpar filtros</a>
+                        <span class="dash-note">O filtro por consultor é aplicado no servidor. Consultores não recebem dados de outros usuários.</span>
+                    </div>
+                </form>
+
+                <div class="dash-kpis">
+                    <div class="dash-kpi"><small>Unidades vendidas</small><strong>{total_unidades}</strong><span>{total_registros_venda} registros de venda</span></div>
+                    <div class="dash-kpi"><small>Negócios ativos</small><strong>{ativos_pipeline}</strong><span>pipeline atual no período</span></div>
+                    <div class="dash-kpi"><small>Negócios fechados</small><strong>{fechados_pipeline}</strong><span>status Fechado</span></div>
+                    <div class="dash-kpi"><small>Negócios perdidos</small><strong>{perdidos_pipeline}</strong><span>status Perdida</span></div>
+                    <div class="dash-kpi"><small>Conversão</small><strong>{taxa_fechamento:.1f}%</strong><span>fechado / (fechado + perdido)</span></div>
+                    <div class="dash-kpi"><small>Comissão PM/RIO</small><strong>R$ {comissao_apm_pm:,.2f}</strong><span>regra APM atual do sistema</span></div>
+                </div>
+
+                <div class="dash-table-card card-planos-manutencao" style="margin-bottom:14px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <h3 style="margin:0;">💰 Menor preço de manutenção por plano</h3>
+                        <span class="dash-note" style="margin:0;">PREV · MAX · PLUS · menor valor mensal de cada modalidade</span>
+                    </div>
+                    <div class="dash-table-scroll" style="margin-top:10px;">
+                        <table class="dash-table">
+                            <thead>
+                                <tr>
+                                    <th>Plano</th>
+                                    <th>Modelo</th>
+                                    <th>Valor mensal</th>
+                                    <th>Tempo</th>
+                                    <th>KM</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {linhas_top3_planos}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="dash-card" style="margin-bottom:14px">
+                    <h3>🔎 Distribuição rápida do pipeline</h3>
+                    <div class="dash-mini-grid">
+                        <div class="dash-mini"><b>{por_temp["Super Quente"]}</b><span>Super Quente</span></div>
+                        <div class="dash-mini"><b>{por_temp["Quente"]}</b><span>Quente</span></div>
+                        <div class="dash-mini"><b>{por_temp["Morno"]}</b><span>Morno</span></div>
+                        <div class="dash-mini"><b>{por_temp["Frio"]}</b><span>Frio</span></div>
+                    </div>
+                    <div class="dash-note">A classificação acima é baseada na coluna TEMPERATURA existente nas abas de negócios.</div>
+                </div>
+
+                <div class="dash-grid">
+                    <div class="dash-card"><h3>📈 Evolução mensal de unidades</h3><div class="dash-chart"><canvas id="dashMes"></canvas></div></div>
+                    <div class="dash-card"><h3>👥 Vendas por consultor</h3><div class="dash-chart"><canvas id="dashConsultor"></canvas></div></div>
+                    <div class="dash-card"><h3>📊 Vendas por plano de manutenção</h3><div class="dash-chart"><canvas id="dashSolucao"></canvas></div></div>
+                    <div class="dash-card"><h3>🛠️ Planos mais vendidos</h3><div class="dash-chart"><canvas id="dashModelo"></canvas></div></div>
+                    <div class="dash-card"><h3>🔥 Temperatura do pipeline</h3><div class="dash-chart"><canvas id="dashTemp"></canvas></div></div>
+                    <div class="dash-card"><h3>⏱️ Aging dos negócios ativos</h3><div class="dash-chart"><canvas id="dashAging"></canvas></div></div>
+                </div>
+
+                <div class="dash-grid">
+                    <div class="dash-table-card">
+                        <h3>🏢 Top clientes por unidades vendidas</h3>
+                        <div class="dash-table-scroll">
+                            <table class="dash-table"><thead><tr><th>Cliente</th><th>Unidades</th></tr></thead><tbody>
+                            {''.join(f"<tr><td>{html.escape(str(c))}</td><td class='num'>{q}</td></tr>" for c,q in top_clientes) or '<tr><td colspan="2" class="empty">Sem dados.</td></tr>'}
+                            </tbody></table>
+                        </div>
+                    </div>
+                    <div class="dash-table-card">
+                        <h3>💰 Resumo de comissão PM</h3>
+                        <div class="dash-mini-grid" style="grid-template-columns:1fr 1fr">
+                            <div class="dash-mini"><b>R$ {comissao_apm_pm:,.2f}</b><span>APM · {qtd_pm} unidades × R$ 250</span></div>
+                            <div class="dash-mini"><b>R$ {comissao_vendedor_pm:,.2f}</b><span>Vendedores · {qtd_pm} unidades × R$ 150</span></div>
+                        </div>
+                        <div class="dash-note">Locação e Consórcio são mostrados em quantidade, pois não há uma regra de comissão dessas fontes definida nas abas consultadas.</div>
+                        {"<div class='dash-note'>Registros de venda idênticos ignorados nesta visualização: <b>" + str(duplicatas) + "</b>.</div>" if duplicatas else ""}
+                    </div>
+                </div>
+
+                <div class="dash-table-card">
+                    <h3>🧾 Últimas vendas do filtro</h3>
+                    <div class="dash-table-scroll">
+                        <table class="dash-table">
+                            <thead><tr><th>Cliente</th><th>Modelo</th><th>Produto</th><th>Qtd.</th><th>Consultor</th><th>Data</th><th>Anexo</th></tr></thead>
+                            <tbody>{linhas_vendas}</tbody>
+                        </table>
+                    </div>
+                    <div class="dash-note">Exibindo até 150 registros nesta tela para preservar velocidade. Os KPIs usam todo o conjunto filtrado.</div>
+                </div>
+
+                <div class="dash-table-card">
+                    <h3>🎯 Negócios ativos para acompanhamento</h3>
+                    <div class="dash-table-scroll">
+                        <table class="dash-table">
+                            <thead><tr><th>Status</th><th>Cliente</th><th>Modelo</th><th>Produto</th><th>Consultor</th><th>Data</th></tr></thead>
+                            <tbody>{linhas_pipeline}</tbody>
+                        </table>
+                    </div>
+                    <div class="dash-note">Exibindo até 100 negócios ativos, ordenados pelos mais recentes.</div>
+                </div>
+            </div>
+
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+            <script>
+            (function(){{
+                const D = {json_dash};
+                const byId = id => document.getElementById(id);
+                const common = {{
+                    responsive:true,
+                    maintainAspectRatio:false,
+                    plugins:{{legend:{{position:'bottom',labels:{{font:{{size:10}}}}}}}}
+                }};
+
+                const meses = Object.keys(D.meses).map(Number);
+                new Chart(byId('dashMes'), {{
+                    type:'line',
+                    data:{{
+                        labels:meses.map(m => D.meses[String(m)].nome.slice(0,3)),
+                        datasets:[{{label:'Unidades',data:meses.map(m=>D.meses[String(m)].qtd),tension:.3,fill:false}}]
+                    }},
+                    options:common
+                }});
+
+                const consultores = Object.keys(D.consultores)
+                    .filter(x => Number(D.consultores[x].qtd) > 0)
+                    .sort((a,b)=>Number(D.consultores[b].qtd)-Number(D.consultores[a].qtd));
+                new Chart(byId('dashConsultor'), {{
+                    type:'bar',
+                    data:{{
+                        labels:consultores,
+                        datasets:[{{label:'Unidades',data:consultores.map(x=>Number(D.consultores[x].qtd))}}]
+                    }},
+                    options:{{
+                        ...common,
+                        scales:{{y:{{beginAtZero:true,ticks:{{precision:0}}}}}},
+                        plugins:{{legend:{{display:false}}}}
+                    }}
+                }});
+
+                const modalidades = ['PREV','MAX','PLUS'];
+                new Chart(byId('dashSolucao'), {{
+                    type:'bar',
+                    data:{{
+                        labels:modalidades,
+                        datasets:[{{label:'Unidades',data:modalidades.map(x=>Number((D.modalidades || {{}})[x] || 0))}}]
+                    }},
+                    options:{{
+                        ...common,
+                        scales:{{y:{{beginAtZero:true,ticks:{{precision:0}}}}}},
+                        plugins:{{legend:{{display:false}}}}
+                    }}
+                }});
+
+                const planos = Object.keys(D.planos || {{}})
+                    .filter(x => Number(D.planos[x]) > 0)
+                    .sort((a,b)=>Number(D.planos[b])-Number(D.planos[a]))
+                    .slice(0,10);
+                new Chart(byId('dashModelo'), {{
+                    type:'bar',
+                    data:{{
+                        labels:planos,
+                        datasets:[{{label:'Unidades',data:planos.map(x=>Number(D.planos[x]))}}]
+                    }},
+                    options:{{
+                        ...common,
+                        scales:{{y:{{beginAtZero:true,ticks:{{precision:0}}}}}},
+                        plugins:{{legend:{{display:false}}}}
+                    }}
+                }});
+
+                const temps = Object.keys(D.temperaturas);
+                new Chart(byId('dashTemp'), {{
+                    type:'doughnut',
+                    data:{{labels:temps,datasets:[{{data:temps.map(x=>D.temperaturas[x])}}]}},
+                    options:common
+                }});
+
+                const aging = Object.keys(D.aging);
+                new Chart(byId('dashAging'), {{
+                    type:'bar',
+                    data:{{labels:aging,datasets:[{{label:'Negócios',data:aging.map(x=>D.aging[x])}}]}},
+                    options:{{...common,plugins:{{legend:{{display:false}}}}}}
+                }});
+            }})();
+            </script>
+            """
+            conteudo = html_dashboard
+
+        except Exception as e:
+            traceback.print_exc()
+            conteudo = f'<div style="color:#c53030;background:#fff5f5;padding:20px;border-radius:8px;border:1px solid #feb2b2"><h3>Erro ao carregar o Dashboard</h3><p>{html.escape(str(e))}</p></div>'
+
+    elif nome_modulo == "traton":
         conteudo = f"""
         <div style="height: calc(100vh - 90px); width: 100%; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); background-color: #ffffff;">
             <iframe src="https://tratonfs.github.io/finance-simulator/" style="width: 100%; height: 100%; border: none;" allowfullscreen></iframe>
@@ -1616,9 +3485,9 @@ def acessar_modulo(nome_modulo):
                 </div>
 
                 <!-- Tabela de Acompanhamento (Somente Leitura) -->
-                <div class="produto-detalhe-card">
-                    <div style="overflow-x: auto;">
-                        <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
+                <div class="produto-detalhe-card negocios-tabela-card">
+                    <div class="negocios-tabela-wrap">
+                        <table class="negocios-tabela">
                             <thead>
                                 <tr style="background: #002244; color: #ffffff;">
                                     <th style="padding: 10px;">Temp.</th>
@@ -2995,10 +4864,24 @@ def acessar_modulo(nome_modulo):
                         }}
                     }});
 
-                    var vendedoresLabels = Object.keys(dadosPainel.vendedores);
-                    vendedoresLabels.sort((a, b) => dadosPainel.vendedores[b].comissao - dadosPainel.vendedores[a].comissao);
-                    var vendComissao = vendedoresLabels.map(v => dadosPainel.vendedores[v].comissao);
-                    var vendQtd = vendedoresLabels.map(v => dadosPainel.vendedores[v].qtd);
+                    var vendedoresLabels = Object.keys(dadosPainel.vendedores || {{}})
+                        .filter(v => v && String(v).trim() !== '');
+                    vendedoresLabels.sort((a, b) => {{
+                        var qtdDiff = (dadosPainel.vendedores[b].qtd || 0) - (dadosPainel.vendedores[a].qtd || 0);
+                        if (qtdDiff !== 0) return qtdDiff;
+                        return (dadosPainel.vendedores[b].comissao || 0) - (dadosPainel.vendedores[a].comissao || 0);
+                    }});
+                    var vendComissao = vendedoresLabels.map(v => Number(dadosPainel.vendedores[v].comissao || 0));
+                    var vendQtd = vendedoresLabels.map(v => Number(dadosPainel.vendedores[v].qtd || 0));
+
+                    var canvasConsultor = document.getElementById('chartRankingVendedores');
+                    if (!vendedoresLabels.length) {{
+                        var ctxConsultor = canvasConsultor.getContext('2d');
+                        ctxConsultor.font = '600 14px Segoe UI, sans-serif';
+                        ctxConsultor.fillStyle = '#718096';
+                        ctxConsultor.textAlign = 'center';
+                        ctxConsultor.fillText('Nenhuma venda encontrada para os filtros atuais', canvasConsultor.width / 2, 150);
+                    }}
 
                     new Chart(document.getElementById('chartRankingVendedores'), {{
                         type: 'bar',
@@ -3019,7 +4902,7 @@ def acessar_modulo(nome_modulo):
                         options: {{ 
                             indexAxis: 'y',
                             responsive: true, maintainAspectRatio: false,
-                            plugins: {{ title: {{ display: true, text: 'Ranking de Vendedores', font: {{ size: 14 }} }} }}
+                            plugins: {{ title: {{ display: true, text: 'Vendas por Consultor', font: {{ size: 14 }} }} }}
                         }}
                     }});
 
@@ -3085,8 +4968,8 @@ def acessar_modulo(nome_modulo):
             try:
                 aba_negocios = planilha.worksheet("Negocios_PM")
             except gspread.exceptions.WorksheetNotFound:
-                aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=10)
-                aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS"])
+                aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=11)
+                aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "CHASSIS", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS"])
             
             sucesso_msg = None
             erro_msg = None
@@ -3097,6 +4980,12 @@ def acessar_modulo(nome_modulo):
             lista_consultores = []
             for u in registros_usuarios:
                 perfil_u = str(u.get("PERFIL", "")).strip().upper()
+                nome_u = str(u.get("NOME", "")).strip()
+                if "CONSULTOR" in perfil_u and nome_u:
+                    if nome_u not in lista_consultores:
+                        lista_consultores.append(nome_u)
+            if not lista_consultores:
+                lista_consultores = [session.get("nome", "Usuário")]
                 nome_u = str(u.get("NOME", "")).strip()
                 if "CONSULTOR" in perfil_u and nome_u:
                     if nome_u not in lista_consultores:
@@ -3125,7 +5014,6 @@ def acessar_modulo(nome_modulo):
                 aba_pm = planilha.worksheet("PM")
                 regs_pm = obter_registros_seguros(aba_pm)
                 for rp in regs_pm:
-                    # Pega o valor da coluna PRODUTO (ou a 2ª coluna do dicionário)
                     val_p = str(rp.get("PRODUTO", list(rp.values())[1] if len(rp) > 1 else (list(rp.values())[0] if rp else ""))).strip()
                     if val_p and val_p not in lista_planos_manutencao and val_p.upper() != "PRODUTO":
                         lista_planos_manutencao.append(val_p)
@@ -3140,7 +5028,6 @@ def acessar_modulo(nome_modulo):
                 aba_rio_origem = planilha.worksheet("RIO")
                 regs_rio = obter_registros_seguros(aba_rio_origem)
                 for rr in regs_rio:
-                    # Pega o valor da coluna PRODUTO (ou a 2ª coluna do dicionário)
                     val_r = str(rr.get("PRODUTO", list(rr.values())[1] if len(rr) > 1 else (list(rr.values())[0] if rr else ""))).strip()
                     if val_r and val_r not in lista_tipos_rio and val_r.upper() != "PRODUTO":
                         lista_tipos_rio.append(val_r)
@@ -3164,6 +5051,7 @@ def acessar_modulo(nome_modulo):
                     vendedor_form = request.form.get("vendedor", "").strip()
                     cliente = request.form.get("cliente", "").strip()
                     modelo = request.form.get("modelo", "").strip()
+                    chassis = request.form.get("chassis", "").strip()  # <--- CAPTURA O CHASSIS
                     plano_manutencao = request.form.get("plano_manutencao", "").strip()
                     rio_val = request.form.get("rio", "").strip()
                     contato = request.form.get("contato", "").strip()
@@ -3171,10 +5059,10 @@ def acessar_modulo(nome_modulo):
                     comentarios = request.form.get("comentarios", "").strip()
 
                     if cliente and vendedor_form:
-                        dados_linha = [temperatura, data_neg, vendedor_form, cliente, modelo, plano_manutencao, rio_val, contato, telefone, comentarios]
+                        dados_linha = [temperatura, data_neg, vendedor_form, cliente, modelo, chassis, plano_manutencao, rio_val, contato, telefone, comentarios]
                         if index_edicao:
                             idx_int = int(index_edicao)
-                            aba_negocios.update(f"A{idx_int}:J{idx_int}", [dados_linha])
+                            aba_negocios.update(f"A{idx_int}:K{idx_int}", [dados_linha])  # <--- ATUALIZADO PARA K
                             sucesso_msg = "Negócio atualizado com sucesso!"
                         else:
                             aba_negocios.append_row(dados_linha)
@@ -3261,7 +5149,7 @@ def acessar_modulo(nome_modulo):
                             a = m_ano.group(1)
                             ano_item = "20" + a if len(a) == 2 else a
                         m_mes = re.search(r'^\d{1,2}/(\d{1,2})/', data_val)
-                        mes_item = m_mes.group(1).zfill(2) if mes_item else ""
+                        mes_item = m_mes.group(1).zfill(2) if m_mes else ""
 
                     if ano_selecionado and ano_item != ano_selecionado:
                         continue
@@ -3297,6 +5185,7 @@ def acessar_modulo(nome_modulo):
                 vend = reg.get('VENDEDOR', '')
                 cli = reg.get('CLIENTE', '')
                 mod = reg.get('MODELO', '')
+                chassis = reg.get('CHASSIS', '')  # <--- LÊ O CHASSIS
                 plano = reg.get('PLANO DE MANUTENÇÃO', '')
                 rio = reg.get('RIO', '')
                 contato = reg.get('CONTATO DO CLIENTE', '')
@@ -3310,7 +5199,7 @@ def acessar_modulo(nome_modulo):
                 botoes_acoes = f"""
                 <div style="display: flex; gap: 4px; align-items: center; justify-content: flex-end;">
                     {btn_venda_direta}
-                    <button type="button" class="btn-acao btn-editar" onclick="carregarParaEdicao({idx_l}, '{temp}', '{dt}', '{vend}', '{cli}', '{mod}', '{plano}', '{rio}', '{contato}', '{tel}', '{com}')">Alterar</button>
+                    <button type="button" class="btn-acao btn-editar" onclick="carregarParaEdicao({idx_l}, '{temp}', '{dt}', '{vend}', '{cli}', '{mod}', '{chassis}', '{plano}', '{rio}', '{contato}', '{tel}', '{com}')">Alterar</button>
                     <button type="button" class="btn-acao btn-excluir" onclick="excluirNegocio({idx_l})">Excluir</button>
                 </div>
                 """
@@ -3322,17 +5211,18 @@ def acessar_modulo(nome_modulo):
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{vend}</td>
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{cli}</td>
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{mod}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{chassis}</td>
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{plano}</td>
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{rio}</td>
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{contato}</td>
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{tel}</td>
                     <td style="padding: 10px; border-bottom: 1px solid #edf2f7; font-size: 12px;">{com}</td>
-                    <td style="padding: 10px; border-bottom: 1px solid #edf2f7;">{botoes_acoes}</td>
+                    <td class="coluna-acoes">{botoes_acoes}</td>
                 </tr>
                 """
 
             if not tabela_linhas:
-                tabela_linhas = '<tr><td colspan="11" style="padding: 20px; text-align: center; color: #718096;">Nenhum registro encontrado.</td></tr>'
+                tabela_linhas = '<tr><td colspan="12" style="padding: 20px; text-align: center; color: #718096;">Nenhum registro encontrado.</td></tr>'
 
             conteudo = f"""
             <div>
@@ -3388,6 +5278,7 @@ def acessar_modulo(nome_modulo):
                                 <div><label>Vendedor</label><select name="vendedor" required>{"".join([f'<option value="{c}">{c}</option>' for c in lista_consultores])}</select></div>
                                 <div><label>Cliente</label><input type="text" name="cliente" placeholder="Nome do Cliente" required></div>
                                 <div><label>Modelo</label><select name="modelo"><option value="">Selecione...</option>{"".join([f'<option value="{m}">{m}</option>' for m in lista_modelos])}</select></div>
+                                <div><label>Chassis</label><input type="text" name="chassis" placeholder="Chassis do veículo"></div>
                                 <div><label>Plano</label><select name="plano_manutencao"><option value="">Nenhum</option>{"".join([f'<option value="{p}">{p}</option>' for p in lista_planos_manutencao])}</select></div>
                             </div>
 
@@ -3431,9 +5322,12 @@ def acessar_modulo(nome_modulo):
                 </div>
 
                 <!-- Tabela de Negócios -->
-                <div class="produto-detalhe-card">
-                    <div style="overflow-x: auto;">
-                        <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
+                <div class="produto-detalhe-card negocios-tabela-card">
+                    <div class="negocios-scroll-top" id="barraScrollNegocios" aria-label="Rolagem horizontal da tabela">
+                        <div class="negocios-scroll-top-inner" id="barraScrollNegociosInner"></div>
+                    </div>
+                    <div class="negocios-tabela-wrap" id="negociosTabelaWrapPrincipal">
+                        <table class="negocios-tabela" id="tabelaNegociosPrincipal">
                             <thead>
                                 <tr style="background: #002244; color: #ffffff;">
                                     <th style="padding: 10px;">Temp.</th>
@@ -3441,12 +5335,13 @@ def acessar_modulo(nome_modulo):
                                     <th style="padding: 10px;">Vendedor</th>
                                     <th style="padding: 10px;">Cliente</th>
                                     <th style="padding: 10px;">Modelo</th>
+                                    <th style="padding: 10px;">Chassis</th>
                                     <th style="padding: 10px;">Plano</th>
                                     <th style="padding: 10px;">RIO</th>
                                     <th style="padding: 10px;">Contato</th>
                                     <th style="padding: 10px;">Telefone</th>
                                     <th style="padding: 10px;">Comentários</th>
-                                    <th style="padding: 10px; text-align: right;">Ações</th>
+                                    <th class="coluna-acoes-header">Ações</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -3458,6 +5353,54 @@ def acessar_modulo(nome_modulo):
             </div>
 
             <script>
+                (function() {{
+                    function iniciarBarraHorizontalNegocios() {{
+                        const barra = document.getElementById('barraScrollNegocios');
+                        const interna = document.getElementById('barraScrollNegociosInner');
+                        const tabelaWrap = document.getElementById('negociosTabelaWrapPrincipal');
+                        const tabela = document.getElementById('tabelaNegociosPrincipal');
+
+                        if (!barra || !interna || !tabelaWrap || !tabela) return;
+
+                        function sincronizarLargura() {{
+                            interna.style.width = Math.max(tabela.scrollWidth, 1450) + 'px';
+                        }}
+
+                        let sincronizando = false;
+
+                        barra.addEventListener('scroll', function() {{
+                            if (sincronizando) return;
+                            sincronizando = true;
+                            tabelaWrap.scrollLeft = barra.scrollLeft;
+                            sincronizando = false;
+                        }});
+
+                        tabelaWrap.addEventListener('scroll', function() {{
+                            if (sincronizando) return;
+                            sincronizando = true;
+                            barra.scrollLeft = tabelaWrap.scrollLeft;
+                            sincronizando = false;
+                        }});
+
+                        sincronizarLargura();
+                        window.addEventListener('resize', sincronizarLargura);
+
+                        // Shift + roda do mouse também movimenta a tabela.
+                        tabelaWrap.addEventListener('wheel', function(e) {{
+                            if (e.shiftKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {{
+                                e.preventDefault();
+                                tabelaWrap.scrollLeft += e.deltaY;
+                            }}
+                        }}, {{passive:false}});
+                    }}
+
+                    if (document.readyState === 'loading') {{
+                        document.addEventListener('DOMContentLoaded', iniciarBarraHorizontalNegocios);
+                    }} else {{
+                        iniciarBarraHorizontalNegocios();
+                    }}
+                }})();
+
                 function toggleFormularioNegocio() {{
                     var container = document.getElementById('containerFormulario');
                     var icone = document.getElementById('iconeSanfona');
@@ -3470,7 +5413,7 @@ def acessar_modulo(nome_modulo):
                     }}
                 }}
 
-                function carregarParaEdicao(idx, temp, dt, vend, cli, mod, plano, rio, contato, tel, com) {{
+                function carregarParaEdicao(idx, temp, dt, vend, cli, mod, chassis, plano, rio, contato, tel, com) {{
                     var container = document.getElementById('containerFormulario');
                     container.style.display = 'block';
                     document.getElementById('iconeSanfona').innerHTML = '▼';
@@ -3485,6 +5428,7 @@ def acessar_modulo(nome_modulo):
                     document.querySelector('[name="vendedor"]').value = vend;
                     document.querySelector('[name="cliente"]').value = cli;
                     document.querySelector('[name="modelo"]').value = mod;
+                    document.querySelector('[name="chassis"]').value = chassis;
                     document.querySelector('[name="plano_manutencao"]').value = plano;
                     document.querySelector('[name="rio"]').value = rio;
                     document.querySelector('[name="contato"]').value = contato;
@@ -3545,10 +5489,60 @@ def acessar_modulo(nome_modulo):
                 function sincronizarParaVendas(idx, cliente, produto, data, modelo, vendedor) {{
                     // Opcional para negócios fechados
                 }}
+                
+                function cancelarEdicao() {{
+                    document.getElementById('editIndexInput').value = "";
+                    document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
+                    document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
+                    document.getElementById('btnCancelarEdicao').style.display = "none";
+                    document.getElementById('containerFormulario').style.display = 'none';
+                    document.getElementById('iconeSanfona').innerHTML = '▶';
+                }}
+
+                function aplicarFiltrosNegocios() {{
+                    var busca = document.getElementById('filtroBusca').value;
+                    var vend = document.getElementById('filtroVend').value;
+                    var ano = document.getElementById('filtroAno').value;
+                    var periodo = document.getElementById('filtroPeriodo').value;
+                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
+                }}
+
+                function filtrarTemp(temp) {{
+                    var busca = document.getElementById('filtroBusca').value;
+                    var vend = document.getElementById('filtroVend').value;
+                    var ano = document.getElementById('filtroAno').value;
+                    var periodo = document.getElementById('filtroPeriodo').value;
+                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
+                }}
+
+                function excluirNegocio(idx) {{
+                    if (confirm("Deseja realmente excluir este negócio?")) {{
+                        var form = document.createElement('form');
+                        form.method = 'POST';
+                        form.action = '/modulo/negocios';
+                        
+                        var inputAcao = document.createElement('input');
+                        inputAcao.type = 'hidden';
+                        inputAcao.name = 'acao_form';
+                        inputAcao.value = 'excluir';
+                        form.appendChild(inputAcao);
+
+                        var inputIdx = document.createElement('input');
+                        inputIdx.type = 'hidden';
+                        inputIdx.name = 'index_linha';
+                        inputIdx.value = idx;
+                        form.appendChild(inputIdx);
+
+                        document.body.appendChild(form);
+                        form.submit();
+                    }}
+                }}
             </script>
             """
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px;"><b>Erro ao carregar Negócios:</b> {e}</div>'
+    
+
 
     elif nome_modulo == "rio":
         produto_selecionado = request.args.get("produto")
@@ -4315,7 +6309,7 @@ def limpar_cache():
     CACHE_IA["timestamp"] = 0
     
     CACHE_PLANILHAS["dados"] = {}
-    CACHE_PLANILHAS["timestamp"] = 0
+    CACHE_PLANILHAS["timestamps"] = {}
     
     return jsonify({"mensagem": "Base de dados, cache de planilhas e IA atualizados com sucesso!"})
 
@@ -4344,7 +6338,7 @@ def chat_ia():
     try:
         agora = time.time()
         
-        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > 1800):
+        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
             print("🔄 IA: Atualizando cache otimizado...")
             planilha = conectar_google_sheets()
             contexto_abas = []
@@ -4354,7 +6348,11 @@ def chat_ia():
             for nome_aba in abas_essenciais:
                 try:
                     registros = obter_registros_com_cache(planilha, nome_aba)
-                    linhas_texto = [f"- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()]) for reg in registros[:15]]
+                    limite_registros = 30 if nome_aba in ("PM_Precos", "Informes", "Argumentos") else 20
+                    linhas_texto = [
+                        "- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()])
+                        for reg in registros[:limite_registros]
+                    ]
                     contexto_abas.append(f"### {nome_aba}\n" + "\n".join(linhas_texto))
                 except Exception:
                     pass
@@ -4399,6 +6397,106 @@ def chat_ia():
         print(f"Erro na IA: {e}")
         traceback.print_exc()
         return jsonify({"resposta": "Desculpe, ocorreu um erro interno de conexão. Tente novamente mais tarde."})
+
+
+@app.route("/api/atualizacoes", methods=["GET"])
+def api_atualizacoes():
+    """Retorna atualizações leves: Informes e arquivos recentes do Drive.
+    Não baixa nem interpreta PDFs; apenas usa metadados.
+    """
+    if not session.get("logado"):
+        return jsonify({"atualizacoes": [], "nao_lidas": 0}), 401
+
+    try:
+        limite = max(1, min(int(request.args.get("limite", 12)), 30))
+    except ValueError:
+        limite = 12
+
+    atualizacoes = []
+
+    # Informes/circulares já estruturados na planilha.
+    try:
+        planilha = conectar_google_sheets()
+        informes = obter_registros_com_cache(planilha, "Informes", ttl=120)
+        for i, item in enumerate(informes):
+            assunto = str(item.get("ASSUNTO", "")).strip()
+            info = str(item.get("INFORMAÇÃO", "") or item.get("INFORMACAO", "")).strip()
+            circular = str(item.get("CIRCULAR", "")).strip()
+            if not assunto and not circular:
+                continue
+
+            link = circular
+            if circular:
+                _, mapa_drive = obter_conteudo_pastas_drive()
+                link = mapa_drive.get(circular.lower(), circular)
+
+            atualizacoes.append({
+                "id": f"informe:{i}:{assunto}",
+                "tipo": "Informe",
+                "titulo": assunto or "Novo comunicado",
+                "descricao": info[:180] if info else "Comunicado disponível.",
+                "data": "",
+                "link": link if link.startswith("http") else "",
+            })
+    except Exception as e:
+        print(f"API atualizações: erro nos Informes: {e}")
+
+    # Metadados do Drive: detecta arquivos modificados sem fazer download.
+    try:
+        if "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
+            credenciais_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+            credenciais = Credentials.from_service_account_info(credenciais_dict, scopes=escopos)
+        else:
+            credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
+
+        service = build("drive", "v3", credentials=credenciais)
+        resposta = service.files().list(
+            q="trashed = false",
+            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)",
+            orderBy="modifiedTime desc",
+            pageSize=20,
+        ).execute()
+
+        for arq in resposta.get("files", []):
+            nome = str(arq.get("name", "")).strip()
+            mime = str(arq.get("mimeType", "")).lower()
+            if not nome:
+                continue
+
+            eh_pdf = mime == "application/pdf" or nome.lower().endswith(".pdf")
+            eh_planilha = (
+                "spreadsheet" in mime
+                or nome.lower().endswith((".xlsx", ".xls", ".csv"))
+            )
+            if not (eh_pdf or eh_planilha):
+                continue
+
+            atualizacoes.append({
+                "id": f"drive:{arq.get('id','')}:{arq.get('modifiedTime','')}",
+                "tipo": "PDF" if eh_pdf else "Planilha",
+                "titulo": nome,
+                "descricao": "Arquivo modificado recentemente no Google Drive.",
+                "data": arq.get("modifiedTime", ""),
+                "link": arq.get("webViewLink", "") or (
+                    f"https://drive.google.com/open?id={arq.get('id','')}"
+                    if arq.get("id") else ""
+                ),
+            })
+    except Exception as e:
+        print(f"API atualizações: erro no Drive: {e}")
+
+    # Remove duplicatas e limita o retorno.
+    vistos = set()
+    final = []
+    for item in atualizacoes:
+        if item["id"] in vistos:
+            continue
+        vistos.add(item["id"])
+        final.append(item)
+
+    final = final[:limite]
+    return jsonify({"atualizacoes": final, "nao_lidas": len(final)})
+
 
 @app.route("/logout", methods=["GET", "POST"])
 def logout():

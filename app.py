@@ -7,7 +7,10 @@ import traceback
 import json
 import unicodedata
 import html
-from google import genai
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
@@ -115,6 +118,8 @@ def criar_cliente_gemini():
                 pass
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY não configurada no ambiente ou .env.")
+    if genai is None:
+        raise RuntimeError("Pacote google-genai não instalado. Instale-o para habilitar o Assistente de IA.")
     return genai.Client(api_key=api_key)
 
 
@@ -2035,10 +2040,23 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
 
-            # Garante que a aba Campanhas_VW existe
-            try:
-                aba_campanhas_vw = planilha.worksheet("Campanhas_VW")
-            except gspread.exceptions.WorksheetNotFound:
+            # Localiza a aba de campanha mesmo quando a planilha usa outro nome.
+            # Isso evita criar uma segunda aba e perder o STATUS já informado pelo usuário.
+            nomes_aba_campanha = (
+                "Campanhas_VW",
+                "CAMPANHA vw prev",
+                "Campanha VW PREV",
+                "CAMPANHA VW PREV",
+            )
+            aba_campanhas_vw = None
+            for nome_aba in nomes_aba_campanha:
+                try:
+                    aba_campanhas_vw = planilha.worksheet(nome_aba)
+                    break
+                except gspread.exceptions.WorksheetNotFound:
+                    continue
+
+            if aba_campanhas_vw is None:
                 aba_campanhas_vw = planilha.add_worksheet(title="Campanhas_VW", rows=1000, cols=10)
                 aba_campanhas_vw.append_row(["DATA", "CIRCULAR", "CONSULTOR", "EMPRESA", "CHASSIS", "MODELOS", "G MANUTENÇÃO", "PLANO DE MANUTENÇÃO", "RIO", "STATUS"])
 
@@ -2608,6 +2626,7 @@ def acessar_modulo(nome_modulo):
                     "%d-%m-%Y", "%d-%m-%y",
                     "%m/%d/%Y", "%m/%d/%y"
                 )
+
                 for fmt in formatos:
                     try:
                         return datetime.strptime(s.split(" ")[0] if " " in s and fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y", "%m/%d/%Y", "%m/%d/%y") else s, fmt)
@@ -2641,9 +2660,15 @@ def acessar_modulo(nome_modulo):
 
             # Dashboard atual: somente Plano de Manutenção / RIO.
             # Locação e Consórcio permanecem fora desta visão por enquanto.
+            # Lê Vendas_PM e Negocios_PM diretamente a cada abertura do dashboard.
+            # Assim os KPIs sempre são recalculados sobre os dados atuais e,
+            # principalmente, obedecem aos filtros de ano, período, consultor,
+            # produto e estado aplicados logo abaixo.
             vendas_pm = carregar_aba("Vendas_PM")
+            neg_pm = carregar_aba("Negocios_PM")
+
+            # As tabelas auxiliares continuam usando o carregamento consolidado.
             dados_login = carregar_dados_login()
-            neg_pm = dados_login.get("Negocios_PM", [])
             usuarios = dados_login.get("Usuarios", [])
             pm_precos_dashboard = dados_login.get("PM_Precos", [])
             top3_planos = obter_top3_planos_melhor_preco(pm_precos_dashboard)
@@ -2754,7 +2779,14 @@ def acessar_modulo(nome_modulo):
                 return fp in norm(produto) or fp in norm(plano) or fp in norm(rio)
 
             # ------------------------------------------------------------
-            # Normalização das vendas
+            # 1. Carrega lista dinâmica de produtos RIO cadastrados na aba RIO
+            # ------------------------------------------------------------
+            catalogo_rio_lista = [norm(p) for p in catalogo_rio if p]
+            # Termos chave padrão de fallback para segurança
+            termos_rio_padrao = ["RIO", "DIAGNOSTICO", "PERFORMANCE", "BROKER", "GEO", "ANÁLISE", "ANALISE"]
+
+            # ------------------------------------------------------------
+            # 2. Normalização e Leitura das Vendas (Vendas_PM)
             # ------------------------------------------------------------
             fontes_vendas = (
                 ("Plano de Manutenção / RIO", "PM", vendas_pm),
@@ -2764,25 +2796,30 @@ def acessar_modulo(nome_modulo):
             for solucao, origem, registros in fontes_vendas:
                 for r in registros:
                     vendedor = str(r.get("VENDEDOR", "")).strip()
-                    dt = parse_data(r.get("DATA DA VENDA"))
+                    dt = parse_data(r.get("DATA DA VENDA") or r.get("DATA"))
                     produto = str(r.get("PRODUTO", "")).strip() or solucao
+                    
+                    # Captura Plano (Coluna B) e RIO (Coluna C) com suporte a nomes antigos e novos
                     plano_manutencao = str(
-                        r.get("PLANO DE MANUTENÇÃO", "")
-                        or r.get("PLANO")
+                        r.get("P. MANUTENÇÃO", "")
+                        or r.get("PLANO DE MANUTENÇÃO", "")
+                        or r.get("PLANO", "")
                         or r.get("PLANO MANUTENCAO", "")
                     ).strip()
+
+                    rio_val = str(r.get("RIO", "")).strip()
+
                     if not passa_pessoa(vendedor) or not passa_uf(vendedor):
                         continue
                     if not passa_data(dt):
                         continue
-                    if not passa_produto(produto, origem=origem, plano="", rio=""):
+                    if not passa_produto(produto, origem=origem, plano=plano_manutencao, rio=rio_val):
                         continue
 
                     qtd = qtd_valor(r.get("QUANTIDADE", 1))
                     cliente = str(r.get("CLIENTE", "")).strip()
                     modelo = str(r.get("MODELO", "")).strip()
-                    # Chave de duplicidade: não usa apenas cliente, pois o mesmo
-                    # cliente pode ter mais de uma venda legítima.
+                    
                     chave = (
                         norm(origem), norm(cliente), norm(produto),
                         norm(modelo), norm(vendedor),
@@ -2794,6 +2831,7 @@ def acessar_modulo(nome_modulo):
                         "cliente": cliente,
                         "produto": produto,
                         "plano": plano_manutencao,
+                        "rio": rio_val,
                         "modelo": modelo,
                         "qtd": qtd,
                         "vendedor": vendedor,
@@ -2803,17 +2841,78 @@ def acessar_modulo(nome_modulo):
                         "chave": chave,
                     })
 
-            # Dedupe somente de registros efetivamente idênticos.
+            # Dedupe de registros idênticos
             vendas_unicas = {}
             duplicatas = 0
             for v in vendas:
                 if v["chave"] in vendas_unicas:
                     duplicatas += 1
-                    # Mantém o registro já conhecido para não inflar KPIs.
                     continue
                 vendas_unicas[v["chave"]] = v
             vendas = list(vendas_unicas.values())
             vendas.sort(key=lambda x: x["data"] or datetime.min, reverse=True)
+
+            # ------------------------------------------------------------
+            # 3. PLANOS E TELEMETRIA RIO (Cálculo dos KPIs Dinâmicos)
+            # ------------------------------------------------------------
+            total_planos_vendidos = 0
+            total_unidades_planos = 0
+            qtd_prev = 0
+            qtd_max = 0
+            qtd_plus = 0
+            qtd_rio = 0
+
+            for v in vendas:
+                qtd_venda = v.get("qtd", 1)
+                total_unidades_planos += qtd_venda
+
+                texto_plano = norm(str(v.get("plano", "")))
+                texto_rio = norm(str(v.get("rio", "")))
+                texto_produto = norm(str(v.get("produto", "")))
+                texto_anexo = norm(str(v.get("anexo", "")))
+                
+                texto_geral_plano = f"{texto_plano} {texto_produto}"
+                texto_geral_rio = f"{texto_rio} {texto_produto} {texto_anexo}"
+
+                # --- A. Contabilização do PLANO DE MANUTENÇÃO ---
+                if "PREV" in texto_geral_plano:
+                    qtd_prev += qtd_venda
+                    total_planos_vendidos += qtd_venda
+                elif "MAX" in texto_geral_plano:
+                    qtd_max += qtd_venda
+                    total_planos_vendidos += qtd_venda
+                elif "PLUS" in texto_geral_plano:
+                    qtd_plus += qtd_venda
+                    total_planos_vendidos += qtd_venda
+
+                # --- B. Contabilização DINÂMICA da TELEMETRIA RIO ---
+                # Verifica se o texto da coluna RIO (ou Produto) coincide com
+                # qualquer item da aba RIO ou qualquer palavra-chave da família RIO
+                tem_rio = False
+
+                if len(texto_rio) > 0 and texto_rio not in ["-", "NENHUM", "NAO", "NÃO"]:
+                    tem_rio = True
+                else:
+                    # Checagem contra o catálogo da aba RIO
+                    for prod_rio in catalogo_rio_lista:
+                        if prod_rio and prod_rio in texto_geral_rio:
+                            tem_rio = True
+                            break
+                    
+                    # Checagem contra termos de fallback (GEO, Broker, Performance, etc.)
+                    if not tem_rio:
+                        for termo in termos_rio_padrao:
+                            if termo in texto_geral_rio:
+                                tem_rio = True
+                                break
+
+                if tem_rio:
+                    qtd_rio += qtd_venda
+            # A conversão NÃO usa mais o total de planos como denominador.
+            # O denominador correto é calculado abaixo, depois da leitura
+            # do pipeline, somando caminhões em andamento + fechados + perdidos.
+            taxa_conversao_plano = 0.0
+
 
             # ------------------------------------------------------------
             # Normalização dos negócios/pipeline
@@ -2857,17 +2956,96 @@ def acessar_modulo(nome_modulo):
                     })
 
             # ------------------------------------------------------------
+            # CORREÇÃO DO RIO
+            # ------------------------------------------------------------
+            # Em alguns registros o RIO fica gravado somente na coluna
+            # "RIO" da aba Negocios_PM, enquanto na Vendas_PM o produto
+            # pode trazer apenas o plano. Para não perder essas vendas,
+            # usamos também o campo RIO dos negócios FECHADOS.
+            #
+            # Não somamos novamente uma venda que já foi identificada na
+            # Vendas_PM. A chave abaixo evita duplicidade.
+            chaves_rio_vendas = set()
+            for v in vendas:
+                texto_v = norm(" ".join([
+                    str(v.get("produto", "")),
+                    str(v.get("plano", "")),
+                    str(v.get("anexo", ""))
+                ]))
+                if "RIO" in texto_v or "REMOTE DIAGNOSIS" in texto_v or "PERFORMANCE" in texto_v:
+                    chave_rio = (
+                        norm(v.get("cliente", "")),
+                        norm(v.get("modelo", "")),
+                        norm(v.get("vendedor", "")),
+                        v.get("data").strftime("%Y-%m-%d") if v.get("data") else ""
+                    )
+                    chaves_rio_vendas.add(chave_rio)
+
+            for n in negocios:
+                if n.get("temperatura_norm") != "FECHADO":
+                    continue
+
+                texto_rio_negocio = norm(str(n.get("produto", "")))
+                # O campo RIO já foi incorporado ao produto em negocios.
+                # Aceitamos também a descrição completa do RIO.
+                if not (
+                    "RIO" in texto_rio_negocio
+                    or "REMOTE DIAGNOSIS" in texto_rio_negocio
+                    or "PERFORMANCE" in texto_rio_negocio
+                ):
+                    continue
+
+                chave_rio = (
+                    norm(n.get("cliente", "")),
+                    norm(n.get("modelo", "")),
+                    norm(n.get("vendedor", "")),
+                    n.get("data").strftime("%Y-%m-%d") if n.get("data") else ""
+                )
+
+                if chave_rio not in chaves_rio_vendas:
+                    qtd_rio += 1
+                    chaves_rio_vendas.add(chave_rio)
+
+            # ------------------------------------------------------------
             # KPIs
             # ------------------------------------------------------------
-            total_unidades = sum(v["qtd"] for v in vendas)
+            # Quantidade de planos vendidos: vem da aba Vendas_PM.
+            # Não deve ser confundida com quantidade de caminhões vendidos.
+            total_unidades_planos = sum(v["qtd"] for v in vendas)
             total_registros_venda = len(vendas)
+
+            # Quantidade de caminhões vendidos no período.
+            # Regra solicitada: em andamento + fechados + perdidos.
             total_pipeline = len(negocios)
 
-            fechados_pipeline = sum(1 for n in negocios if n["temperatura_norm"] == "FECHADO")
-            perdidos_pipeline = sum(1 for n in negocios if n["temperatura_norm"] == "PERDIDA")
+            fechados_pipeline = sum(
+                1 for n in negocios
+                if n["temperatura_norm"] == "FECHADO"
+            )
+            perdidos_pipeline = sum(
+                1 for n in negocios
+                if n["temperatura_norm"] == "PERDIDA"
+            )
             ativos_pipeline = sum(
                 1 for n in negocios
                 if n["temperatura_norm"] not in ("FECHADO", "PERDIDA")
+            )
+
+            # IMPORTANTE: estes três valores são calculados APÓS a aplicação
+            # de todos os filtros em `negocios`. Portanto, o KPI respeita
+            # exatamente Ano + Período + Consultor + Produto + Estado.
+            #
+            # Total de vendas de caminhão = em andamento + fechadas + perdidas.
+            total_vendas_caminhao = (
+                ativos_pipeline + fechados_pipeline + perdidos_pipeline
+            )
+
+            # Meta: 20% dos caminhões do contexto filtrado devem possuir
+            # PREV, MAX ou PLUS.
+            meta_planos_20 = total_vendas_caminhao * 0.20
+            taxa_conversao_plano = (
+                total_planos_vendidos / total_vendas_caminhao * 100
+                if total_vendas_caminhao > 0 else 0.0
             )
 
             desfechos = fechados_pipeline + perdidos_pipeline
@@ -2981,8 +3159,11 @@ def acessar_modulo(nome_modulo):
             # ------------------------------------------------------------
             dashboard_data = {
                 "resumo": {
-                    "unidades": total_unidades,
+                    "unidades": total_unidades_planos,
                     "vendas": total_registros_venda,
+                    "total_planos_vendidos": total_planos_vendidos,
+                    "total_vendas_caminhao": total_vendas_caminhao,
+                    "meta_planos_20": round(meta_planos_20, 1),
                     "pipeline": total_pipeline,
                     "ativos": ativos_pipeline,
                     "fechados_pipeline": fechados_pipeline,
@@ -3198,13 +3379,18 @@ def acessar_modulo(nome_modulo):
                     </div>
                 </form>
 
-                <div class="dash-kpis">
-                    <div class="dash-kpi"><small>Unidades vendidas</small><strong>{total_unidades}</strong><span>{total_registros_venda} registros de venda</span></div>
-                    <div class="dash-kpi"><small>Negócios ativos</small><strong>{ativos_pipeline}</strong><span>pipeline atual no período</span></div>
-                    <div class="dash-kpi"><small>Negócios fechados</small><strong>{fechados_pipeline}</strong><span>status Fechado</span></div>
-                    <div class="dash-kpi"><small>Negócios perdidos</small><strong>{perdidos_pipeline}</strong><span>status Perdida</span></div>
-                    <div class="dash-kpi"><small>Conversão</small><strong>{taxa_fechamento:.1f}%</strong><span>fechado / (fechado + perdido)</span></div>
-                    <div class="dash-kpi"><small>Comissão PM/RIO</small><strong>R$ {comissao_apm_pm:,.2f}</strong><span>regra APM atual do sistema</span></div>
+                <div class="dash-kpis" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));">
+                    <div class="dash-kpi"><small>Total de Vendas de Caminhão</small><strong>{total_vendas_caminhao}</strong><span>em andamento + fechadas + perdidas</span></div>
+                    <div class="dash-kpi"><small>Total de Planos Vendidos</small><strong>{total_planos_vendidos}</strong><span>PREV + MAX + PLUS</span></div>
+                    <div class="dash-kpi"><small>Planos Prev</small><strong>{qtd_prev}</strong><span>modalidade Prev</span></div>
+                    <div class="dash-kpi"><small>Planos Max</small><strong>{qtd_max}</strong><span>modalidade Max</span></div>
+                    <div class="dash-kpi"><small>Planos Plus</small><strong>{qtd_plus}</strong><span>modalidade Plus</span></div>
+                    <div class="dash-kpi"><small>Telemetria RIO</small><strong>{qtd_rio}</strong><span>vendas com RIO</span></div>
+                    <div class="dash-kpi" style="border-left: 4px solid {'#38a169' if taxa_conversao_plano >= 20 else '#e53e3e'};">
+                        <small>Conversão em Plano</small>
+                        <strong>{taxa_conversao_plano:.1f}%</strong>
+                        <span>meta mínima: 20%</span>
+                    </div>
                 </div>
 
                 <div class="dash-table-card card-planos-manutencao" style="margin-bottom:14px">
@@ -4864,15 +5050,15 @@ def acessar_modulo(nome_modulo):
                         }}
                     }});
 
-                    var vendedoresLabels = Object.keys(dadosPainel.vendedores || {{}})
+                    var vendedoresLabels = Object.keys(dadosPainel.consultores || {{}})
                         .filter(v => v && String(v).trim() !== '');
                     vendedoresLabels.sort((a, b) => {{
-                        var qtdDiff = (dadosPainel.vendedores[b].qtd || 0) - (dadosPainel.vendedores[a].qtd || 0);
+                        var qtdDiff = (dadosPainel.consultores[b].qtd || 0) - (dadosPainel.consultores[a].qtd || 0);
                         if (qtdDiff !== 0) return qtdDiff;
-                        return (dadosPainel.vendedores[b].comissao || 0) - (dadosPainel.vendedores[a].comissao || 0);
+                        return (dadosPainel.consultores[b].qtd || 0) - (dadosPainel.consultores[a].qtd || 0);
                     }});
-                    var vendComissao = vendedoresLabels.map(v => Number(dadosPainel.vendedores[v].comissao || 0));
-                    var vendQtd = vendedoresLabels.map(v => Number(dadosPainel.vendedores[v].qtd || 0));
+                    var vendComissao = vendedoresLabels.map(v => Number(dadosPainel.consultores[v].qtd || 0));
+                    var vendQtd = vendedoresLabels.map(v => Number(dadosPainel.consultores[v].qtd || 0));
 
                     var canvasConsultor = document.getElementById('chartRankingVendedores');
                     if (!vendedoresLabels.length) {{
@@ -4888,14 +5074,14 @@ def acessar_modulo(nome_modulo):
                         data: {{ 
                             labels: vendedoresLabels, 
                             datasets: [{{ 
-                                label: 'Total Pago ao Vendedor (R$)', 
+                                label: 'Vendas por Consultor (unidades)', 
                                 data: vendComissao, 
                                 backgroundColor: '#002244',
                                 datalabels: {{
                                     anchor: 'start', 
                                     align: 'end',
                                     color: '#ffffff',
-                                    formatter: (val, ctx) => 'Qtd: ' + vendQtd[ctx.dataIndex] + ' | R$ ' + val.toLocaleString('pt-BR')
+                                    formatter: (val, ctx) => String(vendQtd[ctx.dataIndex]) + ' un'
                                 }}
                             }}] 
                         }},
@@ -4984,12 +5170,7 @@ def acessar_modulo(nome_modulo):
                 if "CONSULTOR" in perfil_u and nome_u:
                     if nome_u not in lista_consultores:
                         lista_consultores.append(nome_u)
-            if not lista_consultores:
-                lista_consultores = [session.get("nome", "Usuário")]
-                nome_u = str(u.get("NOME", "")).strip()
-                if "CONSULTOR" in perfil_u and nome_u:
-                    if nome_u not in lista_consultores:
-                        lista_consultores.append(nome_u)
+            
             if not lista_consultores:
                 lista_consultores = [session.get("nome", "Usuário")]
 
@@ -5352,192 +5533,151 @@ def acessar_modulo(nome_modulo):
                 </div>
             </div>
 
-            <script>
-                (function() {{
-                    function iniciarBarraHorizontalNegocios() {{
-                        const barra = document.getElementById('barraScrollNegocios');
-                        const interna = document.getElementById('barraScrollNegociosInner');
-                        const tabelaWrap = document.getElementById('negociosTabelaWrapPrincipal');
-                        const tabela = document.getElementById('tabelaNegociosPrincipal');
+           <script>
+    (function() {{
+        function iniciarBarraHorizontalNegocios() {{
+            const barra = document.getElementById('barraScrollNegocios');
+            const interna = document.getElementById('barraScrollNegociosInner');
+            const tabelaWrap = document.getElementById('negociosTabelaWrapPrincipal');
+            const tabela = document.getElementById('tabelaNegociosPrincipal');
 
-                        if (!barra || !interna || !tabelaWrap || !tabela) return;
+            if (!barra || !interna || !tabelaWrap || !tabela) return;
 
-                        function sincronizarLargura() {{
-                            interna.style.width = Math.max(tabela.scrollWidth, 1450) + 'px';
-                        }}
+            function sincronizarLargura() {{
+                interna.style.width = Math.max(tabela.scrollWidth, 1450) + 'px';
+            }}
 
-                        let sincronizando = false;
+            let sincronizando = false;
 
-                        barra.addEventListener('scroll', function() {{
-                            if (sincronizando) return;
-                            sincronizando = true;
-                            tabelaWrap.scrollLeft = barra.scrollLeft;
-                            sincronizando = false;
-                        }});
+            barra.addEventListener('scroll', function() {{
+                if (sincronizando) return;
+                sincronizando = true;
+                tabelaWrap.scrollLeft = barra.scrollLeft;
+                sincronizando = false;
+            }});
 
-                        tabelaWrap.addEventListener('scroll', function() {{
-                            if (sincronizando) return;
-                            sincronizando = true;
-                            barra.scrollLeft = tabelaWrap.scrollLeft;
-                            sincronizando = false;
-                        }});
+            tabelaWrap.addEventListener('scroll', function() {{
+                if (sincronizando) return;
+                sincronizando = true;
+                barra.scrollLeft = tabelaWrap.scrollLeft;
+                sincronizando = false;
+            }});
 
-                        sincronizarLargura();
-                        window.addEventListener('resize', sincronizarLargura);
+            sincronizarLargura();
+            window.addEventListener('resize', sincronizarLargura);
 
-                        // Shift + roda do mouse também movimenta a tabela.
-                        tabelaWrap.addEventListener('wheel', function(e) {{
-                            if (e.shiftKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {{
-                                e.preventDefault();
-                                tabelaWrap.scrollLeft += e.deltaY;
-                            }}
-                        }}, {{passive:false}});
-                    }}
-
-                    if (document.readyState === 'loading') {{
-                        document.addEventListener('DOMContentLoaded', iniciarBarraHorizontalNegocios);
-                    }} else {{
-                        iniciarBarraHorizontalNegocios();
-                    }}
-                }})();
-
-                function toggleFormularioNegocio() {{
-                    var container = document.getElementById('containerFormulario');
-                    var icone = document.getElementById('iconeSanfona');
-                    if (container.style.display === 'none') {{
-                        container.style.display = 'block';
-                        icone.innerHTML = '▼';
-                    }} else {{
-                        container.style.display = 'none';
-                        icone.innerHTML = '▶';
-                    }}
+            // Shift + roda do mouse também movimenta a tabela.
+            tabelaWrap.addEventListener('wheel', function(e) {{
+                if (e.shiftKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {{
+                    e.preventDefault();
+                    tabelaWrap.scrollLeft += e.deltaY;
                 }}
+            }}, {{passive: false}});
+        }}
 
-                function carregarParaEdicao(idx, temp, dt, vend, cli, mod, chassis, plano, rio, contato, tel, com) {{
-                    var container = document.getElementById('containerFormulario');
-                    container.style.display = 'block';
-                    document.getElementById('iconeSanfona').innerHTML = '▼';
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', iniciarBarraHorizontalNegocios);
+        }} else {{
+            iniciarBarraHorizontalNegocios();
+        }}
+    }})();
 
-                    document.getElementById('editIndexInput').value = idx;
-                    document.getElementById('tituloBotaoSanfona').innerText = "✏️ Alterar Negociação (Linha " + idx + ")";
-                    document.getElementById('btnSubmitForm').innerText = "Atualizar Negociação";
-                    document.getElementById('btnCancelarEdicao').style.display = "inline-block";
+    function toggleFormularioNegocio() {{
+        var container = document.getElementById('containerFormulario');
+        var icone = document.getElementById('iconeSanfona');
+        if (container.style.display === 'none') {{
+            container.style.display = 'block';
+            icone.innerHTML = '▼';
+        }} else {{
+            container.style.display = 'none';
+            icone.innerHTML = '▶';
+        }}
+    }}
 
-                    document.querySelector('[name="temperatura"]').value = temp;
-                    document.querySelector('[name="data"]').value = dt;
-                    document.querySelector('[name="vendedor"]').value = vend;
-                    document.querySelector('[name="cliente"]').value = cli;
-                    document.querySelector('[name="modelo"]').value = mod;
-                    document.querySelector('[name="chassis"]').value = chassis;
-                    document.querySelector('[name="plano_manutencao"]').value = plano;
-                    document.querySelector('[name="rio"]').value = rio;
-                    document.querySelector('[name="contato"]').value = contato;
-                    document.querySelector('[name="telefone"]').value = tel;
-                    document.querySelector('[name="comentarios"]').value = com;
+    function carregarParaEdicao(indexLinha, temp, data, vendedor, cliente, modelo, chassis, planoManutencao, rioVal, contato, telefone, comentarios) {{
+        document.getElementById('editIndexInput').value = indexLinha;
+        var btnSanfona = document.getElementById('tituloBotaoSanfona');
+        if (btnSanfona) btnSanfona.innerText = "✏️ Alterar Negociação (Linha " + indexLinha + ")";
 
-                    window.scrollTo({{ top: 0, behavior: 'smooth' }});
-                }}
+        document.getElementById('btnSubmitForm').innerText = "Atualizar Negociação";
+        document.getElementById('btnCancelarEdicao').style.display = "inline-block";
 
-                function cancelarEdicao() {{
-                    document.getElementById('editIndexInput').value = "";
-                    document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
-                    document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
-                    document.getElementById('btnCancelarEdicao').style.display = "none";
-                    document.getElementById('containerFormulario').style.display = 'none';
-                    document.getElementById('iconeSanfona').innerHTML = '▶';
-                }}
+        var setVal = function(name, val) {{
+            var el = document.querySelector('[name="' + name + '"]');
+            if (el) el.value = val || "";
+        }};
 
-                function aplicarFiltrosNegocios() {{
-                    var busca = document.getElementById('filtroBusca').value;
-                    var vend = document.getElementById('filtroVend').value;
-                    var ano = document.getElementById('filtroAno').value;
-                    var periodo = document.getElementById('filtroPeriodo').value;
-                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
-                }}
+        setVal('temperatura', temp);
+        setVal('data', data);
+        setVal('vendedor', vendedor);
+        setVal('cliente', cliente);
+        setVal('modelo', modelo);
+        setVal('chassis', chassis);
+        setVal('plano_manutencao', planoManutencao);
+        setVal('rio', rioVal);
+        setVal('contato', contato);
+        setVal('telefone', telefone);
+        setVal('comentarios', comentarios);
 
-                function filtrarTemp(temp) {{
-                    var busca = document.getElementById('filtroBusca').value;
-                    var vend = document.getElementById('filtroVend').value;
-                    var ano = document.getElementById('filtroAno').value;
-                    var periodo = document.getElementById('filtroPeriodo').value;
-                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
-                }}
+        var container = document.getElementById('containerFormulario');
+        if (container) {{
+            container.style.display = 'block';
+            var icone = document.getElementById('iconeSanfona');
+            if (icone) icone.innerHTML = '▼';
+        }}
 
-                function excluirNegocio(idx) {{
-                    if (confirm("Deseja realmente excluir este negócio?")) {{
-                        var form = document.createElement('form');
-                        form.method = 'POST';
-                        form.action = '/modulo/negocios';
-                        
-                        var inputAcao = document.createElement('input');
-                        inputAcao.type = 'hidden';
-                        inputAcao.name = 'acao_form';
-                        inputAcao.value = 'excluir';
-                        form.appendChild(inputAcao);
+        window.scrollTo({{ top: 0, behavior: 'smooth' }});
+    }}
 
-                        var inputIdx = document.createElement('input');
-                        inputIdx.type = 'hidden';
-                        inputIdx.name = 'index_linha';
-                        inputIdx.value = idx;
-                        form.appendChild(inputIdx);
+    function cancelarEdicao() {{
+        document.getElementById('editIndexInput').value = "";
+        document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
+        document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
+        document.getElementById('btnCancelarEdicao').style.display = "none";
+        document.getElementById('containerFormulario').style.display = 'none';
+        document.getElementById('iconeSanfona').innerHTML = '▶';
+    }}
 
-                        document.body.appendChild(form);
-                        form.submit();
-                    }}
-                }}
+    function aplicarFiltrosNegocios() {{
+        var busca = document.getElementById('filtroBusca').value;
+        var vend = document.getElementById('filtroVend').value;
+        var ano = document.getElementById('filtroAno').value;
+        var periodo = document.getElementById('filtroPeriodo').value;
+        window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
+    }}
 
-                function sincronizarParaVendas(idx, cliente, produto, data, modelo, vendedor) {{
-                    // Opcional para negócios fechados
-                }}
-                
-                function cancelarEdicao() {{
-                    document.getElementById('editIndexInput').value = "";
-                    document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
-                    document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
-                    document.getElementById('btnCancelarEdicao').style.display = "none";
-                    document.getElementById('containerFormulario').style.display = 'none';
-                    document.getElementById('iconeSanfona').innerHTML = '▶';
-                }}
+    function filtrarTemp(temp) {{
+        var busca = document.getElementById('filtroBusca').value;
+        var vend = document.getElementById('filtroVend').value;
+        var ano = document.getElementById('filtroAno').value;
+        var periodo = document.getElementById('filtroPeriodo').value;
+        window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
+    }}
 
-                function aplicarFiltrosNegocios() {{
-                    var busca = document.getElementById('filtroBusca').value;
-                    var vend = document.getElementById('filtroVend').value;
-                    var ano = document.getElementById('filtroAno').value;
-                    var periodo = document.getElementById('filtroPeriodo').value;
-                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
-                }}
+    function excluirNegocio(idx) {{
+        if (confirm("Deseja realmente excluir este negócio?")) {{
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/modulo/negocios';
 
-                function filtrarTemp(temp) {{
-                    var busca = document.getElementById('filtroBusca').value;
-                    var vend = document.getElementById('filtroVend').value;
-                    var ano = document.getElementById('filtroAno').value;
-                    var periodo = document.getElementById('filtroPeriodo').value;
-                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
-                }}
+            var inputAcao = document.createElement('input');
+            inputAcao.type = 'hidden';
+            inputAcao.name = 'acao_form';
+            inputAcao.value = 'excluir';
+            form.appendChild(inputAcao);
 
-                function excluirNegocio(idx) {{
-                    if (confirm("Deseja realmente excluir este negócio?")) {{
-                        var form = document.createElement('form');
-                        form.method = 'POST';
-                        form.action = '/modulo/negocios';
-                        
-                        var inputAcao = document.createElement('input');
-                        inputAcao.type = 'hidden';
-                        inputAcao.name = 'acao_form';
-                        inputAcao.value = 'excluir';
-                        form.appendChild(inputAcao);
+            var inputIdx = document.createElement('input');
+            inputIdx.type = 'hidden';
+            inputIdx.name = 'index_linha';
+            inputIdx.value = idx;
+            form.appendChild(inputIdx);
 
-                        var inputIdx = document.createElement('input');
-                        inputIdx.type = 'hidden';
-                        inputIdx.name = 'index_linha';
-                        inputIdx.value = idx;
-                        form.appendChild(inputIdx);
-
-                        document.body.appendChild(form);
-                        form.submit();
-                    }}
-                }}
-            </script>
+            document.body.appendChild(form);
+            form.submit();
+        }}
+    }}
+</script>
+    </script>
             """
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px;"><b>Erro ao carregar Negócios:</b> {e}</div>'

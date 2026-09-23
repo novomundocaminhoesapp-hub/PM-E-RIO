@@ -6,11 +6,9 @@ import urllib.parse
 import traceback
 import json
 import unicodedata
+import hashlib
 import html
-try:
-    from google import genai
-except ImportError:
-    genai = None
+from google import genai
 
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from google.oauth2.service_account import Credentials
@@ -89,6 +87,190 @@ TEMPO_CACHE_CLIENTE_SEGS = 300
 CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
 TEMPO_CACHE_DRIVE_SEGS = 600
 
+
+# =====================================================================
+# REGRAS DE COMISSÃO — FONTE ÚNICA DO CÁLCULO
+# =====================================================================
+# A tela de comissão, KPIs e gráficos devem usar exatamente estas mesmas
+# regras. Isso evita que cada parte do sistema faça um cálculo diferente.
+COMISSAO_APM_PM = 250.0
+COMISSAO_APM_RIO = 150.0
+COMISSAO_VENDEDOR_RIO = 200.0
+
+
+def normalizar_texto_comissao(valor):
+    """Normaliza texto para classificação de produto/modelo."""
+    texto = unicodedata.normalize("NFKD", str(valor or ""))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return texto.strip().lower()
+
+
+def parse_quantidade_comissao(valor):
+    """Converte quantidades da planilha sem transformar 1,5 em 15."""
+    if valor is None:
+        return 1
+    texto = str(valor).strip()
+    if not texto:
+        return 1
+
+    texto = texto.replace(" ", "")
+    # Formatos comuns: 1 / 1,0 / 1.0 / 1,5 / 1.500,00 / 1,500.00
+    try:
+        if "," in texto and "." in texto:
+            # Decide pelo separador decimal usando o último separador.
+            if texto.rfind(",") > texto.rfind("."):
+                texto_num = texto.replace(".", "").replace(",", ".")
+            else:
+                texto_num = texto.replace(",", "")
+            valor_num = float(texto_num)
+        elif "," in texto:
+            partes = texto.split(",")
+            if len(partes[-1]) <= 2:
+                valor_num = float(texto.replace(".", "").replace(",", "."))
+            else:
+                valor_num = float(texto.replace(",", ""))
+        elif "." in texto:
+            partes = texto.split(".")
+            if len(partes) == 2 and len(partes[-1]) <= 2:
+                valor_num = float(texto)
+            else:
+                valor_num = float(texto.replace(".", ""))
+        else:
+            valor_num = float(re.sub(r"[^0-9-]", "", texto) or "1")
+
+        if valor_num <= 0:
+            return 1
+        return int(round(valor_num))
+    except Exception:
+        numeros = re.sub(r"[^0-9]", "", texto)
+        return max(1, int(numeros)) if numeros else 1
+
+
+def parse_data_comissao(valor):
+    """Converte datas comuns do Google Sheets/planilha para datetime.
+    Aceita dd/mm/aaaa, dd-mm-aaaa, aaaa-mm-dd, ISO com hora e números serial.
+    """
+    if valor is None:
+        return None
+    if isinstance(valor, datetime):
+        return valor
+    texto = str(valor).strip()
+    if not texto:
+        return None
+
+    # Datas ISO / Google Sheets com horário
+    candidatos = [
+        "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y",
+        "%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+    ]
+    for fmt in candidatos:
+        try:
+            return datetime.strptime(texto, fmt)
+        except ValueError:
+            pass
+
+    # ISO 8601 com T/Z ou fração de segundos
+    try:
+        return datetime.fromisoformat(texto.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        pass
+
+    # Remove horário de strings como 22/09/2026 00:00:00
+    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", texto)
+    if m:
+        d, mo, a = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if a < 100:
+            a += 2000
+        try:
+            return datetime(a, mo, d)
+        except ValueError:
+            pass
+
+    # Google Sheets pode retornar número serial de data.
+    if re.fullmatch(r"\d+(?:\.\d+)?", texto):
+        try:
+            numero = float(texto)
+            if 20000 <= numero <= 80000:
+                from datetime import timedelta
+                return datetime(1899, 12, 30) + timedelta(days=numero)
+        except Exception:
+            pass
+    return None
+
+
+def detectar_produtos_comissao(produto, modelo, registro=None):
+    """Identifica PM/RIO usando todas as colunas relevantes da venda.
+    Evita que o relatório fique zerado quando a planilha usa nomes diferentes
+    para a descrição do produto.
+    """
+    registro = registro or {}
+    campos = [
+        produto, modelo,
+        registro.get("PRODUTO", ""),
+        registro.get("PLANO DE MANUTENÇÃO", ""),
+        registro.get("P. MANUTENÇÃO", ""),
+        registro.get("PLANO", ""),
+        registro.get("RIO", ""),
+        registro.get("TELEMETRIA RIO", ""),
+        registro.get("SERVIÇO", ""),
+    ]
+    textos = [normalizar_texto_comissao(x) for x in campos if str(x or "").strip()]
+    texto = " | ".join(textos)
+
+    # RIO deve ser identificado antes por seus próprios campos ou palavras.
+    is_rio = any(t in texto for t in (
+        "rio", "telemetria", "diagnostico", "diagnostico remoto",
+        "conectividade rio", "rio remote"
+    ))
+    # PM: PREV/MAX/PLUS ou plano/manutenção; também aceita nomes de coluna.
+    is_pm = any(t in texto for t in (
+        "prev", "max", "plus", "plano de manutencao", "plano",
+        "manutencao", "manutenção"
+    ))
+    return is_pm, is_rio
+
+
+def calcular_comissao_vendedor_pm(modelo, mapa_modelo_familia):
+    """Regra vigente do vendedor para Plano de Manutenção."""
+    mod_lower = normalizar_texto_comissao(modelo)
+    info_modelo_texto = mapa_modelo_familia.get(mod_lower, "")
+    if not info_modelo_texto:
+        for k_mod, v_mod in mapa_modelo_familia.items():
+            k_norm = normalizar_texto_comissao(k_mod)
+            if k_norm and (k_norm in mod_lower or mod_lower in k_norm):
+                info_modelo_texto = normalizar_texto_comissao(v_mod)
+                break
+
+    texto_analise = f"{mod_lower} {normalizar_texto_comissao(info_modelo_texto)}"
+
+    if "delivery" in texto_analise:
+        return 200.0
+    if "constellation" in texto_analise:
+        return 300.0
+    if any(termo in texto_analise for termo in ("meteor", "cavalo", "420", "530", "460")):
+        return 500.0
+    return 300.0
+
+
+def calcular_comissoes_venda(produto, modelo, quantidade, mapa_modelo_familia, registro=None):
+    """Calcula APM e vendedor para uma venda, em um único ponto do sistema."""
+    qtd = parse_quantidade_comissao(quantidade)
+    is_pm, is_rio = detectar_produtos_comissao(produto, modelo, registro)
+
+    vendedor_pm_unit = calcular_comissao_vendedor_pm(modelo, mapa_modelo_familia) if is_pm else 0.0
+    vendedor_rio_unit = COMISSAO_VENDEDOR_RIO if is_rio else 0.0
+
+    return {
+        "qtd": qtd,
+        "is_pm": is_pm,
+        "is_rio": is_rio,
+        "apm_pm": COMISSAO_APM_PM * qtd if is_pm else 0.0,
+        "apm_rio": COMISSAO_APM_RIO * qtd if is_rio else 0.0,
+        "vendedor_pm": vendedor_pm_unit * qtd if is_pm else 0.0,
+        "vendedor_rio": vendedor_rio_unit * qtd if is_rio else 0.0,
+    }
+
 def criar_cliente_gemini():
     api_key = (
         os.environ.get("GEMINI_API_KEY", "").strip()
@@ -118,8 +300,6 @@ def criar_cliente_gemini():
                 pass
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY não configurada no ambiente ou .env.")
-    if genai is None:
-        raise RuntimeError("Pacote google-genai não instalado. Instale-o para habilitar o Assistente de IA.")
     return genai.Client(api_key=api_key)
 
 
@@ -1450,7 +1630,7 @@ TEMPLATE_HTML = r"""
             }
             painel.innerHTML = lista.map(function(item) {
                 var href = item.link || '#';
-                var alvo = item.link ? ' target="_blank" rel="noopener noreferrer"' : '';
+                var alvo = (item.link && /^https?:\/\//i.test(item.link)) ? ' target="_blank" rel="noopener noreferrer"' : '';
                 return '<a class="notificacao-item" href="' + href.replace(/"/g, '&quot;') + '"' + alvo +
                     ' onclick="marcarNotificacaoLida(\'' + String(item.id).replace(/'/g, "\\'") + '\')">' +
                     '<div class="notificacao-tipo">' + (item.tipo || 'Atualização') + '</div>' +
@@ -2040,23 +2220,10 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
 
-            # Localiza a aba de campanha mesmo quando a planilha usa outro nome.
-            # Isso evita criar uma segunda aba e perder o STATUS já informado pelo usuário.
-            nomes_aba_campanha = (
-                "Campanhas_VW",
-                "CAMPANHA vw prev",
-                "Campanha VW PREV",
-                "CAMPANHA VW PREV",
-            )
-            aba_campanhas_vw = None
-            for nome_aba in nomes_aba_campanha:
-                try:
-                    aba_campanhas_vw = planilha.worksheet(nome_aba)
-                    break
-                except gspread.exceptions.WorksheetNotFound:
-                    continue
-
-            if aba_campanhas_vw is None:
+            # Garante que a aba Campanhas_VW existe
+            try:
+                aba_campanhas_vw = planilha.worksheet("Campanhas_VW")
+            except gspread.exceptions.WorksheetNotFound:
                 aba_campanhas_vw = planilha.add_worksheet(title="Campanhas_VW", rows=1000, cols=10)
                 aba_campanhas_vw.append_row(["DATA", "CIRCULAR", "CONSULTOR", "EMPRESA", "CHASSIS", "MODELOS", "G MANUTENÇÃO", "PLANO DE MANUTENÇÃO", "RIO", "STATUS"])
 
@@ -3051,10 +3218,15 @@ def acessar_modulo(nome_modulo):
             desfechos = fechados_pipeline + perdidos_pipeline
             taxa_fechamento = (fechados_pipeline / desfechos * 100) if desfechos else 0.0
 
-            # PM/RIO usam a regra de comissão já existente no sistema.
+            # Comissão do Dashboard usa as mesmas regras do módulo Vendas.
             qtd_pm = sum(v["qtd"] for v in vendas if v["origem"] == "PM")
-            comissao_apm_pm = qtd_pm * 250.0
+            qtd_rio = sum(v["qtd"] for v in vendas if v["origem"] == "RIO")
+            comissao_apm_pm = qtd_pm * COMISSAO_APM_PM
+            comissao_apm_rio = qtd_rio * COMISSAO_APM_RIO
             comissao_vendedor_pm = qtd_pm * 150.0
+            comissao_vendedor_rio = qtd_rio * COMISSAO_VENDEDOR_RIO
+            comissao_apm_total = comissao_apm_pm + comissao_apm_rio
+            comissao_vendedor_total = comissao_vendedor_pm + comissao_vendedor_rio
 
             # ------------------------------------------------------------
             # Séries para gráficos
@@ -3170,7 +3342,11 @@ def acessar_modulo(nome_modulo):
                     "perdidos_pipeline": perdidos_pipeline,
                     "taxa_fechamento": round(taxa_fechamento, 1),
                     "comissao_apm_pm": round(comissao_apm_pm, 2),
+                    "comissao_apm_rio": round(comissao_apm_rio, 2),
+                    "comissao_apm_total": round(comissao_apm_total, 2),
                     "comissao_vendedor_pm": round(comissao_vendedor_pm, 2),
+                    "comissao_vendedor_rio": round(comissao_vendedor_rio, 2),
+                    "comissao_vendedor_total": round(comissao_vendedor_total, 2),
                     "duplicatas_ignoradas": duplicatas,
                 },
                 "meses": meses,
@@ -3448,8 +3624,8 @@ def acessar_modulo(nome_modulo):
                     <div class="dash-table-card">
                         <h3>💰 Resumo de comissão PM</h3>
                         <div class="dash-mini-grid" style="grid-template-columns:1fr 1fr">
-                            <div class="dash-mini"><b>R$ {comissao_apm_pm:,.2f}</b><span>APM · {qtd_pm} unidades × R$ 250</span></div>
-                            <div class="dash-mini"><b>R$ {comissao_vendedor_pm:,.2f}</b><span>Vendedores · {qtd_pm} unidades × R$ 150</span></div>
+                            <div class="dash-mini"><b>R$ {comissao_apm_pm:,.2f}</b><span>APM · PM {qtd_pm} × R$ 250 + RIO {qtd_rio} × R$ 150</span></div>
+                            <div class="dash-mini"><b>R$ {comissao_vendedor_pm:,.2f}</b><span>Vendedores · PM + RIO conforme regra do veículo/produto</span></div>
                         </div>
                         <div class="dash-note">Locação e Consórcio são mostrados em quantidade, pois não há uma regra de comissão dessas fontes definida nas abas consultadas.</div>
                         {"<div class='dash-note'>Registros de venda idênticos ignorados nesta visualização: <b>" + str(duplicatas) + "</b>.</div>" if duplicatas else ""}
@@ -3870,6 +4046,8 @@ def acessar_modulo(nome_modulo):
                 idx_l = reg["_index_planilha"]
                 cli = reg.get('CLIENTE', '')
                 prod = reg.get('PRODUTO', '')
+                if not str(prod).strip():
+                    prod = reg.get('PLANO DE MANUTENÇÃO', '') or reg.get('P. MANUTENÇÃO', '') or reg.get('PLANO', '')
                 dt_v = reg.get('DATA DA VENDA', '')
                 mod = reg.get('MODELO', '')
                 qtd_str = reg.get('QUANTIDADE', '1')
@@ -4482,11 +4660,9 @@ def acessar_modulo(nome_modulo):
                 idx_dt_scan_v = cab_scan_v.index("DATA DA VENDA") if "DATA DA VENDA" in cab_scan_v else 2
                 for l in linhas_vendas_brutas[1:]:
                     if len(l) > idx_dt_scan_v:
-                        m_a = re.search(r'/\d{2}/(\d{4}|\d{2})', l[idx_dt_scan_v])
-                        if m_a:
-                            a_val = m_a.group(1)
-                            if len(a_val) == 2: a_val = "20" + a_val
-                            anos_disponiveis.add(a_val)
+                        dt_scan = parse_data_comissao(l[idx_dt_scan_v])
+                        if dt_scan:
+                            anos_disponiveis.add(str(dt_scan.year))
 
             options_anos = ""
             for a_op in sorted(list(anos_disponiveis), reverse=True):
@@ -4520,25 +4696,10 @@ def acessar_modulo(nome_modulo):
                     vend_val = str(dict_v.get('VENDEDOR', '')).strip().lower()
                     data_venda_val = str(dict_v.get('DATA DA VENDA', '')).strip()
 
-                    dt_obj = datetime.max
-                    ano_item = ""
-                    mes_item = ""
-                    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
-                        try:
-                            dt_obj = datetime.strptime(data_venda_val, fmt)
-                            mes_item = f"{dt_obj.month:02d}"
-                            ano_item = str(dt_obj.year)
-                            break
-                        except ValueError:
-                            pass
-
-                    if not ano_item:
-                        m_ano = re.search(r'/(\d{4}|\d{2})$', data_venda_val)
-                        if m_ano:
-                            a = m_ano.group(1)
-                            ano_item = "20" + a if len(a) == 2 else a
-                        m_mes = re.search(r'^\d{1,2}/(\d{1,2})/', data_venda_val)
-                        mes_item = m_mes.group(1).zfill(2) if m_mes else ""
+                    dt_parse = parse_data_comissao(data_venda_val)
+                    dt_obj = dt_parse if dt_parse else datetime.max
+                    ano_item = str(dt_parse.year) if dt_parse else ""
+                    mes_item = f"{dt_parse.month:02d}" if dt_parse else ""
 
                     if ano_selecionado and ano_item != ano_selecionado:
                         continue
@@ -4584,44 +4745,27 @@ def acessar_modulo(nome_modulo):
                 idx_l = reg["_index_planilha"]
                 cli = reg.get('CLIENTE', '')
                 prod = reg.get('PRODUTO', '')
+                if not str(prod).strip():
+                    prod = reg.get('PLANO DE MANUTENÇÃO', '') or reg.get('P. MANUTENÇÃO', '') or reg.get('PLANO', '')
                 dt_v = reg.get('DATA DA VENDA', '')
                 mod = reg.get('MODELO', '')
                 qtd_str = reg.get('QUANTIDADE', '1')
                 vend = reg.get('VENDEDOR', 'Desconhecido')
                 mes_str_grafico = reg["_dt_obj"].strftime("%m/%Y") if reg["_dt_obj"] != datetime.max else "Sem Data"
                 
-                try:
-                    qtd_num = int(re.sub(r'\D', '', str(qtd_str)))
-                    if qtd_num <= 0: qtd_num = 1
-                except ValueError:
-                    qtd_num = 1
-
-                prod_upper = prod.upper()
-                comissao_pm_item = 0
-                comissao_rio_item = 0
-                comissao_apm_item = 0
-
-                is_pm = any(p_termo in prod_upper for p_termo in ["PREV", "MAX", "PLUS", "PLANO"])
-                is_rio = any(r_termo in prod_upper for r_termo in ["RIO", "DIAGNÓSTICO", "DIAGNOSTICO"])
-
-                mod_lower = mod.strip().lower()
-                info_modelo_texto = mapa_modelo_familia.get(mod_lower, "")
-                if not info_modelo_texto:
-                    for k_mod, v_mod in mapa_modelo_familia.items():
-                        if k_mod in mod_lower or mod_lower in k_mod:
-                            info_modelo_texto = v_mod
-                            break
-                
-                texto_analise_modelo = f"{mod_lower} {info_modelo_texto}"
-
-                if "delivery" in texto_analise_modelo:
-                    valor_unitario_pm_vendedor = 200
-                elif "constellation" in texto_analise_modelo:
-                    valor_unitario_pm_vendedor = 300
-                elif "meteor" in texto_analise_modelo or "cavalo" in texto_analise_modelo or "420" in texto_analise_modelo or "530" in texto_analise_modelo or "460" in texto_analise_modelo:
-                    valor_unitario_pm_vendedor = 500
-                else:
-                    valor_unitario_pm_vendedor = 300
+                calculo = calcular_comissoes_venda(
+                    produto=prod,
+                    modelo=mod,
+                    quantidade=qtd_str,
+                    mapa_modelo_familia=mapa_modelo_familia,
+                    registro=reg,
+                )
+                qtd_num = calculo["qtd"]
+                is_pm = calculo["is_pm"]
+                is_rio = calculo["is_rio"]
+                comissao_pm_item = calculo["vendedor_pm"]
+                comissao_rio_item = calculo["vendedor_rio"]
+                comissao_apm_item = calculo["apm_pm"] + calculo["apm_rio"]
 
                 estado_v = mapa_vendedor_estado.get(vend.strip().lower(), "PE")
                 if estado_v not in comissoes_por_estado:
@@ -4631,16 +4775,12 @@ def acessar_modulo(nome_modulo):
                     comissoes_por_estado[estado_v]["vendedores"][vend] = {"pm_qtd": 0, "pm_total": 0, "rio_qtd": 0, "rio_total": 0}
 
                 if is_pm:
-                    comissao_pm_item = valor_unitario_pm_vendedor * qtd_num
-                    comissao_apm_item += 250.0 * qtd_num
                     comissoes_por_estado[estado_v]["vendedores"][vend]["pm_qtd"] += qtd_num
                     comissoes_por_estado[estado_v]["vendedores"][vend]["pm_total"] += comissao_pm_item
                     comissoes_por_estado[estado_v]["total_pm"] += comissao_pm_item
                     total_qtd_pm_geral += qtd_num
                     dados_dashboard["produtos"]["PM"] += qtd_num
                 if is_rio:
-                    comissao_rio_item = 200 * qtd_num
-                    comissao_apm_item += 150.0 * qtd_num
                     comissoes_por_estado[estado_v]["vendedores"][vend]["rio_qtd"] += qtd_num
                     comissoes_por_estado[estado_v]["vendedores"][vend]["rio_total"] += comissao_rio_item
                     comissoes_por_estado[estado_v]["total_rio"] += comissao_rio_item
@@ -4726,7 +4866,7 @@ def acessar_modulo(nome_modulo):
                                 <b>R$ {formata_br(d_v['pm_total'])}</b>
                             </div>
                             <div style="font-size: 12px; color: #4a5568; display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                <span>Telemetria RIO ({d_v['rio_qtd']} un. × R$ 200,00):</span>
+                                <span>Telemetria RIO ({d_v['rio_qtd']} un. × R$ {COMISSAO_VENDEDOR_RIO:,.2f}):</span>
                                 <b>R$ {formata_br(d_v['rio_total'])}</b>
                             </div>
                             <div style="font-size: 13px; color: #2f855a; font-weight: 700; border-top: 1px dashed #cbd5e0; padding-top: 4px; display: flex; justify-content: space-between;">
@@ -4749,8 +4889,8 @@ def acessar_modulo(nome_modulo):
             if not bloco_comissoes_html:
                 bloco_comissoes_html = '<p style="color: #718096; font-size: 13px; text-align: center;">Nenhuma comissão registrada para o período.</p>'
 
-            comissao_minha_pm = total_qtd_pm_geral * 250.0
-            comissao_minha_rio = total_qtd_rio_geral * 150.0
+            comissao_minha_pm = total_qtd_pm_geral * COMISSAO_APM_PM
+            comissao_minha_rio = total_qtd_rio_geral * COMISSAO_APM_RIO
             comissao_minha_total = comissao_minha_pm + comissao_minha_rio
 
             bloco_minha_comissao = f"""
@@ -5050,15 +5190,15 @@ def acessar_modulo(nome_modulo):
                         }}
                     }});
 
-                    var vendedoresLabels = Object.keys(dadosPainel.consultores || {{}})
+                    var vendedoresLabels = Object.keys(dadosPainel.vendedores || {{}})
                         .filter(v => v && String(v).trim() !== '');
                     vendedoresLabels.sort((a, b) => {{
-                        var qtdDiff = (dadosPainel.consultores[b].qtd || 0) - (dadosPainel.consultores[a].qtd || 0);
+                        var qtdDiff = (dadosPainel.vendedores[b].qtd || 0) - (dadosPainel.vendedores[a].qtd || 0);
                         if (qtdDiff !== 0) return qtdDiff;
-                        return (dadosPainel.consultores[b].qtd || 0) - (dadosPainel.consultores[a].qtd || 0);
+                        return (dadosPainel.vendedores[b].comissao || 0) - (dadosPainel.vendedores[a].comissao || 0);
                     }});
-                    var vendComissao = vendedoresLabels.map(v => Number(dadosPainel.consultores[v].qtd || 0));
-                    var vendQtd = vendedoresLabels.map(v => Number(dadosPainel.consultores[v].qtd || 0));
+                    var vendComissao = vendedoresLabels.map(v => Number(dadosPainel.vendedores[v].comissao || 0));
+                    var vendQtd = vendedoresLabels.map(v => Number(dadosPainel.vendedores[v].qtd || 0));
 
                     var canvasConsultor = document.getElementById('chartRankingVendedores');
                     if (!vendedoresLabels.length) {{
@@ -5074,14 +5214,14 @@ def acessar_modulo(nome_modulo):
                         data: {{ 
                             labels: vendedoresLabels, 
                             datasets: [{{ 
-                                label: 'Vendas por Consultor (unidades)', 
+                                label: 'Total Pago ao Vendedor (R$)', 
                                 data: vendComissao, 
                                 backgroundColor: '#002244',
                                 datalabels: {{
                                     anchor: 'start', 
                                     align: 'end',
                                     color: '#ffffff',
-                                    formatter: (val, ctx) => String(vendQtd[ctx.dataIndex]) + ' un'
+                                    formatter: (val, ctx) => 'Qtd: ' + vendQtd[ctx.dataIndex] + ' | R$ ' + val.toLocaleString('pt-BR')
                                 }}
                             }}] 
                         }},
@@ -5677,7 +5817,58 @@ def acessar_modulo(nome_modulo):
         }}
     }}
 </script>
-    </script>
+                function sincronizarParaVendas(idx, cliente, produto, data, modelo, vendedor) {{
+                    // Opcional para negócios fechados
+                }}
+                
+                function cancelarEdicao() {{
+                    document.getElementById('editIndexInput').value = "";
+                    document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
+                    document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
+                    document.getElementById('btnCancelarEdicao').style.display = "none";
+                    document.getElementById('containerFormulario').style.display = 'none';
+                    document.getElementById('iconeSanfona').innerHTML = '▶';
+                }}
+
+                function aplicarFiltrosNegocios() {{
+                    var busca = document.getElementById('filtroBusca').value;
+                    var vend = document.getElementById('filtroVend').value;
+                    var ano = document.getElementById('filtroAno').value;
+                    var periodo = document.getElementById('filtroPeriodo').value;
+                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
+                }}
+
+                function filtrarTemp(temp) {{
+                    var busca = document.getElementById('filtroBusca').value;
+                    var vend = document.getElementById('filtroVend').value;
+                    var ano = document.getElementById('filtroAno').value;
+                    var periodo = document.getElementById('filtroPeriodo').value;
+                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
+                }}
+
+                function excluirNegocio(idx) {{
+                    if (confirm("Deseja realmente excluir este negócio?")) {{
+                        var form = document.createElement('form');
+                        form.method = 'POST';
+                        form.action = '/modulo/negocios';
+                        
+                        var inputAcao = document.createElement('input');
+                        inputAcao.type = 'hidden';
+                        inputAcao.name = 'acao_form';
+                        inputAcao.value = 'excluir';
+                        form.appendChild(inputAcao);
+
+                        var inputIdx = document.createElement('input');
+                        inputIdx.type = 'hidden';
+                        inputIdx.name = 'index_linha';
+                        inputIdx.value = idx;
+                        form.appendChild(inputIdx);
+
+                        document.body.appendChild(form);
+                        form.submit();
+                    }}
+                }}
+            </script>
             """
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px;"><b>Erro ao carregar Negócios:</b> {e}</div>'
@@ -6541,100 +6732,83 @@ def chat_ia():
 
 @app.route("/api/atualizacoes", methods=["GET"])
 def api_atualizacoes():
-    """Retorna atualizações leves: Informes e arquivos recentes do Drive.
-    Não baixa nem interpreta PDFs; apenas usa metadados.
+    """Retorna somente atualizações do menu Informes e Circulares.
+
+    Importante: nunca retorna link de acesso à planilha/Drive. O sino leva
+    diretamente ao menu interno do sistema onde o informe pode ser consultado.
+    O ID inclui um hash do conteúdo para que uma alteração no mesmo informe
+    volte a aparecer como uma nova notificação.
     """
     if not session.get("logado"):
         return jsonify({"atualizacoes": [], "nao_lidas": 0}), 401
 
     try:
         limite = max(1, min(int(request.args.get("limite", 12)), 30))
-    except ValueError:
+    except (ValueError, TypeError):
         limite = 12
 
     atualizacoes = []
 
-    # Informes/circulares já estruturados na planilha.
     try:
         planilha = conectar_google_sheets()
         informes = obter_registros_com_cache(planilha, "Informes", ttl=120)
+
         for i, item in enumerate(informes):
             assunto = str(item.get("ASSUNTO", "")).strip()
             info = str(item.get("INFORMAÇÃO", "") or item.get("INFORMACAO", "")).strip()
             circular = str(item.get("CIRCULAR", "")).strip()
-            if not assunto and not circular:
+            data_atualizacao = str(
+                item.get("DATA", "")
+                or item.get("DATA ATUALIZAÇÃO", "")
+                or item.get("DATA ATUALIZACAO", "")
+                or item.get("MÊS", "")
+                or item.get("MES", "")
+            ).strip()
+
+            if not assunto and not circular and not info:
                 continue
 
-            link = circular
+            # Link exclusivamente para o menu interno do aplicativo.
+            if assunto:
+                link_interno = "/modulo/informes?item=" + urllib.parse.quote(assunto)
+            else:
+                link_interno = "/modulo/informes"
+
+            base_id = "|".join((assunto, circular, info, data_atualizacao))
+            hash_conteudo = hashlib.sha1(base_id.encode("utf-8", "ignore")).hexdigest()[:16]
+
+            descricao_partes = []
             if circular:
-                _, mapa_drive = obter_conteudo_pastas_drive()
-                link = mapa_drive.get(circular.lower(), circular)
+                descricao_partes.append(f"Circular: {circular}")
+            if info:
+                descricao_partes.append(info[:180])
+            descricao = " — ".join(descricao_partes) or "Atualização disponível no menu Informes e Circulares."
 
             atualizacoes.append({
-                "id": f"informe:{i}:{assunto}",
-                "tipo": "Informe",
-                "titulo": assunto or "Novo comunicado",
-                "descricao": info[:180] if info else "Comunicado disponível.",
-                "data": "",
-                "link": link if link.startswith("http") else "",
+                "id": f"informe:{i}:{hash_conteudo}",
+                "tipo": "Atualização",
+                "titulo": assunto or "Novo informe disponível",
+                "descricao": descricao,
+                "data": data_atualizacao,
+                "link": link_interno,
             })
+
     except Exception as e:
-        print(f"API atualizações: erro nos Informes: {e}")
+        print(f"API atualizações: erro na aba Informes: {e}")
 
-    # Metadados do Drive: detecta arquivos modificados sem fazer download.
-    try:
-        if "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
-            credenciais_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-            credenciais = Credentials.from_service_account_info(credenciais_dict, scopes=escopos)
-        else:
-            credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
+    # Mais recentes primeiro quando houver uma data reconhecível; mantém a
+    # ordem da planilha como critério de desempate.
+    def chave_atualizacao(item):
+        texto = str(item.get("data", "")).strip()
+        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(texto, fmt)
+            except ValueError:
+                pass
+        return datetime.min
 
-        service = build("drive", "v3", credentials=credenciais)
-        resposta = service.files().list(
-            q="trashed = false",
-            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)",
-            orderBy="modifiedTime desc",
-            pageSize=20,
-        ).execute()
-
-        for arq in resposta.get("files", []):
-            nome = str(arq.get("name", "")).strip()
-            mime = str(arq.get("mimeType", "")).lower()
-            if not nome:
-                continue
-
-            eh_pdf = mime == "application/pdf" or nome.lower().endswith(".pdf")
-            eh_planilha = (
-                "spreadsheet" in mime
-                or nome.lower().endswith((".xlsx", ".xls", ".csv"))
-            )
-            if not (eh_pdf or eh_planilha):
-                continue
-
-            atualizacoes.append({
-                "id": f"drive:{arq.get('id','')}:{arq.get('modifiedTime','')}",
-                "tipo": "PDF" if eh_pdf else "Planilha",
-                "titulo": nome,
-                "descricao": "Arquivo modificado recentemente no Google Drive.",
-                "data": arq.get("modifiedTime", ""),
-                "link": arq.get("webViewLink", "") or (
-                    f"https://drive.google.com/open?id={arq.get('id','')}"
-                    if arq.get("id") else ""
-                ),
-            })
-    except Exception as e:
-        print(f"API atualizações: erro no Drive: {e}")
-
-    # Remove duplicatas e limita o retorno.
-    vistos = set()
-    final = []
-    for item in atualizacoes:
-        if item["id"] in vistos:
-            continue
-        vistos.add(item["id"])
-        final.append(item)
-
-    final = final[:limite]
+    atualizacoes.sort(key=chave_atualizacao, reverse=True)
+    final = atualizacoes[:limite]
     return jsonify({"atualizacoes": final, "nao_lidas": len(final)})
 
 

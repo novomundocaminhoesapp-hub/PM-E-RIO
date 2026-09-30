@@ -8,11 +8,16 @@ import json
 import unicodedata
 import hashlib
 import html
+import io
+import mimetypes
 from google import genai
 
-from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
+from flask import Flask, abort, redirect, render_template_string, request, session, url_for, jsonify, send_file
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from werkzeug.datastructures import FileStorage
+from werkzeug.utils import secure_filename
 import gspread
 
 app = Flask(__name__)
@@ -55,6 +60,14 @@ def conectar_google_sheets():
     Em produção (Render), usa GOOGLE_CREDENTIALS quando configurada.
     Localmente, mantém o funcionamento usando credenciais.json.
     """
+    global CACHE_PLANILHA_CLIENTE
+    agora = time.time()
+    if (
+        CACHE_PLANILHA_CLIENTE["cliente"] is not None
+        and agora - CACHE_PLANILHA_CLIENTE["timestamp"] < TEMPO_CACHE_CLIENTE_SEGS
+    ):
+        return CACHE_PLANILHA_CLIENTE["cliente"]
+
     if "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
         credenciais_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
         credenciais = Credentials.from_service_account_info(
@@ -68,7 +81,156 @@ def conectar_google_sheets():
         )
 
     cliente = gspread.authorize(credenciais)
-    return cliente.open("PM e RIO Novo")
+    planilha = cliente.open("PM e RIO Novo")
+    CACHE_PLANILHA_CLIENTE = {"cliente": planilha, "timestamp": agora}
+    return planilha
+
+
+def conectar_google_drive():
+    if "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
+        credenciais = Credentials.from_service_account_info(
+            json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=escopos
+        )
+    else:
+        credenciais = Credentials.from_service_account_file(
+            "credenciais.json", scopes=escopos
+        )
+    return build("drive", "v3", credentials=credenciais)
+
+
+def salvar_comprovante_static(arquivo):
+    nome_original = secure_filename(os.path.basename(str(arquivo.filename or "comprovante"))) or "comprovante"
+    nome_arquivo = f"{time.time_ns()}_{nome_original}"
+    pasta_uploads = os.path.join(app.root_path, "static", "uploads")
+    os.makedirs(pasta_uploads, exist_ok=True)
+    arquivo.stream.seek(0)
+    arquivo.save(os.path.join(pasta_uploads, nome_arquivo))
+    return f"/static/uploads/{nome_arquivo}"
+
+
+def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True):
+    """Tenta o Drive e usa static local quando a conta não puder armazenar arquivos."""
+    try:
+        service = conectar_google_drive()
+        folder_id = os.environ.get("GOOGLE_DRIVE_UPLOAD_FOLDER_ID", "").strip()
+        if not folder_id:
+            resposta = service.files().list(
+                q="(name = 'Upload_Comprovantes' or name = 'Uplod_Comprovantes') and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                fields="files(id, name)",
+                pageSize=100,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            pastas = resposta.get("files", [])
+            if len(pastas) != 1:
+                raise RuntimeError(
+                    "A pasta Upload_Comprovantes/Uplod_Comprovantes não foi encontrada de forma única."
+                )
+            folder_id = pastas[0]["id"]
+
+        nome_original = secure_filename(os.path.basename(str(arquivo.filename or "comprovante"))) or "comprovante"
+        nome_arquivo = f"{time.time_ns()}_{nome_original}"
+        arquivo.stream.seek(0)
+        media = MediaIoBaseUpload(
+            arquivo.stream,
+            mimetype=arquivo.mimetype or "application/octet-stream",
+            resumable=True,
+        )
+        enviado = service.files().create(
+            body={"name": nome_arquivo, "parents": [folder_id]},
+            media_body=media,
+            fields="id, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        return enviado.get("webViewLink") or f"https://drive.google.com/open?id={enviado['id']}"
+    except Exception as erro:
+        if not permitir_fallback_local:
+            raise
+        print(f"Upload no Drive indisponível; salvando comprovante em static/uploads: {erro}")
+        return salvar_comprovante_static(arquivo)
+
+
+def extrair_id_arquivo_drive(link):
+    texto = str(link or "").strip()
+    match = re.search(r"/file/d/([A-Za-z0-9_-]+)|[?&]id=([A-Za-z0-9_-]+)", texto)
+    return next((grupo for grupo in match.groups() if grupo), "") if match else ""
+
+
+def url_comprovante_no_app(link):
+    texto = str(link or "").strip()
+    if texto.startswith("/static/uploads/"):
+        caminho = os.path.realpath(os.path.join(app.root_path, texto.lstrip("/")))
+        pasta_uploads = os.path.realpath(os.path.join(app.root_path, "static", "uploads"))
+        if os.path.commonpath([caminho, pasta_uploads]) == pasta_uploads and os.path.isfile(caminho):
+            return texto
+        return ""
+    file_id = extrair_id_arquivo_drive(texto)
+    return f"/comprovante-drive/{file_id}" if file_id else ""
+
+
+def migrar_comprovantes_static(aba_vendas):
+    """Migra para o Drive links locais cujos arquivos ainda existem no servidor."""
+    linhas = aba_vendas.get_all_values()
+    if len(linhas) < 2:
+        return 0
+
+    cabecalhos = [normalizar_texto_comissao(valor) for valor in linhas[0]]
+    colunas_anexos = [
+        (indice, cabecalho)
+        for indice, cabecalho in enumerate(cabecalhos)
+        if cabecalho in ("anexo 1", "anexo 2", "anexo 3")
+    ]
+    pasta_uploads = os.path.realpath(os.path.join(app.root_path, "static", "uploads"))
+    migrados = 0
+
+    for numero_linha, linha in enumerate(linhas[1:], start=2):
+        for indice_coluna, _ in colunas_anexos:
+            valor = linha[indice_coluna].strip() if len(linha) > indice_coluna else ""
+            if not valor.startswith("/static/uploads/"):
+                continue
+
+            caminho = os.path.realpath(os.path.join(app.root_path, valor.lstrip("/")))
+            if os.path.commonpath([caminho, pasta_uploads]) != pasta_uploads or not os.path.isfile(caminho):
+                continue
+
+            with open(caminho, "rb") as arquivo_local:
+                arquivo = FileStorage(
+                    stream=arquivo_local,
+                    filename=os.path.basename(caminho),
+                    content_type=mimetypes.guess_type(caminho)[0] or "application/octet-stream",
+                )
+                link_drive = subir_comprovante_google_drive(arquivo)
+            aba_vendas.update_cell(numero_linha, indice_coluna + 1, link_drive)
+            migrados += 1
+
+    return migrados
+
+
+@app.route("/comprovante-drive/<file_id>")
+def servir_comprovante_drive(file_id):
+    if not session.get("logado"):
+        abort(401)
+
+    try:
+        service = conectar_google_drive()
+        metadados = service.files().get(
+            fileId=file_id, fields="mimeType", supportsAllDrives=True
+        ).execute()
+        resposta = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        conteudo = io.BytesIO()
+        downloader = MediaIoBaseDownload(conteudo, resposta)
+        concluido = False
+        while not concluido:
+            _, concluido = downloader.next_chunk()
+        conteudo.seek(0)
+        return send_file(
+            conteudo,
+            mimetype=metadados.get("mimeType", "application/octet-stream"),
+            max_age=300,
+        )
+    except Exception as erro:
+        print(f"Erro ao carregar comprovante do Drive {file_id}: {erro}")
+        abort(404)
 
 CACHE_IA = {
     "contexto_sistema": "",
@@ -84,6 +246,15 @@ CACHE_PLANILHAS = {
 TEMPO_CACHE_PLANILHA_SEGS = 300  # 5 minutos por aba
 CACHE_PLANILHA_CLIENTE = {"cliente": None, "timestamp": 0}
 TEMPO_CACHE_CLIENTE_SEGS = 300
+TEMPO_CACHE_ABAS = {
+    "Vendas_PM": 60,
+    "Negocios_PM": 60,
+    "Vendas_LOC": 60,
+    "Negocio_LOC": 60,
+    "Vendas_Consorcio": 60,
+    "Negocios_Consorcio": 60,
+    "Informes": 120,
+}
 CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
 TEMPO_CACHE_DRIVE_SEGS = 600
 
@@ -199,6 +370,189 @@ def parse_data_comissao(valor):
     return None
 
 
+def chave_venda_pm(registro):
+    """Gera uma chave estável para evitar importar a mesma venda duas vezes."""
+    produto = str(registro.get("PRODUTO", "")).strip()
+    plano = str(
+        registro.get("P. MANUTENÇÃO", "")
+        or registro.get("P. MANUTENCAO", "")
+        or registro.get("PLANO DE MANUTENÇÃO", "")
+        or registro.get("PLANO", "")
+    ).strip()
+    rio = str(registro.get("RIO", "")).strip()
+    if not plano and not rio and produto:
+        partes_produto = produto.split(" / ", 1)
+        plano = partes_produto[0].strip()
+        rio = partes_produto[1].strip() if len(partes_produto) > 1 else ""
+    elif not produto:
+        produto = f"{plano} / {rio}".strip(" /")
+
+    data = parse_data_comissao(
+        registro.get("DATA DA VENDA") or registro.get("DATA", "")
+    )
+    data_chave = data.strftime("%Y-%m-%d") if data else str(
+        registro.get("DATA DA VENDA") or registro.get("DATA", "")
+    ).strip()
+
+    return tuple(
+        normalizar_texto_comissao(valor)
+        for valor in (
+            registro.get("CLIENTE", ""),
+            plano or produto,
+            rio,
+            data_chave,
+            registro.get("MODELO", ""),
+            registro.get("VENDEDOR", ""),
+        )
+    )
+
+
+def montar_linha_venda_pm(registro, cabecalhos):
+    aliases = {
+        "cliente": "CLIENTE",
+        "produto": "PRODUTO",
+        "numero do contrato": "CONTRATO",
+        "numero contrato": "CONTRATO",
+        "num do contrato": "CONTRATO",
+        "num contrato": "CONTRATO",
+        "no do contrato": "CONTRATO",
+        "no contrato": "CONTRATO",
+        "n do contrato": "CONTRATO",
+        "n contrato": "CONTRATO",
+        "contrato": "CONTRATO",
+        "contrato n": "CONTRATO",
+        "p manutencao": "PLANO",
+        "p. manutencao": "PLANO",
+        "plano de manutencao": "PLANO",
+        "plano manutencao": "PLANO",
+        "plano": "PLANO",
+        "rio": "RIO",
+        "data da venda": "DATA",
+        "data": "DATA",
+        "modelo": "MODELO",
+        "quantidade": "QUANTIDADE",
+        "vendedor": "VENDEDOR",
+        "anexo 1": "ANEXO 1",
+        "anexo 2": "ANEXO 2",
+        "anexo 3": "ANEXO 3",
+    }
+    plano = str(
+        registro.get("P. MANUTENÇÃO", "")
+        or registro.get("PLANO DE MANUTENÇÃO", "")
+        or registro.get("PLANO", "")
+    ).strip()
+    rio = str(registro.get("RIO", "")).strip()
+    produto = str(registro.get("PRODUTO", "")).strip()
+    if not plano and not rio and produto:
+        partes_produto = produto.split(" / ", 1)
+        plano = partes_produto[0].strip()
+        rio = partes_produto[1].strip() if len(partes_produto) > 1 else ""
+    if not produto:
+        produto = " / ".join(valor for valor in (plano, rio) if valor)
+
+    valores = {
+        "CLIENTE": str(registro.get("CLIENTE", "")).strip(),
+        "PRODUTO": produto,
+        "CONTRATO": str(registro.get("CONTRATO", "") or obter_numero_contrato(registro)).strip(),
+        "PLANO": plano,
+        "RIO": rio,
+        "DATA": str(registro.get("DATA DA VENDA") or registro.get("DATA", "")).strip(),
+        "MODELO": str(registro.get("MODELO", "")).strip(),
+        "QUANTIDADE": str(registro.get("QUANTIDADE", "1") or "1").strip(),
+        "VENDEDOR": str(registro.get("VENDEDOR", "")).strip(),
+        "ANEXO 1": str(registro.get("ANEXO 1", "")).strip(),
+        "ANEXO 2": str(registro.get("ANEXO 2", "")).strip(),
+        "ANEXO 3": str(registro.get("ANEXO 3", "")).strip(),
+    }
+    return [
+        valores.get(aliases.get(normalizar_chave_planilha(cabecalho), ""), "")
+        for cabecalho in cabecalhos
+    ]
+
+
+def normalizar_chave_planilha(valor):
+    texto = normalizar_texto_comissao(valor)
+    return re.sub(r"[^a-z0-9]+", " ", texto).strip()
+
+
+def obter_numero_contrato(registro):
+    cabecalhos_contrato = {
+        "numero do contrato", "numero contrato", "num do contrato", "num contrato",
+        "no do contrato", "no contrato", "n do contrato", "n contrato",
+        "contrato", "contrato n",
+    }
+    for cabecalho, valor in registro.items():
+        if normalizar_chave_planilha(cabecalho) in cabecalhos_contrato:
+            return str(valor or "").strip()
+    return ""
+
+
+def separar_produto_venda(registro):
+    plano = str(
+        registro.get("P. MANUTENÇÃO", "")
+        or registro.get("P. MANUTENCAO", "")
+        or registro.get("PLANO DE MANUTENÇÃO", "")
+        or registro.get("PLANO", "")
+        or registro.get("PLANO MANUTENCAO", "")
+    ).strip()
+    rio = str(registro.get("RIO", "")).strip()
+    produto = str(registro.get("PRODUTO", "")).strip()
+
+    if produto and (not plano or not rio):
+        partes = produto.split(" / ", 1)
+        if len(partes) == 2:
+            plano = plano or partes[0].strip()
+            rio = rio or partes[1].strip()
+
+    return plano, rio
+
+
+def sincronizar_negocio_fechado(aba_vendas, negocio, chaves_existentes=None):
+    """Registra um negócio fechado em Vendas_PM, sem duplicar a venda.
+
+    Retorna True quando uma nova venda foi criada e False quando ela já existia.
+    Esta função concentra a gravação usada tanto pelo fechamento manual quanto
+    pela sincronização retroativa do módulo de Vendas.
+    """
+    if chaves_existentes is None:
+        registros_vendas = obter_registros_seguros(aba_vendas)
+        chaves_existentes = {chave_venda_pm(registro) for registro in registros_vendas}
+
+    chave = chave_venda_pm(negocio)
+    if chave in chaves_existentes:
+        return False
+
+    cabecalhos = aba_vendas.row_values(1)
+    if not cabecalhos:
+        cabecalhos = [
+            "CLIENTE", "P. MANUTENÇÃO", "RIO", "DATA DA VENDA", "MODELO",
+            "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO"
+        ]
+        aba_vendas.append_row(cabecalhos)
+
+    aba_vendas.append_row(montar_linha_venda_pm(negocio, cabecalhos))
+    invalidar_cache_ab_as("Vendas_PM")
+    chaves_existentes.add(chave)
+    return True
+
+
+def mover_negocio_fechado_para_vendas(aba_negocios, aba_vendas, index_linha, negocio, chaves_existentes=None):
+    """Move um negócio fechado de Negocios_PM para Vendas_PM.
+
+    A origem só é excluída depois que a venda é confirmada em Vendas_PM.
+    Isso evita perder o negócio se houver erro na gravação da venda.
+    """
+    criado = sincronizar_negocio_fechado(aba_vendas, negocio, chaves_existentes)
+
+    # Se já estava em Vendas_PM, ainda assim o objetivo do status Fechado é
+    # retirar o registro da fila de negócios em andamento.
+    if index_linha and int(index_linha) > 1:
+        aba_negocios.delete_rows(int(index_linha))
+        invalidar_cache_ab_as("Negocios_PM")
+
+    return criado
+
+
 def detectar_produtos_comissao(produto, modelo, registro=None):
     """Identifica PM/RIO usando todas as colunas relevantes da venda.
     Evita que o relatório fique zerado quando a planilha usa nomes diferentes
@@ -219,9 +573,11 @@ def detectar_produtos_comissao(produto, modelo, registro=None):
     texto = " | ".join(textos)
 
     # RIO deve ser identificado antes por seus próprios campos ou palavras.
-    is_rio = any(t in texto for t in (
+    rio_coluna = normalizar_texto_comissao(registro.get("RIO", ""))
+    is_rio = bool(rio_coluna and rio_coluna not in ("-", "nenhum", "nao")) or any(t in texto for t in (
         "rio", "telemetria", "diagnostico", "diagnostico remoto",
-        "conectividade rio", "rio remote"
+        "conectividade rio", "rio remote", "performance", "geo",
+        "analise de eficiencia"
     ))
     # PM: PREV/MAX/PLUS ou plano/manutenção; também aceita nomes de coluna.
     is_pm = any(t in texto for t in (
@@ -320,7 +676,7 @@ def validar_cpf(cpf_input):
     return True
 
 CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
-TEMPO_CACHE_LOGIN_SEGS = 300
+TEMPO_CACHE_LOGIN_SEGS = 60
 
 def carregar_dados_login():
     """
@@ -339,14 +695,14 @@ def carregar_dados_login():
         return CACHE_LOGIN_DADOS["dados"]
 
     planilha = conectar_google_sheets()
-    abas = ["PM", "RIO", "PM_Precos", "Informes", "Argumentos", "Modelos",
+    abas = ["PM", "RIO", "PM_Precos", "Informes", "Argumentos", "Modelos", "Usuarios",
             "Negocios_PM", "Vendas_PM", "Vendas_LOC", "Negocio_LOC",
             "Vendas_Consorcio", "Negocios_Consorcio"]
 
     dados = {}
     for nome_aba in abas:
         try:
-            dados[nome_aba] = obter_registros_com_cache(planilha, nome_aba, ttl=TEMPO_CACHE_LOGIN_SEGS)
+            dados[nome_aba] = obter_registros_com_cache(planilha, nome_aba)
         except Exception as e:
             print(f"⚠️ Pré-carga da aba {nome_aba}: {e}")
             dados[nome_aba] = []
@@ -363,20 +719,36 @@ def obter_registros_com_cache(planilha, nome_aba, ttl=None):
     """Lê uma aba com cache independente por aba."""
     global CACHE_PLANILHAS
     agora = time.time()
-    ttl = TEMPO_CACHE_PLANILHA_SEGS if ttl is None else ttl
+    ttl = TEMPO_CACHE_ABAS.get(nome_aba, TEMPO_CACHE_PLANILHA_SEGS) if ttl is None else ttl
     timestamp = CACHE_PLANILHAS["timestamps"].get(nome_aba, 0)
 
     if (nome_aba not in CACHE_PLANILHAS["dados"]) or (agora - timestamp > ttl):
-        print(f"🔄 Baixando aba '{nome_aba}' do Google Sheets...")
+        inicio_leitura = time.perf_counter()
         try:
             aba = planilha.worksheet(nome_aba)
             registros = obter_registros_seguros(aba)
             CACHE_PLANILHAS["dados"][nome_aba] = registros
             CACHE_PLANILHAS["timestamps"][nome_aba] = agora
+            duracao_ms = (time.perf_counter() - inicio_leitura) * 1000
+            print(f"Cache Sheets miss: aba={nome_aba} linhas={len(registros)} duracao_ms={duracao_ms:.0f}")
         except Exception as e:
-            print(f"Erro ao carregar aba {nome_aba}: {e}")
+            duracao_ms = (time.perf_counter() - inicio_leitura) * 1000
+            print(f"Erro ao carregar aba {nome_aba} duracao_ms={duracao_ms:.0f}: {e}")
             return []
     return CACHE_PLANILHAS["dados"].get(nome_aba, [])
+
+
+def invalidar_cache_ab_as(*nomes_abas):
+    global CACHE_LOGIN_DADOS
+    for nome_aba in nomes_abas:
+        CACHE_PLANILHAS["dados"].pop(nome_aba, None)
+        CACHE_PLANILHAS["timestamps"].pop(nome_aba, None)
+    CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
+    if {"PM", "RIO", "PM_Precos", "Informes", "Argumentos", "Modelos"}.intersection(nomes_abas):
+        CACHE_IA["contexto_sistema"] = ""
+        CACHE_IA["timestamp"] = 0
+
+
 def obter_registros_seguros(aba):
     linhas = aba.get_all_values()
     if not linhas or len(linhas) <= 1:
@@ -759,6 +1131,7 @@ def importar_relatorios_drive_vendas():
         # ============================================================
         if novas_linhas_lote:
             aba_negocios.append_rows(novas_linhas_lote)
+            invalidar_cache_ab_as("Negocios_PM")
 
         return f"Sincronização concluída! {importados_count} novos registros importados."
 
@@ -1444,7 +1817,16 @@ TEMPLATE_HTML = r"""
         }
 
         function gerarPDFRelatorio() {
-            window.print();
+            var imagens = Array.from(document.querySelectorAll('#secaoRelatorioPDF img'));
+            Promise.all(imagens.map(function(imagem) {
+                if (imagem.complete) return Promise.resolve();
+                return new Promise(function(resolve) {
+                    imagem.addEventListener('load', resolve, { once: true });
+                    imagem.addEventListener('error', resolve, { once: true });
+                });
+            })).then(function() {
+                window.print();
+            });
         }
 
         function alternarVisaoDashboard() {
@@ -1499,14 +1881,109 @@ TEMPLATE_HTML = r"""
             document.querySelector('[name="comentarios"]').value = "";
         }
 
-        function carregarVendaParaEdicao(indexLinha, cliente, produto, dataVenda, modelo, quantidade, vendedor) {
+        // Funções exclusivas do módulo Negócios em Andamento.
+        // Mantidas no script global para evitar que o JavaScript seja impresso
+        // como texto quando o conteúdo do módulo é montado dinamicamente.
+        function carregarNegocioParaEdicao(indexLinha, temp, data, vendedor, cliente, modelo, chassis, planoManutencao, rioVal, contato, telefone, comentarios) {
+            var edit = document.getElementById('editIndexInput');
+            if (!edit) return;
+            edit.value = indexLinha;
+
+            var titulo = document.getElementById('tituloBotaoSanfona');
+            if (titulo) titulo.innerText = '✏️ Alterar Negociação (Linha ' + indexLinha + ')';
+
+            var btn = document.getElementById('btnSubmitForm');
+            if (btn) btn.innerText = 'Atualizar Negociação';
+            var cancelar = document.getElementById('btnCancelarEdicao');
+            if (cancelar) cancelar.style.display = 'inline-block';
+
+            var setVal = function(name, val) {
+                var el = document.querySelector('#containerFormulario [name="' + name + '"]');
+                if (el) el.value = val || '';
+            };
+            setVal('temperatura', temp);
+            setVal('data', data);
+            setVal('vendedor', vendedor);
+            setVal('cliente', cliente);
+            setVal('modelo', modelo);
+            setVal('chassis', chassis);
+            setVal('plano_manutencao', planoManutencao);
+            setVal('rio', rioVal);
+            setVal('contato', contato);
+            setVal('telefone', telefone);
+            setVal('comentarios', comentarios);
+
+            var container = document.getElementById('containerFormulario');
+            if (container) container.style.display = 'block';
+            var icone = document.getElementById('iconeSanfona');
+            if (icone) icone.innerHTML = '▼';
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        function cancelarNegocioEdicao() {
+            var edit = document.getElementById('editIndexInput');
+            if (edit) edit.value = '';
+            var titulo = document.getElementById('tituloBotaoSanfona');
+            if (titulo) titulo.innerText = '➕ Registrar Nova Negociação';
+            var btn = document.getElementById('btnSubmitForm');
+            if (btn) btn.innerText = 'Salvar Nova Negociação';
+            var cancelar = document.getElementById('btnCancelarEdicao');
+            if (cancelar) cancelar.style.display = 'none';
+            var container = document.getElementById('containerFormulario');
+            if (container) container.style.display = 'none';
+            var icone = document.getElementById('iconeSanfona');
+            if (icone) icone.innerHTML = '▶';
+        }
+
+        function toggleFormularioNegocio() {
+            var container = document.getElementById('containerFormulario');
+            var icone = document.getElementById('iconeSanfona');
+            if (!container) return;
+            var aberto = container.style.display !== 'none';
+            container.style.display = aberto ? 'none' : 'block';
+            if (icone) icone.innerHTML = aberto ? '▶' : '▼';
+        }
+
+        function aplicarFiltrosNegocios() {
+            var busca = document.getElementById('filtroBusca')?.value || '';
+            var vend = document.getElementById('filtroVend')?.value || 'todos';
+            var ano = document.getElementById('filtroAno')?.value || '';
+            var periodo = document.getElementById('filtroPeriodo')?.value || 'anointeiro';
+            window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + encodeURIComponent(ano) + '&periodo=' + encodeURIComponent(periodo);
+        }
+
+        function filtrarTempNegocios(temp) {
+            var busca = document.getElementById('filtroBusca')?.value || '';
+            var vend = document.getElementById('filtroVend')?.value || 'todos';
+            var ano = document.getElementById('filtroAno')?.value || '';
+            var periodo = document.getElementById('filtroPeriodo')?.value || 'anointeiro';
+            window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + encodeURIComponent(ano) + '&periodo=' + encodeURIComponent(periodo) + '&temp=' + encodeURIComponent(temp);
+        }
+
+        function excluirNegocioAndamento(idx) {
+            if (!confirm('Deseja realmente excluir este negócio?')) return;
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/modulo/negocios';
+            var acao = document.createElement('input');
+            acao.type = 'hidden'; acao.name = 'acao_form'; acao.value = 'excluir';
+            var indice = document.createElement('input');
+            indice.type = 'hidden'; indice.name = 'index_linha'; indice.value = idx;
+            form.appendChild(acao); form.appendChild(indice);
+            document.body.appendChild(form);
+            form.submit();
+        }
+
+        function carregarVendaParaEdicao(indexLinha, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor) {
             document.getElementById('editVendaIndexInput').value = indexLinha;
             document.getElementById('tituloFormVendaCard').innerText = "✏️ Alterar Venda / Comprovação (Linha " + indexLinha + ")";
             document.getElementById('btnSubmitVendaForm').innerText = "Atualizar Venda";
             document.getElementById('btnCancelarEdicaoVenda').style.display = "inline-block";
 
             document.querySelector('[name="cliente"]').value = cliente;
-            document.querySelector('[name="produto"]').value = produto;
+            document.querySelector('[name="numero_contrato"]').value = contrato;
+            document.querySelector('[name="plano_manutencao"]').value = plano;
+            document.querySelector('[name="rio"]').value = rio;
             document.querySelector('[name="data_venda"]').value = dataVenda;
             document.querySelector('[name="modelo"]').value = modelo;
             document.querySelector('[name="quantidade"]').value = quantidade;
@@ -1522,7 +1999,9 @@ TEMPLATE_HTML = r"""
             document.getElementById('btnCancelarEdicaoVenda').style.display = "none";
 
             document.querySelector('[name="cliente"]').value = "";
-            document.querySelector('[name="produto"]').value = "";
+            document.querySelector('[name="numero_contrato"]').value = "";
+            document.querySelector('[name="plano_manutencao"]').value = "";
+            document.querySelector('[name="rio"]').value = "";
             document.querySelector('[name="modelo"]').value = "";
             document.querySelector('[name="quantidade"]').value = "";
         }
@@ -2203,7 +2682,9 @@ def acessar_modulo(nome_modulo):
 
     conteudo = ""
     modulo_titulo = NOMES_MODULOS.get(nome_modulo, "Início")
-    _, mapa_drive = obter_conteudo_pastas_drive()
+    mapa_drive = {}
+    if nome_modulo in {"informes", "fichatecnica"}:
+        _, mapa_drive = obter_conteudo_pastas_drive()
     nome_usuario_logado = session.get('nome', 'Usuário')
 
     # ============================================================
@@ -2820,7 +3301,7 @@ def acessar_modulo(nome_modulo):
 
             def carregar_aba(nome):
                 try:
-                    return obter_registros_com_cache(planilha, nome, ttl=60)
+                    return obter_registros_com_cache(planilha, nome)
                 except Exception as e_aba:
                     print(f"Dashboard: erro ao carregar {nome}: {e_aba}")
                     return []
@@ -2989,6 +3470,7 @@ def acessar_modulo(nome_modulo):
                     
                     chave = (
                         norm(origem), norm(cliente), norm(produto),
+                        norm(plano_manutencao), norm(rio_val),
                         norm(modelo), norm(vendedor),
                         dt.strftime("%Y-%m-%d") if dt else ""
                     )
@@ -2996,6 +3478,7 @@ def acessar_modulo(nome_modulo):
                         "origem": origem,
                         "solucao": solucao,
                         "cliente": cliente,
+                        "contrato": obter_numero_contrato(r),
                         "produto": produto,
                         "plano": plano_manutencao,
                         "rio": rio_val,
@@ -3181,8 +3664,8 @@ def acessar_modulo(nome_modulo):
             total_unidades_planos = sum(v["qtd"] for v in vendas)
             total_registros_venda = len(vendas)
 
-            # Quantidade de caminhões vendidos no período.
-            # Regra solicitada: em andamento + fechados + perdidos.
+            # Base de caminhões no período: negociações filtradas mais as
+            # unidades registradas em Vendas_PM, também já filtradas.
             total_pipeline = len(negocios)
 
             fechados_pipeline = sum(
@@ -3198,14 +3681,9 @@ def acessar_modulo(nome_modulo):
                 if n["temperatura_norm"] not in ("FECHADO", "PERDIDA")
             )
 
-            # IMPORTANTE: estes três valores são calculados APÓS a aplicação
-            # de todos os filtros em `negocios`. Portanto, o KPI respeita
-            # exatamente Ano + Período + Consultor + Produto + Estado.
-            #
-            # Total de vendas de caminhão = em andamento + fechadas + perdidas.
-            total_vendas_caminhao = (
-                ativos_pipeline + fechados_pipeline + perdidos_pipeline
-            )
+            # As duas fontes já passaram pelos filtros de ano, período,
+            # consultor, produto e estado antes de entrarem nesta soma.
+            total_vendas_caminhao = total_pipeline + total_unidades_planos
 
             # Meta: 20% dos caminhões do contexto filtrado devem possuir
             # PREV, MAX ou PLUS.
@@ -3219,8 +3697,14 @@ def acessar_modulo(nome_modulo):
             taxa_fechamento = (fechados_pipeline / desfechos * 100) if desfechos else 0.0
 
             # Comissão do Dashboard usa as mesmas regras do módulo Vendas.
-            qtd_pm = sum(v["qtd"] for v in vendas if v["origem"] == "PM")
-            qtd_rio = sum(v["qtd"] for v in vendas if v["origem"] == "RIO")
+            qtd_pm = sum(
+                v["qtd"] for v in vendas
+                if detectar_produtos_comissao(
+                    v.get("produto", ""),
+                    v.get("modelo", ""),
+                    {"P. MANUTENÇÃO": v.get("plano", ""), "RIO": v.get("rio", "")},
+                )[0]
+            )
             comissao_apm_pm = qtd_pm * COMISSAO_APM_PM
             comissao_apm_rio = qtd_rio * COMISSAO_APM_RIO
             comissao_vendedor_pm = qtd_pm * 150.0
@@ -3319,13 +3803,6 @@ def acessar_modulo(nome_modulo):
                     else:
                         aging["+90 dias"] += 1
 
-            # Top clientes por unidades vendidas.
-            por_cliente = {}
-            for v in vendas:
-                c = v["cliente"] or "Não informado"
-                por_cliente[c] = por_cliente.get(c, 0) + v["qtd"]
-            top_clientes = sorted(por_cliente.items(), key=lambda x: x[1], reverse=True)[:10]
-
             # ------------------------------------------------------------
             # Dados JSON enviados uma única vez para o navegador.
             # ------------------------------------------------------------
@@ -3359,7 +3836,6 @@ def acessar_modulo(nome_modulo):
                 "ufs": por_uf,
                 "temperaturas": por_temp,
                 "aging": aging,
-                "top_clientes": top_clientes,
             }
             json_dash = json.dumps(dashboard_data, ensure_ascii=False).replace("</", "<\\/")
 
@@ -3436,8 +3912,10 @@ def acessar_modulo(nome_modulo):
                 linhas_vendas += f"""
                 <tr>
                     <td>{html.escape(v["cliente"] or "-")}</td>
+                    <td>{html.escape(v["contrato"] or "-")}</td>
                     <td>{html.escape(v["modelo"] or "-")}</td>
-                    <td>{html.escape(v["produto"] or "-")}</td>
+                    <td>{html.escape(v["plano"] or "-")}</td>
+                    <td>{html.escape(v["rio"] or "-")}</td>
                     <td class="num">{v["qtd"]}</td>
                     <td>{html.escape(v["vendedor"] or "-")}</td>
                     <td>{html.escape(v["data_txt"] or "-")}</td>
@@ -3445,7 +3923,7 @@ def acessar_modulo(nome_modulo):
                 </tr>
                 """
             if not linhas_vendas:
-                linhas_vendas = '<tr><td colspan="7" class="empty">Nenhuma venda encontrada para os filtros atuais.</td></tr>'
+                linhas_vendas = '<tr><td colspan="9" class="empty">Nenhuma venda encontrada para os filtros atuais.</td></tr>'
 
             linhas_pipeline = ""
             for n in sorted(negocios_ativos, key=lambda x: x["data"] or datetime.min, reverse=True)[:100]:
@@ -3511,6 +3989,7 @@ def acessar_modulo(nome_modulo):
                 .dash-table{{width:100%;border-collapse:collapse;font-size:12px;min-width:780px}}
                 .dash-table th{{position:sticky;top:0;background:#002244;color:#fff;padding:9px;text-align:left;z-index:1}}
                 .dash-table td{{padding:9px;border-bottom:1px solid #eef2f7;color:#334155}}
+                .dash-table-precos th:nth-child(3),.dash-table-precos td:nth-child(3){{text-align:center}}
                 .dash-table tr.plano-separador td{{padding:0;height:8px;background:#f1f5f9;border-bottom:1px solid #cbd5e1}}
                 .dash-table .num{{text-align:center;font-weight:800}}
                 .dash-link{{color:#0066cc;font-weight:700;text-decoration:none}}
@@ -3556,7 +4035,7 @@ def acessar_modulo(nome_modulo):
                 </form>
 
                 <div class="dash-kpis" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));">
-                    <div class="dash-kpi"><small>Total de Vendas de Caminhão</small><strong>{total_vendas_caminhao}</strong><span>em andamento + fechadas + perdidas</span></div>
+                    <div class="dash-kpi"><small>Base de Caminhões</small><strong>{total_vendas_caminhao}</strong><span>Negociações + unidades em Vendas PM</span></div>
                     <div class="dash-kpi"><small>Total de Planos Vendidos</small><strong>{total_planos_vendidos}</strong><span>PREV + MAX + PLUS</span></div>
                     <div class="dash-kpi"><small>Planos Prev</small><strong>{qtd_prev}</strong><span>modalidade Prev</span></div>
                     <div class="dash-kpi"><small>Planos Max</small><strong>{qtd_max}</strong><span>modalidade Max</span></div>
@@ -3575,7 +4054,7 @@ def acessar_modulo(nome_modulo):
                         <span class="dash-note" style="margin:0;">PREV · MAX · PLUS · menor valor mensal de cada modalidade</span>
                     </div>
                     <div class="dash-table-scroll" style="margin-top:10px;">
-                        <table class="dash-table">
+                        <table class="dash-table dash-table-precos">
                             <thead>
                                 <tr>
                                     <th>Plano</th>
@@ -3612,31 +4091,11 @@ def acessar_modulo(nome_modulo):
                     <div class="dash-card"><h3>⏱️ Aging dos negócios ativos</h3><div class="dash-chart"><canvas id="dashAging"></canvas></div></div>
                 </div>
 
-                <div class="dash-grid">
-                    <div class="dash-table-card">
-                        <h3>🏢 Top clientes por unidades vendidas</h3>
-                        <div class="dash-table-scroll">
-                            <table class="dash-table"><thead><tr><th>Cliente</th><th>Unidades</th></tr></thead><tbody>
-                            {''.join(f"<tr><td>{html.escape(str(c))}</td><td class='num'>{q}</td></tr>" for c,q in top_clientes) or '<tr><td colspan="2" class="empty">Sem dados.</td></tr>'}
-                            </tbody></table>
-                        </div>
-                    </div>
-                    <div class="dash-table-card">
-                        <h3>💰 Resumo de comissão PM</h3>
-                        <div class="dash-mini-grid" style="grid-template-columns:1fr 1fr">
-                            <div class="dash-mini"><b>R$ {comissao_apm_pm:,.2f}</b><span>APM · PM {qtd_pm} × R$ 250 + RIO {qtd_rio} × R$ 150</span></div>
-                            <div class="dash-mini"><b>R$ {comissao_vendedor_pm:,.2f}</b><span>Vendedores · PM + RIO conforme regra do veículo/produto</span></div>
-                        </div>
-                        <div class="dash-note">Locação e Consórcio são mostrados em quantidade, pois não há uma regra de comissão dessas fontes definida nas abas consultadas.</div>
-                        {"<div class='dash-note'>Registros de venda idênticos ignorados nesta visualização: <b>" + str(duplicatas) + "</b>.</div>" if duplicatas else ""}
-                    </div>
-                </div>
-
                 <div class="dash-table-card">
                     <h3>🧾 Últimas vendas do filtro</h3>
                     <div class="dash-table-scroll">
                         <table class="dash-table">
-                            <thead><tr><th>Cliente</th><th>Modelo</th><th>Produto</th><th>Qtd.</th><th>Consultor</th><th>Data</th><th>Anexo</th></tr></thead>
+                            <thead><tr><th>Cliente</th><th>Contrato</th><th>Modelo</th><th>Plano de Manutenção</th><th>Produto RIO</th><th>Qtd.</th><th>Consultor</th><th>Data</th><th>Anexo</th></tr></thead>
                             <tbody>{linhas_vendas}</tbody>
                         </table>
                     </div>
@@ -3929,6 +4388,7 @@ def acessar_modulo(nome_modulo):
                             rio_n = str(rn.get("RIO", "")).strip()
                             prod_n = f"{pm_n} / {rio_n}".strip(" /")
                             aba_vendas.append_row([cli_n, prod_n, data_n, mod_n, "1", vend_n, "", "", ""])
+                            invalidar_cache_ab_as(nome_aba_planilha)
                             clientes_ja_em_vendas.add(cli_n.lower())
             except Exception:
                 pass
@@ -3967,12 +4427,7 @@ def acessar_modulo(nome_modulo):
                         if file_key in request.files:
                             file_obj = request.files[file_key]
                             if file_obj and file_obj.filename:
-                                filename_seguro = f"{int(time.time())}_{file_obj.filename}"
-                                upload_folder = os.path.join("static", "uploads")
-                                os.makedirs(upload_folder, exist_ok=True)
-                                caminho_completo = os.path.join(upload_folder, filename_seguro)
-                                file_obj.save(caminho_completo)
-                                anexos[idx_file] = f"/static/uploads/{filename_seguro}"
+                                anexos[idx_file] = subir_comprovante_google_drive(file_obj)
 
                     if cliente_v:
                         dados_venda_linha = [cliente_v, produto_v, data_v, modelo_v, qtd_v, vendedor_v, anexos[0], anexos[1], anexos[2]]
@@ -4058,11 +4513,16 @@ def acessar_modulo(nome_modulo):
                 for anexo_idx in range(1, 4):
                     link_anexo = reg.get(f'ANEXO {anexo_idx}', '')
                     if link_anexo:
-                        anexos_html += f'''
-                        <div onclick="abrirImagemModal('{link_anexo}')" title="Clique para ampliar" style="display: inline-block; margin-right: 12px; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
-                            <img src="{link_anexo}" alt="Anexo {anexo_idx}" class="img-comprovacao">
-                        </div>
-                        '''
+                        url_imagem = url_comprovante_no_app(link_anexo)
+                        if url_imagem:
+                            url_segura = html.escape(url_imagem, quote=True)
+                            anexos_html += f'''
+                            <div onclick="abrirImagemModal('{url_segura}')" title="Clique para ampliar" style="display: inline-block; margin-right: 12px; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
+                                <img src="{url_segura}" alt="Anexo {anexo_idx}" class="img-comprovacao">
+                            </div>
+                            '''
+                        else:
+                            anexos_html += f'<span style="display:inline-block;margin-right:12px;color:#a33;">Comprovante {anexo_idx} indisponível; reenvie o arquivo.</span>'
 
                 botoes_v = f"""
                 <div style="display: flex; gap: 4px;">
@@ -4083,7 +4543,7 @@ def acessar_modulo(nome_modulo):
                     <td style="padding: 10px; border-bottom: none;" class="no-print">{botoes_v}</td>
                 </tr>
                 <tr style="background-color: #fafbfc;">
-                    <td colspan="8" style="padding: 8px 10px 12px 10px; border-bottom: 1px solid #edf2f7;">
+                    <td colspan="9" style="padding: 8px 10px 12px 10px; border-bottom: 1px solid #edf2f7;">
                         <span style="font-size: 11px; font-weight: 700; color: #4a5568; text-transform: uppercase; display: block; margin-bottom: 4px;">Comprovações / Anexos:</span>
                         {anexos_html if anexos_html else '<span style="color: #a0aec0; font-size: 12px;">Nenhum anexo enviado.</span>'}
                     </td>
@@ -4519,8 +4979,11 @@ def acessar_modulo(nome_modulo):
             try:
                 aba_vendas = planilha.worksheet("Vendas_PM")
             except gspread.exceptions.WorksheetNotFound:
-                aba_vendas = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=7)
-                aba_vendas.append_row(["CLIENTE", "PRODUTO", "DATA DA VENDA", "MODELO", "QUANTIDADE", "VENDEDOR", "ANEXO 1"])
+                aba_vendas = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=10)
+                aba_vendas.append_row([
+                    "CLIENTE", "P. MANUTENÇÃO", "RIO", "DATA DA VENDA", "MODELO",
+                    "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO"
+                ])
 
             mapa_vendedor_estado = {}
             try:
@@ -4559,23 +5022,24 @@ def acessar_modulo(nome_modulo):
                 aba_neg_sync = planilha.worksheet("Negocios_PM")
                 regs_neg = obter_registros_seguros(aba_neg_sync)
                 regs_vendas_atuais = obter_registros_seguros(aba_vendas)
-                
-                clientes_ja_em_vendas = set(str(r.get("CLIENTE", "")).strip().lower() for r in regs_vendas_atuais)
+                chaves_vendas = {chave_venda_pm(registro) for registro in regs_vendas_atuais}
 
-                for rn in regs_neg:
-                    temp_n = str(rn.get("TEMPERATURA", "")).strip().lower()
-                    if temp_n == "fechado":
-                        cli_n = str(rn.get("CLIENTE", "")).strip()
-                        if cli_n and cli_n.lower() not in clientes_ja_em_vendas:
-                            data_n = str(rn.get("DATA", "")).strip()
-                            vend_n = str(rn.get("VENDEDOR", "")).strip()
-                            mod_n = str(rn.get("MODELO", "")).strip()
-                            pm_n = str(rn.get("PLANO DE MANUTENÇÃO", "")).strip()
-                            rio_n = str(rn.get("RIO", "")).strip()
-                            prod_n = f"{pm_n} / {rio_n}".strip(" /")
-                            
-                            aba_vendas.append_row([cli_n, prod_n, data_n, mod_n, "1", vend_n, ""])
-                            clientes_ja_em_vendas.add(cli_n.lower())
+                # A partir daqui, qualquer registro que ainda esteja em
+                # Negocios_PM com status Fechado é concluído automaticamente.
+                # Processamos de baixo para cima porque a exclusão de uma linha
+                # altera os índices das linhas que estão acima dela.
+                negocios_fechados_pendentes = [
+                    (idx_neg, rn)
+                    for idx_neg, rn in enumerate(regs_neg, start=2)
+                    if str(rn.get("TEMPERATURA", "")).strip().lower() == "fechado"
+                ]
+                for idx_neg, rn in reversed(negocios_fechados_pendentes):
+                    try:
+                        mover_negocio_fechado_para_vendas(
+                            aba_neg_sync, aba_vendas, idx_neg, rn, chaves_vendas
+                        )
+                    except Exception as exc_mover:
+                        print(f"Aviso ao mover negócio fechado linha {idx_neg}: {exc_mover}")
             except Exception as e_sync_retroativa:
                 print(f"Aviso sync retroativa: {e_sync_retroativa}")
 
@@ -4605,7 +5069,16 @@ def acessar_modulo(nome_modulo):
                 elif acao_form == "cadastrar":
                     index_edicao = request.form.get("index_edicao", "").strip()
                     cliente_v = request.form.get("cliente", "").strip()
-                    produto_v = request.form.get("produto", "").strip()
+                    produto_legado = request.form.get("produto", "").strip()
+                    plano_v = request.form.get("plano_manutencao", "").strip()
+                    rio_v = request.form.get("rio", "").strip()
+                    plano_v, rio_v = separar_produto_venda({
+                        "P. MANUTENÇÃO": plano_v,
+                        "RIO": rio_v,
+                        "PRODUTO": produto_legado,
+                    })
+                    produto_v = " / ".join(valor for valor in (plano_v, rio_v) if valor) or produto_legado
+                    contrato_v = request.form.get("numero_contrato", "").strip()
                     data_v = request.form.get("data_venda", "").strip()
                     modelo_v = request.form.get("modelo", "").strip()
                     qtd_v = request.form.get("quantidade", "").strip()
@@ -4615,31 +5088,46 @@ def acessar_modulo(nome_modulo):
                     if index_edicao:
                         try:
                             linha_atual = aba_vendas.row_values(int(index_edicao))
-                            if len(linha_atual) >= 7: anexo_1_url = linha_atual[6]
+                            cabecalhos_venda = aba_vendas.row_values(1)
+                            idx_anexo_1 = next(
+                                (i for i, nome in enumerate(cabecalhos_venda)
+                                 if normalizar_texto_comissao(nome) == "anexo 1"),
+                                None,
+                            )
+                            if idx_anexo_1 is not None and len(linha_atual) > idx_anexo_1:
+                                anexo_1_url = linha_atual[idx_anexo_1]
                         except Exception:
                             pass
 
                     if "anexo_1" in request.files:
                         file_obj = request.files["anexo_1"]
                         if file_obj and file_obj.filename:
-                            filename_seguro = f"{int(time.time())}_{file_obj.filename}"
-                            upload_folder = os.path.join("static", "uploads")
-                            os.makedirs(upload_folder, exist_ok=True)
-                            caminho_completo = os.path.join(upload_folder, filename_seguro)
-                            file_obj.save(caminho_completo)
-                            anexo_1_url = f"/static/uploads/{filename_seguro}"
+                            anexo_1_url = subir_comprovante_google_drive(file_obj)
 
-                    if cliente_v:
-                        dados_venda_linha = [cliente_v, produto_v, data_v, modelo_v, qtd_v, vendedor_v, anexo_1_url]
+                    if cliente_v and (plano_v or rio_v or produto_legado):
+                        cabecalhos_venda = aba_vendas.row_values(1)
+                        dados_venda_linha = montar_linha_venda_pm({
+                            "CLIENTE": cliente_v,
+                            "PRODUTO": produto_v,
+                            "P. MANUTENÇÃO": plano_v,
+                            "RIO": rio_v,
+                            "CONTRATO": contrato_v,
+                            "DATA": data_v,
+                            "MODELO": modelo_v,
+                            "QUANTIDADE": qtd_v,
+                            "VENDEDOR": vendedor_v,
+                            "ANEXO 1": anexo_1_url,
+                        }, cabecalhos_venda)
+                        ultima_coluna = chr(ord("A") + len(cabecalhos_venda) - 1)
                         if index_edicao:
                             idx_int = int(index_edicao)
-                            aba_vendas.update(f"A{idx_int}:G{idx_int}", [dados_venda_linha])
+                            aba_vendas.update(f"A{idx_int}:{ultima_coluna}{idx_int}", [dados_venda_linha])
                             sucesso_msg = "Venda atualizada com sucesso!"
                         else:
                             aba_vendas.append_row(dados_venda_linha)
                             sucesso_msg = "Venda registrada com sucesso!"
                     else:
-                        erro_msg = "Informe o cliente para registrar a venda."
+                        erro_msg = "Informe o cliente e ao menos um produto (Plano de Manutenção ou RIO)."
 
             linhas_vendas_brutas = aba_vendas.get_all_values()
             
@@ -4744,9 +5232,9 @@ def acessar_modulo(nome_modulo):
                 contador_vendas += 1
                 idx_l = reg["_index_planilha"]
                 cli = reg.get('CLIENTE', '')
-                prod = reg.get('PRODUTO', '')
-                if not str(prod).strip():
-                    prod = reg.get('PLANO DE MANUTENÇÃO', '') or reg.get('P. MANUTENÇÃO', '') or reg.get('PLANO', '')
+                contrato_reg = obter_numero_contrato(reg)
+                plano_reg, rio_reg = separar_produto_venda(reg)
+                prod = " / ".join(valor for valor in (plano_reg, rio_reg) if valor) or str(reg.get('PRODUTO', '')).strip()
                 dt_v = reg.get('DATA DA VENDA', '')
                 mod = reg.get('MODELO', '')
                 qtd_str = reg.get('QUANTIDADE', '1')
@@ -4813,32 +5301,44 @@ def acessar_modulo(nome_modulo):
                 link_anexo_1 = reg.get('ANEXO 1', '')
                 anexos_html = ""
                 if link_anexo_1:
-                    anexos_html = f'''
-                    <div onclick="abrirImagemModal('{link_anexo_1}')" title="Clique para ampliar" style="display: inline-block; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
-                        <img src="{link_anexo_1}" alt="Anexo 1" class="img-comprovacao">
-                    </div>
-                    '''
+                    url_imagem = url_comprovante_no_app(link_anexo_1)
+                    if url_imagem:
+                        url_segura = html.escape(url_imagem, quote=True)
+                        anexos_html = f'''
+                        <div onclick="abrirImagemModal('{url_segura}')" title="Clique para ampliar" style="display: inline-block; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
+                            <img src="{url_segura}" alt="Anexo 1" class="img-comprovacao">
+                        </div>
+                        '''
+                    else:
+                        anexos_html = '<span style="color:#a33;">Comprovante indisponível; reenvie o arquivo.</span>'
 
+                argumentos_edicao = ", ".join(
+                    json.dumps(str(valor or ""), ensure_ascii=False)
+                    for valor in (cli, contrato_reg, plano_reg, rio_reg, dt_v, mod, qtd_str, vend)
+                )
+                argumentos_edicao = html.escape(argumentos_edicao, quote=True)
                 botoes_v = f"""
                 <div style="display: flex; gap: 4px;">
-                    <button type="button" class="btn-acao btn-editar no-print" onclick="carregarVendaParaEdicao({idx_l}, '{cli}', '{prod}', '{dt_v}', '{mod}', '{qtd_str}', '{vend}')">Alterar</button>
+                    <button type="button" class="btn-acao btn-editar no-print" onclick="carregarVendaParaEdicao({idx_l}, {argumentos_edicao})">Alterar</button>
                     <button type="button" class="btn-acao btn-excluir no-print" onclick="excluirVenda({idx_l}, 'vendas')">Excluir</button>
                 </div>
                 """
 
                 tabela_vendas_linhas += f"""
                 <tr>
-                    <td style="padding: 10px; border-bottom: none;"><b>{cli}</b></td>
-                    <td style="padding: 10px; border-bottom: none;">{prod}</td>
-                    <td style="padding: 10px; border-bottom: none;">{dt_v}</td>
-                    <td style="padding: 10px; border-bottom: none;">{mod}</td>
-                    <td style="padding: 10px; border-bottom: none;">{qtd_str}</td>
-                    <td style="padding: 10px; border-bottom: none;">{vend} ({estado_v})</td>
+                    <td style="padding: 10px; border-bottom: none;"><b>{html.escape(str(cli))}</b></td>
+                    <td style="padding: 10px; border-bottom: none;">{html.escape(str(contrato_reg))}</td>
+                    <td style="padding: 10px; border-bottom: none;">{html.escape(str(plano_reg))}</td>
+                    <td style="padding: 10px; border-bottom: none;">{html.escape(str(rio_reg))}</td>
+                    <td style="padding: 10px; border-bottom: none;">{html.escape(str(dt_v))}</td>
+                    <td style="padding: 10px; border-bottom: none;">{html.escape(str(mod))}</td>
+                    <td style="padding: 10px; border-bottom: none;">{html.escape(str(qtd_str))}</td>
+                    <td style="padding: 10px; border-bottom: none;">{html.escape(str(vend))} ({html.escape(str(estado_v))})</td>
                     <td style="padding: 10px; border-bottom: none;" class="no-print">-</td>
                     <td style="padding: 10px; border-bottom: none;" class="no-print">{botoes_v}</td>
                 </tr>
                 <tr style="background-color: #fafbfc;">
-                    <td colspan="8" style="padding: 8px 10px 12px 10px; border-bottom: 1px solid #edf2f7;">
+                    <td colspan="10" style="padding: 8px 10px 12px 10px; border-bottom: 1px solid #edf2f7;">
                         <span style="font-size: 11px; font-weight: 700; color: #4a5568; text-transform: uppercase; display: block; margin-bottom: 4px;">Comprovação (Anexo 1):</span>
                         {anexos_html if anexos_html else '<span style="color: #a0aec0; font-size: 12px;">Nenhum anexo enviado.</span>'}
                     </td>
@@ -4846,7 +5346,7 @@ def acessar_modulo(nome_modulo):
                 """
 
             if contador_vendas == 0:
-                tabela_vendas_linhas = '<tr><td colspan="8" style="padding: 20px; text-align: center; color: #718096;">Nenhuma venda encontrada para este filtro.</td></tr>'
+                tabela_vendas_linhas = '<tr><td colspan="10" style="padding: 20px; text-align: center; color: #718096;">Nenhuma venda encontrada para este filtro.</td></tr>'
 
             def formata_br(valor):
                 return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -4944,8 +5444,16 @@ def acessar_modulo(nome_modulo):
                                     <input type="text" name="cliente" placeholder="Nome do Cliente / Empresa" required>
                                 </div>
                                 <div>
-                                    <label>Produto (Plano / RIO)</label>
-                                    <input type="text" name="produto" placeholder="Ex: PREV / RIO" required>
+                                    <label>Nº do Contrato</label>
+                                    <input type="text" name="numero_contrato" placeholder="Número do contrato">
+                                </div>
+                                <div>
+                                    <label>Plano de Manutenção</label>
+                                    <input type="text" name="plano_manutencao" placeholder="Ex: PREV, MAX ou PLUS">
+                                </div>
+                                <div>
+                                    <label>RIO</label>
+                                    <input type="text" name="rio" placeholder="Ex: Diagnóstico Remoto">
                                 </div>
                             </div>
 
@@ -5020,11 +5528,13 @@ def acessar_modulo(nome_modulo):
                             <thead>
                                 <tr style="background: #002244; color: #ffffff; border-bottom: 2px solid #001529;">
                                     <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 0, 'text')">Cliente ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 1, 'text')">Produto ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 2, 'data')">Data da Venda ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 3, 'text')">Modelo ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 4, 'num')">Quantidade ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 5, 'text')">Vendedor / Região ↕</th>
+                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 1, 'text')">Nº do Contrato ↕</th>
+                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 2, 'text')">Plano de Manutenção ↕</th>
+                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 3, 'text')">RIO ↕</th>
+                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 4, 'data')">Data da Venda ↕</th>
+                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 5, 'text')">Modelo ↕</th>
+                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 6, 'num')">Quantidade ↕</th>
+                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 7, 'text')">Vendedor / Região ↕</th>
                                     <th style="padding: 10px;" class="no-print">Comprovação</th>
                                     <th style="padding: 10px;" class="no-print">Ações</th>
                                 </tr>
@@ -5093,7 +5603,7 @@ def acessar_modulo(nome_modulo):
                     }}
                 }}
 
-                function carregarVendaParaEdicao(idx, cliente, produto, dataVenda, modelo, quantidade, vendedor) {{
+                function carregarVendaParaEdicao(idx, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor) {{
                     var container = document.getElementById('containerFormularioVenda');
                     container.style.display = 'block';
                     document.getElementById('iconeSanfonaVenda').innerHTML = '▼';
@@ -5104,7 +5614,9 @@ def acessar_modulo(nome_modulo):
                     document.getElementById('btnCancelarEdicaoVenda').style.display = "inline-block";
 
                     document.querySelector('[name="cliente"]').value = cliente;
-                    document.querySelector('[name="produto"]').value = produto;
+                    document.querySelector('[name="numero_contrato"]').value = contrato;
+                    document.querySelector('[name="plano_manutencao"]').value = plano;
+                    document.querySelector('[name="rio"]').value = rio;
                     document.querySelector('[name="data_venda"]').value = dataVenda;
                     document.querySelector('[name="modelo"]').value = modelo;
                     document.querySelector('[name="quantidade"]').value = quantidade;
@@ -5122,7 +5634,9 @@ def acessar_modulo(nome_modulo):
                     document.getElementById('iconeSanfonaVenda').innerHTML = '▶';
 
                     document.querySelector('[name="cliente"]').value = "";
-                    document.querySelector('[name="produto"]').value = "";
+                    document.querySelector('[name="numero_contrato"]').value = "";
+                    document.querySelector('[name="plano_manutencao"]').value = "";
+                    document.querySelector('[name="rio"]').value = "";
                     document.querySelector('[name="modelo"]').value = "";
                     document.querySelector('[name="quantidade"]').value = "";
                 }}
@@ -5388,6 +5902,61 @@ def acessar_modulo(nome_modulo):
                         else:
                             aba_negocios.append_row(dados_linha)
                             sucesso_msg = "Negócio cadastrado com sucesso!"
+
+                        if temperatura.lower() == "fechado":
+                            try:
+                                try:
+                                    aba_vendas_fechadas = planilha.worksheet("Vendas_PM")
+                                except gspread.exceptions.WorksheetNotFound:
+                                    aba_vendas_fechadas = planilha.add_worksheet(
+                                        title="Vendas_PM", rows=1000, cols=9
+                                    )
+                                    aba_vendas_fechadas.append_row([
+                                        "CLIENTE", "P. MANUTENÇÃO", "RIO", "DATA DA VENDA",
+                                        "MODELO", "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2"
+                                    ])
+
+                                negocio_fechado = {
+                                    "CLIENTE": cliente,
+                                    "PRODUTO": f"{plano_manutencao} / {rio_val}".strip(" /"),
+                                    "DATA": data_neg,
+                                    "MODELO": modelo,
+                                    "QUANTIDADE": "1",
+                                    "PLANO DE MANUTENÇÃO": plano_manutencao,
+                                    "RIO": rio_val,
+                                    "VENDEDOR": vendedor_form,
+                                }
+
+                                # Importante: não existe mais etapa/botão "Vender".
+                                # Ao escolher Fechado e salvar, a venda vai diretamente
+                                # para Vendas_PM, que é a base usada pelas comissões.
+                                registros_vendas_fechadas = obter_registros_seguros(aba_vendas_fechadas)
+                                chaves_vendas_fechadas = {
+                                    chave_venda_pm(r) for r in registros_vendas_fechadas
+                                }
+
+                                index_origem = int(index_edicao) if index_edicao else len(aba_negocios.get_all_values())
+                                nova_venda = sincronizar_negocio_fechado(
+                                    aba_vendas_fechadas,
+                                    negocio_fechado,
+                                    chaves_vendas_fechadas
+                                )
+
+                                # Só remove da Negocios_PM depois que a venda foi
+                                # criada ou confirmada como já existente.
+                                if index_origem > 1:
+                                    aba_negocios.delete_rows(index_origem)
+
+                                if nova_venda:
+                                    sucesso_msg = "Negócio fechado e transferido automaticamente para Vendas Fechadas. As comissões serão calculadas pelas regras vigentes."
+                                else:
+                                    sucesso_msg = "Negócio já constava em Vendas Fechadas e foi retirado de Negócios em Andamento."
+                            except Exception as erro_sync:
+                                print(f"Erro ao transferir negócio fechado para Vendas_PM: {erro_sync}")
+                                erro_msg = (
+                                    "Não foi possível concluir a transferência para Vendas Fechadas. "
+                                    "O registro permanece em Negócios em Andamento para não ser perdido."
+                                )
                     else:
                         erro_msg = "Preencha ao menos o Cliente e o Vendedor."
 
@@ -5482,6 +6051,9 @@ def acessar_modulo(nome_modulo):
                     elif len(periodo_selecionado) == 2 and periodo_selecionado.isdigit() and mes_item != periodo_selecionado:
                         continue
 
+                    if temp_lower == "fechado":
+                        continue
+
                     kpis["total"] += 1
                     if temp_lower in kpis:
                         kpis[temp_lower] += 1
@@ -5513,15 +6085,10 @@ def acessar_modulo(nome_modulo):
                 tel = reg.get('TELEFONE', '')
                 com = reg.get('COMENTÁRIOS', '')
 
-                btn_venda_direta = ""
-                if temp.strip().lower() == "fechado":
-                    btn_venda_direta = f'<button type="button" class="btn-acao" style="background:#2f855a; color:#fff;" onclick="sincronizarParaVendas({idx_l}, \'{cli}\', \'{plano} / {rio}\', \'{dt}\', \'{mod}\', \'{vend}\')">✔ Venda</button>'
-
                 botoes_acoes = f"""
                 <div style="display: flex; gap: 4px; align-items: center; justify-content: flex-end;">
-                    {btn_venda_direta}
-                    <button type="button" class="btn-acao btn-editar" onclick="carregarParaEdicao({idx_l}, '{temp}', '{dt}', '{vend}', '{cli}', '{mod}', '{chassis}', '{plano}', '{rio}', '{contato}', '{tel}', '{com}')">Alterar</button>
-                    <button type="button" class="btn-acao btn-excluir" onclick="excluirNegocio({idx_l})">Excluir</button>
+                    <button type="button" class="btn-acao btn-editar" onclick="carregarNegocioParaEdicao({idx_l}, '{temp}', '{dt}', '{vend}', '{cli}', '{mod}', '{chassis}', '{plano}', '{rio}', '{contato}', '{tel}', '{com}')">Alterar</button>
+                    <button type="button" class="btn-acao btn-excluir" onclick="excluirNegocioAndamento({idx_l})">Excluir</button>
                 </div>
                 """
 
@@ -5549,31 +6116,27 @@ def acessar_modulo(nome_modulo):
             <div>
                 <!-- KPIs Estilo Painel -->
                 <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 15px;">
-                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #3182ce; cursor:pointer;" onclick="filtrarTemp('todas')">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #3182ce; cursor:pointer;" onclick="filtrarTempNegocios('todas')">
                         <div style="font-size:10px; color:#718096; font-weight:700;">TOTAL</div>
                         <div style="font-size:20px; font-weight:bold; color:#2d3748;">{kpis['total']}</div>
                     </div>
-                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #2f855a; cursor:pointer;" onclick="filtrarTemp('fechado')">
-                        <div style="font-size:10px; color:#2f855a; font-weight:700;">FECHADO</div>
-                        <div style="font-size:20px; font-weight:bold; color:#2f855a;">{kpis['fechado']}</div>
-                    </div>
-                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #e53e3e; cursor:pointer;" onclick="filtrarTemp('sup. quente')">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #e53e3e; cursor:pointer;" onclick="filtrarTempNegocios('sup. quente')">
                         <div style="font-size:10px; color:#e53e3e; font-weight:700;">SUPER QUENTE</div>
                         <div style="font-size:20px; font-weight:bold; color:#e53e3e;">{kpis['super quente']}</div>
                     </div>
-                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #dd6b20; cursor:pointer;" onclick="filtrarTemp('quente')">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #dd6b20; cursor:pointer;" onclick="filtrarTempNegocios('quente')">
                         <div style="font-size:10px; color:#dd6b20; font-weight:700;">QUENTE</div>
                         <div style="font-size:20px; font-weight:bold; color:#dd6b20;">{kpis['quente']}</div>
                     </div>
-                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #d69e2e; cursor:pointer;" onclick="filtrarTemp('morno')">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #d69e2e; cursor:pointer;" onclick="filtrarTempNegocios('morno')">
                         <div style="font-size:10px; color:#d69e2e; font-weight:700;">MORNO</div>
                         <div style="font-size:20px; font-weight:bold; color:#d69e2e;">{kpis['morno']}</div>
                     </div>
-                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #742a2a; cursor:pointer;" onclick="filtrarTemp('perdida')">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #742a2a; cursor:pointer;" onclick="filtrarTempNegocios('perdida')">
                         <div style="font-size:10px; color:#742a2a; font-weight:700;">PERDIDA</div>
                         <div style="font-size:20px; font-weight:bold; color:#742a2a;">{kpis['perdida']}</div>
                     </div>
-                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #4a5568; cursor:pointer;" onclick="filtrarTemp('frio')">
+                    <div style="background:#fff; border:1px solid #cbd5e0; border-radius:6px; padding:10px; border-left:4px solid #4a5568; cursor:pointer;" onclick="filtrarTempNegocios('frio')">
                         <div style="font-size:10px; color:#4a5568; font-weight:700;">FRIO</div>
                         <div style="font-size:20px; font-weight:bold; color:#4a5568;">{kpis['frio']}</div>
                     </div>
@@ -5616,7 +6179,7 @@ def acessar_modulo(nome_modulo):
 
                             <div style="display: flex; gap: 10px; margin-top: 10px;">
                                 <button type="submit" id="btnSubmitForm" class="btn-login" style="width: auto; padding: 10px 24px;">Salvar Nova Negociação</button>
-                                <button type="button" id="btnCancelarEdicao" onclick="cancelarEdicao()" style="display:none; background:#cbd5e0; border:none; padding:10px 16px; border-radius:6px; cursor:pointer; font-weight:600;">Cancelar Edição</button>
+                                <button type="button" id="btnCancelarEdicao" onclick="cancelarNegocioEdicao()" style="display:none; background:#cbd5e0; border:none; padding:10px 16px; border-radius:6px; cursor:pointer; font-weight:600;">Cancelar Edição</button>
                             </div>
                         </form>
                     </div>
@@ -5673,202 +6236,6 @@ def acessar_modulo(nome_modulo):
                 </div>
             </div>
 
-           <script>
-    (function() {{
-        function iniciarBarraHorizontalNegocios() {{
-            const barra = document.getElementById('barraScrollNegocios');
-            const interna = document.getElementById('barraScrollNegociosInner');
-            const tabelaWrap = document.getElementById('negociosTabelaWrapPrincipal');
-            const tabela = document.getElementById('tabelaNegociosPrincipal');
-
-            if (!barra || !interna || !tabelaWrap || !tabela) return;
-
-            function sincronizarLargura() {{
-                interna.style.width = Math.max(tabela.scrollWidth, 1450) + 'px';
-            }}
-
-            let sincronizando = false;
-
-            barra.addEventListener('scroll', function() {{
-                if (sincronizando) return;
-                sincronizando = true;
-                tabelaWrap.scrollLeft = barra.scrollLeft;
-                sincronizando = false;
-            }});
-
-            tabelaWrap.addEventListener('scroll', function() {{
-                if (sincronizando) return;
-                sincronizando = true;
-                barra.scrollLeft = tabelaWrap.scrollLeft;
-                sincronizando = false;
-            }});
-
-            sincronizarLargura();
-            window.addEventListener('resize', sincronizarLargura);
-
-            // Shift + roda do mouse também movimenta a tabela.
-            tabelaWrap.addEventListener('wheel', function(e) {{
-                if (e.shiftKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {{
-                    e.preventDefault();
-                    tabelaWrap.scrollLeft += e.deltaY;
-                }}
-            }}, {{passive: false}});
-        }}
-
-        if (document.readyState === 'loading') {{
-            document.addEventListener('DOMContentLoaded', iniciarBarraHorizontalNegocios);
-        }} else {{
-            iniciarBarraHorizontalNegocios();
-        }}
-    }})();
-
-    function toggleFormularioNegocio() {{
-        var container = document.getElementById('containerFormulario');
-        var icone = document.getElementById('iconeSanfona');
-        if (container.style.display === 'none') {{
-            container.style.display = 'block';
-            icone.innerHTML = '▼';
-        }} else {{
-            container.style.display = 'none';
-            icone.innerHTML = '▶';
-        }}
-    }}
-
-    function carregarParaEdicao(indexLinha, temp, data, vendedor, cliente, modelo, chassis, planoManutencao, rioVal, contato, telefone, comentarios) {{
-        document.getElementById('editIndexInput').value = indexLinha;
-        var btnSanfona = document.getElementById('tituloBotaoSanfona');
-        if (btnSanfona) btnSanfona.innerText = "✏️ Alterar Negociação (Linha " + indexLinha + ")";
-
-        document.getElementById('btnSubmitForm').innerText = "Atualizar Negociação";
-        document.getElementById('btnCancelarEdicao').style.display = "inline-block";
-
-        var setVal = function(name, val) {{
-            var el = document.querySelector('[name="' + name + '"]');
-            if (el) el.value = val || "";
-        }};
-
-        setVal('temperatura', temp);
-        setVal('data', data);
-        setVal('vendedor', vendedor);
-        setVal('cliente', cliente);
-        setVal('modelo', modelo);
-        setVal('chassis', chassis);
-        setVal('plano_manutencao', planoManutencao);
-        setVal('rio', rioVal);
-        setVal('contato', contato);
-        setVal('telefone', telefone);
-        setVal('comentarios', comentarios);
-
-        var container = document.getElementById('containerFormulario');
-        if (container) {{
-            container.style.display = 'block';
-            var icone = document.getElementById('iconeSanfona');
-            if (icone) icone.innerHTML = '▼';
-        }}
-
-        window.scrollTo({{ top: 0, behavior: 'smooth' }});
-    }}
-
-    function cancelarEdicao() {{
-        document.getElementById('editIndexInput').value = "";
-        document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
-        document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
-        document.getElementById('btnCancelarEdicao').style.display = "none";
-        document.getElementById('containerFormulario').style.display = 'none';
-        document.getElementById('iconeSanfona').innerHTML = '▶';
-    }}
-
-    function aplicarFiltrosNegocios() {{
-        var busca = document.getElementById('filtroBusca').value;
-        var vend = document.getElementById('filtroVend').value;
-        var ano = document.getElementById('filtroAno').value;
-        var periodo = document.getElementById('filtroPeriodo').value;
-        window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
-    }}
-
-    function filtrarTemp(temp) {{
-        var busca = document.getElementById('filtroBusca').value;
-        var vend = document.getElementById('filtroVend').value;
-        var ano = document.getElementById('filtroAno').value;
-        var periodo = document.getElementById('filtroPeriodo').value;
-        window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
-    }}
-
-    function excluirNegocio(idx) {{
-        if (confirm("Deseja realmente excluir este negócio?")) {{
-            var form = document.createElement('form');
-            form.method = 'POST';
-            form.action = '/modulo/negocios';
-
-            var inputAcao = document.createElement('input');
-            inputAcao.type = 'hidden';
-            inputAcao.name = 'acao_form';
-            inputAcao.value = 'excluir';
-            form.appendChild(inputAcao);
-
-            var inputIdx = document.createElement('input');
-            inputIdx.type = 'hidden';
-            inputIdx.name = 'index_linha';
-            inputIdx.value = idx;
-            form.appendChild(inputIdx);
-
-            document.body.appendChild(form);
-            form.submit();
-        }}
-    }}
-</script>
-                function sincronizarParaVendas(idx, cliente, produto, data, modelo, vendedor) {{
-                    // Opcional para negócios fechados
-                }}
-                
-                function cancelarEdicao() {{
-                    document.getElementById('editIndexInput').value = "";
-                    document.getElementById('tituloBotaoSanfona').innerText = "➕ Registrar Nova Negociação";
-                    document.getElementById('btnSubmitForm').innerText = "Salvar Nova Negociação";
-                    document.getElementById('btnCancelarEdicao').style.display = "none";
-                    document.getElementById('containerFormulario').style.display = 'none';
-                    document.getElementById('iconeSanfona').innerHTML = '▶';
-                }}
-
-                function aplicarFiltrosNegocios() {{
-                    var busca = document.getElementById('filtroBusca').value;
-                    var vend = document.getElementById('filtroVend').value;
-                    var ano = document.getElementById('filtroAno').value;
-                    var periodo = document.getElementById('filtroPeriodo').value;
-                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo;
-                }}
-
-                function filtrarTemp(temp) {{
-                    var busca = document.getElementById('filtroBusca').value;
-                    var vend = document.getElementById('filtroVend').value;
-                    var ano = document.getElementById('filtroAno').value;
-                    var periodo = document.getElementById('filtroPeriodo').value;
-                    window.location.href = '/modulo/negocios?busca=' + encodeURIComponent(busca) + '&vend=' + encodeURIComponent(vend) + '&ano=' + ano + '&periodo=' + periodo + '&temp=' + temp;
-                }}
-
-                function excluirNegocio(idx) {{
-                    if (confirm("Deseja realmente excluir este negócio?")) {{
-                        var form = document.createElement('form');
-                        form.method = 'POST';
-                        form.action = '/modulo/negocios';
-                        
-                        var inputAcao = document.createElement('input');
-                        inputAcao.type = 'hidden';
-                        inputAcao.name = 'acao_form';
-                        inputAcao.value = 'excluir';
-                        form.appendChild(inputAcao);
-
-                        var inputIdx = document.createElement('input');
-                        inputIdx.type = 'hidden';
-                        inputIdx.name = 'index_linha';
-                        inputIdx.value = idx;
-                        form.appendChild(inputIdx);
-
-                        document.body.appendChild(form);
-                        form.submit();
-                    }}
-                }}
-            </script>
             """
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px;"><b>Erro ao carregar Negócios:</b> {e}</div>'
@@ -6626,6 +6993,23 @@ def acessar_modulo(nome_modulo):
         </div>
         """
 
+    if request.method == "POST":
+        abas_cache_por_modulo = {
+            "rio": ("RIO",),
+            "pm": ("PM",),
+            "valores": ("PM_Precos",),
+            "informes": ("Informes",),
+            "argumentos": ("Argumentos",),
+            "fichatecnica": ("Modelos",),
+            "vendas": ("Vendas_PM", "Negocios_PM"),
+            "negocios": ("Negocios_PM", "Vendas_PM"),
+            "locacao_vendas": ("Vendas_LOC", "Negocio_LOC"),
+            "locacao_negocios": ("Negocio_LOC", "Vendas_LOC"),
+            "consorcio_vendas": ("Vendas_Consorcio", "Negocios_Consorcio"),
+            "consorcio_negocios": ("Negocios_Consorcio", "Vendas_Consorcio"),
+        }
+        invalidar_cache_ab_as(*abas_cache_por_modulo.get(nome_modulo, ()))
+
     return render_template_string(
         TEMPLATE_HTML, 
         conteudo_modulo=conteudo, 
@@ -6635,13 +7019,17 @@ def acessar_modulo(nome_modulo):
 
 @app.route("/api/limpar-cache", methods=["POST"])
 def limpar_cache():
-    global CACHE_IA, CACHE_PLANILHAS
+    global CACHE_IA, CACHE_PLANILHAS, CACHE_LOGIN_DADOS, CACHE_DRIVE, CACHE_PLANILHA_CLIENTE
     CACHE_IA["contexto_sistema"] = ""
     CACHE_IA["timestamp"] = 0
-    
-    CACHE_PLANILHAS["dados"] = {}
-    CACHE_PLANILHAS["timestamps"] = {}
-    
+
+    CACHE_PLANILHAS = {"dados": {}, "timestamps": {}}
+    CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
+    CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
+    CACHE_PLANILHA_CLIENTE = {"cliente": None, "timestamp": 0}
+    if "CACHE_CAMPANHAS" in globals():
+        CACHE_CAMPANHAS.clear()
+
     return jsonify({"mensagem": "Base de dados, cache de planilhas e IA atualizados com sucesso!"})
 
 @app.route("/api/chat-ia", methods=["POST"])
@@ -6776,6 +7164,7 @@ def api_atualizacoes():
 
             base_id = "|".join((assunto, circular, info, data_atualizacao))
             hash_conteudo = hashlib.sha1(base_id.encode("utf-8", "ignore")).hexdigest()[:16]
+            chave_informe = hashlib.sha1("|".join((assunto, circular)).encode("utf-8", "ignore")).hexdigest()[:16]
 
             descricao_partes = []
             if circular:
@@ -6785,7 +7174,7 @@ def api_atualizacoes():
             descricao = " — ".join(descricao_partes) or "Atualização disponível no menu Informes e Circulares."
 
             atualizacoes.append({
-                "id": f"informe:{i}:{hash_conteudo}",
+                "id": f"informe:{chave_informe}:{hash_conteudo}",
                 "tipo": "Atualização",
                 "titulo": assunto or "Novo informe disponível",
                 "descricao": descricao,

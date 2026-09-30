@@ -14,6 +14,7 @@ from google import genai
 
 from flask import Flask, abort, redirect, render_template_string, request, session, url_for, jsonify, send_file
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from werkzeug.datastructures import FileStorage
@@ -87,7 +88,12 @@ def conectar_google_sheets():
 
 
 def conectar_google_drive():
-    if "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
+    credenciais_oauth = os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
+    if credenciais_oauth:
+        credenciais = OAuthCredentials.from_authorized_user_info(
+            json.loads(credenciais_oauth), scopes=escopos
+        )
+    elif "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
         credenciais = Credentials.from_service_account_info(
             json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=escopos
         )
@@ -108,14 +114,24 @@ def salvar_comprovante_static(arquivo):
     return f"/static/uploads/{nome_arquivo}"
 
 
-def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True):
-    """Tenta o Drive e usa static local quando a conta não puder armazenar arquivos."""
+def nomear_comprovante_venda(cliente, produto, chassis, nome_original):
+    componentes = []
+    for valor, limite in ((cliente, 40), (produto, 60), (chassis, 40)):
+        componente = secure_filename(str(valor or "").strip())[:limite]
+        componentes.append(componente or "nao_informado")
+
+    extensao = os.path.splitext(secure_filename(os.path.basename(str(nome_original or ""))))[1].lower()
+    return f"{'_'.join(componentes)}_{time.time_ns()}{extensao}"
+
+
+def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_arquivo=None):
+    """Envia comprovantes para a pasta de vendas no Drive."""
     try:
         service = conectar_google_drive()
-        folder_id = os.environ.get("GOOGLE_DRIVE_UPLOAD_FOLDER_ID", "").strip()
+        folder_id = os.environ.get("GOOGLE_DRIVE_UPLOAD_VENDAS_FOLDER_ID", "").strip()
         if not folder_id:
             resposta = service.files().list(
-                q="(name = 'Upload_Comprovantes' or name = 'Uplod_Comprovantes') and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                q="name = 'Upload_Vendas' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
                 fields="files(id, name)",
                 pageSize=100,
                 supportsAllDrives=True,
@@ -124,12 +140,29 @@ def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True):
             pastas = resposta.get("files", [])
             if len(pastas) != 1:
                 raise RuntimeError(
-                    "A pasta Upload_Comprovantes/Uplod_Comprovantes não foi encontrada de forma única."
+                    "A pasta Upload_Vendas não foi encontrada de forma única."
                 )
             folder_id = pastas[0]["id"]
 
+        pasta_upload = service.files().get(
+            fileId=folder_id,
+            fields="id, name, mimeType, driveId",
+            supportsAllDrives=True,
+        ).execute()
+        if pasta_upload.get("mimeType") != "application/vnd.google-apps.folder":
+            raise RuntimeError("O ID configurado para Upload_Vendas não é uma pasta do Google Drive.")
+        if (
+            not pasta_upload.get("driveId")
+            and not os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
+        ):
+            raise RuntimeError(
+                "Upload_Vendas está no Meu Drive. Contas de serviço não têm cota de armazenamento; "
+                "configure GOOGLE_DRIVE_OAUTH_CREDENTIALS com OAuth de um usuário Google "
+                "ou mova a pasta para uma Unidade compartilhada."
+            )
+
         nome_original = secure_filename(os.path.basename(str(arquivo.filename or "comprovante"))) or "comprovante"
-        nome_arquivo = f"{time.time_ns()}_{nome_original}"
+        nome_arquivo = secure_filename(os.path.basename(str(nome_arquivo or ""))) or f"{time.time_ns()}_{nome_original}"
         arquivo.stream.seek(0)
         media = MediaIoBaseUpload(
             arquivo.stream,
@@ -174,7 +207,7 @@ def migrar_comprovantes_static(aba_vendas):
     if len(linhas) < 2:
         return 0
 
-    cabecalhos = [normalizar_texto_comissao(valor) for valor in linhas[0]]
+    cabecalhos = [normalizar_chave_planilha(valor) for valor in linhas[0]]
     colunas_anexos = [
         (indice, cabecalho)
         for indice, cabecalho in enumerate(cabecalhos)
@@ -193,16 +226,45 @@ def migrar_comprovantes_static(aba_vendas):
             if os.path.commonpath([caminho, pasta_uploads]) != pasta_uploads or not os.path.isfile(caminho):
                 continue
 
-            with open(caminho, "rb") as arquivo_local:
-                arquivo = FileStorage(
-                    stream=arquivo_local,
-                    filename=os.path.basename(caminho),
-                    content_type=mimetypes.guess_type(caminho)[0] or "application/octet-stream",
+            try:
+                registro = {
+                    cabecalho: linha[indice]
+                    for indice, cabecalho in enumerate(cabecalhos)
+                    if indice < len(linha)
+                }
+                produto = str(
+                    registro.get("produto")
+                    or " / ".join(
+                        valor for valor in (
+                            registro.get("p manutencao"),
+                            registro.get("rio"),
+                        ) if valor
+                    )
+                ).strip()
+                nome_arquivo = nomear_comprovante_venda(
+                    registro.get("cliente", ""),
+                    produto,
+                    registro.get("chassis", "") or registro.get("chassi", ""),
+                    os.path.basename(caminho),
                 )
-                link_drive = subir_comprovante_google_drive(arquivo)
-            aba_vendas.update_cell(numero_linha, indice_coluna + 1, link_drive)
-            migrados += 1
+                with open(caminho, "rb") as arquivo_local:
+                    arquivo = FileStorage(
+                        stream=arquivo_local,
+                        filename=os.path.basename(caminho),
+                        content_type=mimetypes.guess_type(caminho)[0] or "application/octet-stream",
+                    )
+                    link_drive = subir_comprovante_google_drive(
+                        arquivo,
+                        permitir_fallback_local=False,
+                        nome_arquivo=nome_arquivo,
+                    )
+                aba_vendas.update_cell(numero_linha, indice_coluna + 1, link_drive)
+                migrados += 1
+            except Exception as erro:
+                print(f"Erro ao migrar comprovante da linha {numero_linha}: {erro}")
 
+    if migrados:
+        invalidar_cache_ab_as("Vendas_PM")
     return migrados
 
 
@@ -434,6 +496,9 @@ def montar_linha_venda_pm(registro, cabecalhos):
         "modelo": "MODELO",
         "quantidade": "QUANTIDADE",
         "vendedor": "VENDEDOR",
+        "placa": "PLACA",
+        "chassis": "CHASSIS",
+        "chassi": "CHASSIS",
         "anexo 1": "ANEXO 1",
         "anexo 2": "ANEXO 2",
         "anexo 3": "ANEXO 3",
@@ -462,6 +527,8 @@ def montar_linha_venda_pm(registro, cabecalhos):
         "MODELO": str(registro.get("MODELO", "")).strip(),
         "QUANTIDADE": str(registro.get("QUANTIDADE", "1") or "1").strip(),
         "VENDEDOR": str(registro.get("VENDEDOR", "")).strip(),
+        "PLACA": str(registro.get("PLACA", "")).strip(),
+        "CHASSIS": str(registro.get("CHASSIS", "") or registro.get("CHASSI", "")).strip(),
         "ANEXO 1": str(registro.get("ANEXO 1", "")).strip(),
         "ANEXO 2": str(registro.get("ANEXO 2", "")).strip(),
         "ANEXO 3": str(registro.get("ANEXO 3", "")).strip(),
@@ -475,6 +542,32 @@ def montar_linha_venda_pm(registro, cabecalhos):
 def normalizar_chave_planilha(valor):
     texto = normalizar_texto_comissao(valor)
     return re.sub(r"[^a-z0-9]+", " ", texto).strip()
+
+
+def garantir_colunas_venda_pm(aba_vendas):
+    cabecalhos = aba_vendas.row_values(1)
+    if not cabecalhos:
+        cabecalhos = [
+            "CLIENTE", "P. MANUTENÇÃO", "RIO", "DATA DA VENDA", "MODELO",
+            "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO",
+            "CHASSIS",
+        ]
+        aba_vendas.append_row(cabecalhos)
+        return cabecalhos
+
+    colunas_existentes = {normalizar_chave_planilha(nome) for nome in cabecalhos}
+    novas_colunas = [
+        nome for nome in ("CHASSIS",)
+        if normalizar_chave_planilha(nome) not in colunas_existentes
+    ]
+    if novas_colunas:
+        colunas_necessarias = len(cabecalhos) + len(novas_colunas)
+        if colunas_necessarias > aba_vendas.col_count:
+            aba_vendas.add_cols(colunas_necessarias - aba_vendas.col_count)
+        for nome in novas_colunas:
+            cabecalhos.append(nome)
+            aba_vendas.update_cell(1, len(cabecalhos), nome)
+    return cabecalhos
 
 
 def obter_numero_contrato(registro):
@@ -524,13 +617,7 @@ def sincronizar_negocio_fechado(aba_vendas, negocio, chaves_existentes=None):
     if chave in chaves_existentes:
         return False
 
-    cabecalhos = aba_vendas.row_values(1)
-    if not cabecalhos:
-        cabecalhos = [
-            "CLIENTE", "P. MANUTENÇÃO", "RIO", "DATA DA VENDA", "MODELO",
-            "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO"
-        ]
-        aba_vendas.append_row(cabecalhos)
+    cabecalhos = garantir_colunas_venda_pm(aba_vendas)
 
     aba_vendas.append_row(montar_linha_venda_pm(negocio, cabecalhos))
     invalidar_cache_ab_as("Vendas_PM")
@@ -5189,11 +5276,15 @@ def acessar_modulo(nome_modulo):
             try:
                 aba_vendas = planilha.worksheet("Vendas_PM")
             except gspread.exceptions.WorksheetNotFound:
-                aba_vendas = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=10)
+                aba_vendas = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=11)
                 aba_vendas.append_row([
                     "CLIENTE", "P. MANUTENÇÃO", "RIO", "DATA DA VENDA", "MODELO",
-                    "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO"
+                    "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO",
+                    "CHASSIS"
                 ])
+
+            garantir_colunas_venda_pm(aba_vendas)
+            migrar_comprovantes_static(aba_vendas)
 
             mapa_vendedor_estado = {}
             try:
@@ -5350,8 +5441,10 @@ def acessar_modulo(nome_modulo):
                     contrato_v = request.form.get("numero_contrato", "").strip()
                     data_v = request.form.get("data_venda", "").strip()
                     modelo_v = request.form.get("modelo", "").strip()
+                    chassis_v = request.form.get("chassis", "").strip()
                     qtd_v = request.form.get("quantidade", "").strip()
                     vendedor_v = request.form.get("vendedor", "").strip()
+                    placa_venda_existente = ""
                     
                     anexo_1_url = ""
                     if index_edicao:
@@ -5365,13 +5458,30 @@ def acessar_modulo(nome_modulo):
                             )
                             if idx_anexo_1 is not None and len(linha_atual) > idx_anexo_1:
                                 anexo_1_url = linha_atual[idx_anexo_1]
+                            idx_placa = next(
+                                (i for i, nome in enumerate(cabecalhos_venda)
+                                 if normalizar_chave_planilha(nome) == "placa"),
+                                None,
+                            )
+                            if idx_placa is not None and len(linha_atual) > idx_placa:
+                                placa_venda_existente = linha_atual[idx_placa]
                         except Exception:
                             pass
 
                     if "anexo_1" in request.files:
                         file_obj = request.files["anexo_1"]
                         if file_obj and file_obj.filename:
-                            anexo_1_url = subir_comprovante_google_drive(file_obj)
+                            nome_arquivo = nomear_comprovante_venda(
+                                cliente_v,
+                                produto_v,
+                                chassis_v,
+                                file_obj.filename,
+                            )
+                            anexo_1_url = subir_comprovante_google_drive(
+                                file_obj,
+                                permitir_fallback_local=False,
+                                nome_arquivo=nome_arquivo,
+                            )
 
                     if cliente_v and (plano_v or rio_v or produto_legado):
                         cabecalhos_venda = aba_vendas.row_values(1)
@@ -5383,6 +5493,8 @@ def acessar_modulo(nome_modulo):
                             "CONTRATO": contrato_v,
                             "DATA": data_v,
                             "MODELO": modelo_v,
+                            "PLACA": placa_venda_existente,
+                            "CHASSIS": chassis_v,
                             "QUANTIDADE": qtd_v,
                             "VENDEDOR": vendedor_v,
                             "ANEXO 1": anexo_1_url,
@@ -5508,6 +5620,7 @@ def acessar_modulo(nome_modulo):
                 mod = reg.get('MODELO', '')
                 qtd_str = reg.get('QUANTIDADE', '1')
                 vend = reg.get('VENDEDOR', 'Desconhecido')
+                chassis_reg = reg.get('CHASSIS', '') or reg.get('CHASSI', '')
                 mes_str_grafico = reg["_dt_obj"].strftime("%m/%Y") if reg["_dt_obj"] != datetime.max else "Sem Data"
                 
                 calculo = calcular_comissoes_venda(
@@ -5585,7 +5698,7 @@ def acessar_modulo(nome_modulo):
                     json.dumps(str(valor or ""), ensure_ascii=False)
                     for valor in (
                         cli, contrato_reg, plano_reg, rio_reg, dt_v, mod, qtd_str,
-                        vend, link_anexo_1, url_anexo_atual,
+                        vend, chassis_reg, link_anexo_1, url_anexo_atual,
                     )
                 )
                 argumentos_edicao = html.escape(argumentos_edicao, quote=True)
@@ -5764,6 +5877,11 @@ def acessar_modulo(nome_modulo):
                             </div>
 
                             <div style="margin-bottom: 10px;">
+                                <label>Chassi</label>
+                                <input type="text" name="chassis" placeholder="Chassi do veículo">
+                            </div>
+
+                            <div style="margin-bottom: 10px;">
                                 <label>Anexo 1 (Comprovação / Imagem)</label>
                                 <input type="file" name="anexo_1" accept="image/*" capture="environment">
                                 <div id="comprovanteAtual" role="status" style="display:none; margin-top:8px; padding:9px 10px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; color:#1e3a5f; font-size:12px;">
@@ -5892,7 +6010,7 @@ def acessar_modulo(nome_modulo):
                     }}
                 }}
 
-                function carregarVendaParaEdicao(idx, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor, anexoAtual, urlAnexoAtual) {{
+                function carregarVendaParaEdicao(idx, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor, chassis, anexoAtual, urlAnexoAtual) {{
                     var container = document.getElementById('containerFormularioVenda');
                     container.style.display = 'block';
                     document.getElementById('iconeSanfonaVenda').innerHTML = '▼';
@@ -5910,6 +6028,7 @@ def acessar_modulo(nome_modulo):
                     selecionarOpcaoVenda('modelo', modelo);
                     document.querySelector('[name="quantidade"]').value = quantidade;
                     selecionarOpcaoVenda('vendedor', vendedor);
+                    document.querySelector('[name="chassis"]').value = chassis;
                     mostrarComprovanteAtual(anexoAtual, urlAnexoAtual);
 
                     window.scrollTo({{ top: 0, behavior: 'smooth' }});
@@ -5965,6 +6084,7 @@ def acessar_modulo(nome_modulo):
                     document.querySelector('[name="rio"]').value = "";
                     document.querySelector('[name="modelo"]').value = "";
                     document.querySelector('[name="quantidade"]').value = "";
+                    document.querySelector('[name="chassis"]').value = "";
                     mostrarComprovanteAtual('', '');
                 }}
 
@@ -6248,6 +6368,7 @@ def acessar_modulo(nome_modulo):
                                     "PRODUTO": f"{plano_manutencao} / {rio_val}".strip(" /"),
                                     "DATA": data_neg,
                                     "MODELO": modelo,
+                                    "CHASSIS": chassis,
                                     "QUANTIDADE": "1",
                                     "PLANO DE MANUTENÇÃO": plano_manutencao,
                                     "RIO": rio_val,

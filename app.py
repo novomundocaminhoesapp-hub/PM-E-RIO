@@ -234,7 +234,9 @@ def servir_comprovante_drive(file_id):
 
 CACHE_IA = {
     "contexto_sistema": "",
-    "timestamp": 0
+    "timestamp": 0,
+    "registros": None,
+    "planilha_id": "",
 }
 TEMPO_CACHE_SEGUNDOS = 600  # 10 minutos de cache da IA
 
@@ -659,6 +661,136 @@ def criar_cliente_gemini():
     return genai.Client(api_key=api_key)
 
 
+def aba_sensivel_para_ia(nome_aba):
+    palavras = set(normalizar_chave_planilha(nome_aba).split())
+    nomes_sensiveis = {
+        "usuario", "usuarios", "user", "users", "log", "logs", "login",
+        "logins", "acesso", "acessos", "credencial", "credenciais",
+    }
+    return bool(palavras.intersection(nomes_sensiveis))
+
+
+def campo_sensivel_para_ia(nome_campo):
+    campo = normalizar_chave_planilha(nome_campo)
+    palavras_sensiveis = {
+        "senha", "password", "cpf", "cnpj", "email", "token", "secret",
+        "segredo", "credencial", "usuario", "user", "login", "telefone",
+        "celular", "rg", "endereco", "cep", "nascimento",
+    }
+    frases_sensiveis = {"e mail", "api key", "chave api", "access token", "refresh token"}
+    palavras = set(campo.split())
+    return bool(palavras.intersection(palavras_sensiveis)) or any(
+        frase in campo for frase in frases_sensiveis
+    )
+
+
+def link_planilha_google(url, planilha_id=""):
+    url_normalizada = str(url or "").lower()
+    return (
+        "docs.google.com/spreadsheets" in url_normalizada
+        or bool(planilha_id and planilha_id in url_normalizada)
+    )
+
+
+def carregar_indice_planilha_ia(planilha):
+    registros_ia = []
+    links_planilha = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+    planilha_id = str(getattr(planilha, "id", "") or "")
+
+    for aba in planilha.worksheets():
+        nome_aba = str(aba.title or "").strip()
+        if not nome_aba or aba_sensivel_para_ia(nome_aba):
+            continue
+
+        try:
+            registros = obter_registros_com_cache(planilha, nome_aba)
+        except Exception as erro:
+            print(f"IA: falha ao indexar aba {nome_aba}: {erro}")
+            continue
+
+        for registro in registros:
+            campos = []
+            links = set()
+            for nome_campo, valor in registro.items():
+                if campo_sensivel_para_ia(nome_campo):
+                    continue
+                texto_valor = str(valor or "").strip()
+                if not texto_valor:
+                    continue
+
+                def preservar_link_existente(match):
+                    url = match.group(0).rstrip(".,;:!?)\"]}")
+                    if link_planilha_google(url, planilha_id):
+                        return "[link da planilha omitido]"
+                    links.add(url)
+                    return url
+
+                texto_valor = links_planilha.sub(preservar_link_existente, texto_valor)
+                campos.append(f"{nome_campo}: {texto_valor}")
+
+            if campos:
+                texto_registro = f"Aba {nome_aba} | " + " | ".join(campos)
+                registros_ia.append({
+                    "texto": texto_registro,
+                    "busca": normalizar_texto_comissao(texto_registro),
+                    "links": links,
+                })
+
+    return registros_ia, planilha_id
+
+
+def selecionar_contexto_ia(registros, pergunta, limite_linhas=50, limite_caracteres=18000):
+    stopwords = {
+        "com", "que", "qual", "quais", "como", "para", "por", "uma", "uns",
+        "umas", "dos", "das", "mais", "menos", "meu", "minha", "seu", "sua",
+        "tem", "ter", "ser", "está", "esta", "são", "sao", "sobre", "entre",
+        "onde", "quando", "isso", "essa", "esse", "favor", "pode", "me", "de",
+        "do", "da", "no", "na", "em", "os", "as", "um", "ao", "aos", "e",
+        "ou", "se", "eu", "ele", "ela", "voce", "vocês", "voces",
+    }
+    termos = {
+        termo for termo in re.findall(r"[a-z0-9]{2,}", normalizar_texto_comissao(pergunta))
+        if termo not in stopwords
+    }
+    if not termos:
+        return "", set()
+
+    encontrados = []
+    for indice, registro in enumerate(registros):
+        score = sum(termo in registro["busca"] for termo in termos)
+        if score:
+            encontrados.append((score, indice, registro))
+    encontrados.sort(key=lambda item: (-item[0], item[1]))
+
+    linhas = []
+    links_permitidos = set()
+    tamanho = 0
+    for _, _, registro in encontrados[:limite_linhas]:
+        if tamanho + len(registro["texto"]) > limite_caracteres:
+            continue
+        linhas.append(registro["texto"])
+        links_permitidos.update(registro["links"])
+        tamanho += len(registro["texto"])
+
+    return "\n".join(linhas), links_permitidos
+
+
+def filtrar_links_resposta_ia(texto, links_permitidos, planilha_id=""):
+    padrao_url = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+    def validar_url(match):
+        url_original = match.group(0)
+        url = url_original.rstrip(".,;:!?)\"]}")
+        sufixo = url_original[len(url):]
+        if link_planilha_google(url, planilha_id):
+            return "[link da planilha não compartilhado]" + sufixo
+        if url not in links_permitidos:
+            return "[link não encontrado nos dados consultados]" + sufixo
+        return url_original
+
+    return padrao_url.sub(validar_url, str(texto or ""))
+
+
 def validar_cpf(cpf_input):
     cpf = re.sub(r'\D', '', str(cpf_input))
     if len(cpf) < 11:
@@ -744,9 +876,11 @@ def invalidar_cache_ab_as(*nomes_abas):
         CACHE_PLANILHAS["dados"].pop(nome_aba, None)
         CACHE_PLANILHAS["timestamps"].pop(nome_aba, None)
     CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
-    if {"PM", "RIO", "PM_Precos", "Informes", "Argumentos", "Modelos"}.intersection(nomes_abas):
+    if nomes_abas:
         CACHE_IA["contexto_sistema"] = ""
         CACHE_IA["timestamp"] = 0
+        CACHE_IA["registros"] = None
+        CACHE_IA["planilha_id"] = ""
 
 
 def obter_registros_seguros(aba):
@@ -7022,6 +7156,8 @@ def limpar_cache():
     global CACHE_IA, CACHE_PLANILHAS, CACHE_LOGIN_DADOS, CACHE_DRIVE, CACHE_PLANILHA_CLIENTE
     CACHE_IA["contexto_sistema"] = ""
     CACHE_IA["timestamp"] = 0
+    CACHE_IA["registros"] = None
+    CACHE_IA["planilha_id"] = ""
 
     CACHE_PLANILHAS = {"dados": {}, "timestamps": {}}
     CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
@@ -7057,42 +7193,38 @@ def chat_ia():
     try:
         agora = time.time()
         
-        if not CACHE_IA["contexto_sistema"] or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
+        if CACHE_IA["registros"] is None or (agora - CACHE_IA["timestamp"] > TEMPO_CACHE_SEGUNDOS):
             print("🔄 IA: Atualizando cache otimizado...")
             planilha = conectar_google_sheets()
-            contexto_abas = []
-            
-            abas_essenciais = ["PM", "RIO", "PM_Precos", "Informes", "Argumentos","Modelos"]
-            
-            for nome_aba in abas_essenciais:
-                try:
-                    registros = obter_registros_com_cache(planilha, nome_aba)
-                    limite_registros = 30 if nome_aba in ("PM_Precos", "Informes", "Argumentos") else 20
-                    linhas_texto = [
-                        "- " + " | ".join([f"{k}: {v}" for k, v in reg.items() if str(v).strip()])
-                        for reg in registros[:limite_registros]
-                    ]
-                    contexto_abas.append(f"### {nome_aba}\n" + "\n".join(linhas_texto))
-                except Exception:
-                    pass
-            
-            dados_planilha = "\n\n".join(contexto_abas)
-
-            instrucao_sistema = (
-                "Você é o Assistente Oficial da Novo Mundo Caminhões e Ônibus. "
-                "Responda de forma direta, educada e baseada estritamente nos dados da planilha fornecidos abaixo. "
-                "Se o usuário pedir um link de circular ou PDF, busque na aba Informes e forneça o nome e o link correspondente."
-            )
-            
-            CACHE_IA["contexto_sistema"] = f"{instrucao_sistema}\n\n{dados_planilha}"
+            registros_ia, planilha_id = carregar_indice_planilha_ia(planilha)
+            CACHE_IA["registros"] = registros_ia
+            CACHE_IA["planilha_id"] = planilha_id
             CACHE_IA["timestamp"] = agora
+
+        dados_planilha, links_permitidos = selecionar_contexto_ia(
+            CACHE_IA["registros"], pergunta_usuario
+        )
+        instrucao_sistema = (
+            "Você é o Assistente Oficial da Novo Mundo Caminhões e Ônibus. "
+            "Responda em português, de forma direta, usando somente os registros relevantes fornecidos. "
+            "Se não houver evidência suficiente nesses registros, diga que não encontrou a informação. "
+            "Nunca invente URLs, nunca compartilhe links de acesso à planilha ou ao Google Sheets e só informe links que apareçam literalmente nos registros fornecidos. "
+            "Não revele dados pessoais, credenciais ou informações de abas administrativas."
+        )
+        CACHE_IA["contexto_sistema"] = f"{instrucao_sistema}\n\nRegistros relevantes:\n{dados_planilha}"
 
         cliente_ia = criar_cliente_gemini()
         
         prompt_completo = f"{CACHE_IA['contexto_sistema']}\n\nPergunta do Usuário: {pergunta_usuario}\nResposta:"
         
         resposta_ia = None
-        modelos_para_tentar = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"]
+        modelos_para_tentar = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
+        modelo_configurado = os.environ.get("GEMINI_MODEL", "").strip()
+        if modelo_configurado in modelos_para_tentar:
+            modelos_para_tentar.remove(modelo_configurado)
+            modelos_para_tentar.insert(0, modelo_configurado)
+        elif modelo_configurado:
+            print("GEMINI_MODEL fora dos modelos permitidos; usando Gemini 3.5 Flash Lite e Gemini 3.6 Flash.")
         
         ultimo_erro = None
         for nome_modelo in modelos_para_tentar:
@@ -7110,12 +7242,33 @@ def chat_ia():
         if not resposta_ia or not resposta_ia.text:
             raise Exception(f"Todos os modelos falharam. Último erro: {ultimo_erro}")
         
-        return jsonify({"resposta": resposta_ia.text})
+        resposta_filtrada = filtrar_links_resposta_ia(
+            resposta_ia.text,
+            links_permitidos,
+            CACHE_IA["planilha_id"],
+        )
+        return jsonify({"resposta": resposta_filtrada})
 
     except Exception as e:
-        print(f"Erro na IA: {e}")
+        erro_texto = str(e)
+        erro_lower = erro_texto.lower()
+        print(f"Erro na IA: {erro_texto}")
         traceback.print_exc()
-        return jsonify({"resposta": "Desculpe, ocorreu um erro interno de conexão. Tente novamente mais tarde."})
+
+        if "gemini_api_key não configurada" in erro_lower:
+            mensagem_erro = "A chave do Gemini não está configurada. Cadastre GEMINI_API_KEY no ambiente do servidor."
+        elif "429" in erro_texto or "quota" in erro_lower or "resource_exhausted" in erro_lower:
+            mensagem_erro = "O limite de uso do Gemini foi atingido. Aguarde e tente novamente."
+        elif "401" in erro_texto or "unauthenticated" in erro_lower or "authentication" in erro_lower:
+            mensagem_erro = "A chave do Gemini foi recusada. Confira GEMINI_API_KEY no ambiente do servidor."
+        elif "403" in erro_texto or "permission denied" in erro_lower or "forbidden" in erro_lower:
+            mensagem_erro = "O Gemini recusou o acesso. Confira se a chave está ativa e tem permissão para usar a API."
+        elif "404" in erro_texto or "not found" in erro_lower or "model" in erro_lower:
+            mensagem_erro = "O modelo Gemini configurado não está disponível. Confira GEMINI_MODEL no ambiente do servidor."
+        else:
+            mensagem_erro = "O Gemini não respondeu. Confira os logs do servidor para ver o erro técnico."
+
+        return jsonify({"resposta": mensagem_erro})
 
 
 @app.route("/api/atualizacoes", methods=["GET"])

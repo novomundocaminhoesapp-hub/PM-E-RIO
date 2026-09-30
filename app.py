@@ -245,17 +245,17 @@ CACHE_PLANILHAS = {
     "dados": {},
     "timestamps": {}
 }
-TEMPO_CACHE_PLANILHA_SEGS = 300  # 5 minutos por aba
+TEMPO_CACHE_PLANILHA_SEGS = 600  # 10 minutos por aba
 CACHE_PLANILHA_CLIENTE = {"cliente": None, "timestamp": 0}
 TEMPO_CACHE_CLIENTE_SEGS = 300
 TEMPO_CACHE_ABAS = {
-    "Vendas_PM": 60,
-    "Negocios_PM": 60,
-    "Vendas_LOC": 60,
-    "Negocio_LOC": 60,
-    "Vendas_Consorcio": 60,
-    "Negocios_Consorcio": 60,
-    "Informes": 120,
+    "Vendas_PM": 600,
+    "Negocios_PM": 600,
+    "Vendas_LOC": 600,
+    "Negocio_LOC": 600,
+    "Vendas_Consorcio": 600,
+    "Negocios_Consorcio": 600,
+    "Informes": 600,
 }
 CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
 TEMPO_CACHE_DRIVE_SEGS = 600
@@ -808,7 +808,7 @@ def validar_cpf(cpf_input):
     return True
 
 CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
-TEMPO_CACHE_LOGIN_SEGS = 60
+TEMPO_CACHE_LOGIN_SEGS = 600
 
 def carregar_dados_login():
     """
@@ -1703,12 +1703,44 @@ TEMPLATE_HTML = r"""
             display: block;
         }
 
+        #secaoRelatorioPDF.relatorio-vendas #tabelaVendas th {
+            text-align: center !important;
+            vertical-align: middle !important;
+        }
+        #secaoRelatorioPDF.relatorio-vendas #tabelaVendas tbody tr:nth-child(odd) td {
+            padding: 5px 4px !important;
+            text-align: center !important;
+            vertical-align: middle !important;
+            line-height: 1.2;
+            font-weight: 600;
+        }
+
         @media print {
             body * { visibility: hidden; }
             #secaoRelatorioPDF, #secaoRelatorioPDF *, #secaoDashboard, #secaoDashboard * { visibility: visible; }
             #secaoRelatorioPDF, #secaoDashboard { position: absolute; left: 0; top: 0; width: 100%; margin: 0; padding: 15px; background: #fff; }
             .no-print { display: none !important; }
             .chart-container { page-break-inside: avoid; margin-bottom: 20px; height: 250px !important; }
+
+            #secaoRelatorioPDF.relatorio-vendas { padding: 9px !important; }
+            #secaoRelatorioPDF.relatorio-vendas * {
+                font-size: 9px !important;
+                line-height: 1.2 !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas h3 {
+                font-size: 12px !important;
+                line-height: 1.25 !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas h4 {
+                font-size: 10px !important;
+                line-height: 1.25 !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas p { font-size: 8px !important; }
+            #secaoRelatorioPDF.relatorio-vendas #tabelaVendas th,
+            #secaoRelatorioPDF.relatorio-vendas #tabelaVendas td {
+                padding: 5px 4px !important;
+                vertical-align: middle !important;
+            }
             
             .img-comprovacao {
                 width: 500px !important;
@@ -3579,7 +3611,7 @@ def acessar_modulo(nome_modulo):
                 for r in registros:
                     vendedor = str(r.get("VENDEDOR", "")).strip()
                     dt = parse_data(r.get("DATA DA VENDA") or r.get("DATA"))
-                    produto = str(r.get("PRODUTO", "")).strip() or solucao
+                    produto = str(r.get("PRODUTO", "")).strip()
                     
                     # Captura Plano (Coluna B) e RIO (Coluna C) com suporte a nomes antigos e novos
                     plano_manutencao = str(
@@ -3590,6 +3622,10 @@ def acessar_modulo(nome_modulo):
                     ).strip()
 
                     rio_val = str(r.get("RIO", "")).strip()
+                    if not produto:
+                        produto = " / ".join(
+                            valor for valor in (plano_manutencao, rio_val) if valor
+                        ) or "Não informado"
 
                     if not passa_pessoa(vendedor) or not passa_uf(vendedor):
                         continue
@@ -3645,6 +3681,7 @@ def acessar_modulo(nome_modulo):
             qtd_max = 0
             qtd_plus = 0
             qtd_rio = 0
+            por_tipo_rio = {}
 
             for v in vendas:
                 qtd_venda = v.get("qtd", 1)
@@ -3673,13 +3710,18 @@ def acessar_modulo(nome_modulo):
                 # Verifica se o texto da coluna RIO (ou Produto) coincide com
                 # qualquer item da aba RIO ou qualquer palavra-chave da família RIO
                 tem_rio = False
+                tokens_rio = set(texto_geral_rio.split())
 
                 if len(texto_rio) > 0 and texto_rio not in ["-", "NENHUM", "NAO", "NÃO"]:
                     tem_rio = True
                 else:
                     # Checagem contra o catálogo da aba RIO
                     for prod_rio in catalogo_rio_lista:
-                        if prod_rio and prod_rio in texto_geral_rio:
+                        tokens_produto_rio = {
+                            token for token in re.findall(r"[A-Z0-9]+", prod_rio)
+                            if token not in {"RIO", "TELEMETRIA", "PRODUTO"}
+                        }
+                        if tokens_produto_rio and tokens_produto_rio.issubset(tokens_rio):
                             tem_rio = True
                             break
                     
@@ -3692,6 +3734,35 @@ def acessar_modulo(nome_modulo):
 
                 if tem_rio:
                     qtd_rio += qtd_venda
+                    tipos_catalogo = [
+                        produto_rio
+                        for produto_rio in catalogo_rio
+                        if (tokens_produto_rio := {
+                            token for token in re.findall(r"[A-Z0-9]+", norm(produto_rio))
+                            if token not in {"RIO", "TELEMETRIA", "PRODUTO"}
+                        })
+                        and tokens_produto_rio.issubset(tokens_rio)
+                    ]
+                    if tipos_catalogo:
+                        tipo_rio = max(tipos_catalogo, key=lambda produto: len(norm(produto)))
+                    elif texto_rio and texto_rio not in {
+                        "X", "SIM", "S", "TRUE", "1", "ATIVO", "CONTRATADO", "CONTRATADA"
+                    }:
+                        tipo_rio = str(v.get("rio", "")).strip()
+                    else:
+                        tipos_fallback = (
+                            ("diagnostico", "Diagnóstico remoto"),
+                            ("performance", "Performance"),
+                            ("broker", "Broker"),
+                            ("bloqueio", "Bloqueio"),
+                            ("geo", "GEO"),
+                            ("analise", "Análise de eficiência"),
+                        )
+                        tipo_rio = next(
+                            (nome for termo, nome in tipos_fallback if termo in texto_geral_rio),
+                            "RIO (tipo não identificado)",
+                        )
+                    por_tipo_rio[tipo_rio] = por_tipo_rio.get(tipo_rio, 0) + qtd_venda
             # A conversão NÃO usa mais o total de planos como denominador.
             # O denominador correto é calculado abaixo, depois da leitura
             # do pipeline, somando caminhões em andamento + fechados + perdidos.
@@ -3878,11 +3949,6 @@ def acessar_modulo(nome_modulo):
                 por_modelo.setdefault(v["modelo"] or "Não informado", 0)
                 por_modelo[v["modelo"] or "Não informado"] += v["qtd"]
 
-            por_plano = {}
-            for v in vendas:
-                plano = v.get("plano") or v.get("produto") or "Plano não informado"
-                por_plano[plano] = por_plano.get(plano, 0) + v["qtd"]
-
             # Resumo comercial por modalidade de manutenção.
             por_modalidade = {"PREV": 0, "MAX": 0, "PLUS": 0}
             for v in vendas:
@@ -3965,7 +4031,7 @@ def acessar_modulo(nome_modulo):
                 "solucoes": por_solucao,
                 "produtos": por_produto,
                 "modelos": por_modelo,
-                "planos": por_plano,
+                "rio_tipos": por_tipo_rio,
                 "modalidades": por_modalidade,
                 "ufs": por_uf,
                 "temperaturas": por_temp,
@@ -4220,7 +4286,7 @@ def acessar_modulo(nome_modulo):
                     <div class="dash-card"><h3>📈 Evolução mensal de unidades</h3><div class="dash-chart"><canvas id="dashMes"></canvas></div></div>
                     <div class="dash-card"><h3>👥 Vendas por consultor</h3><div class="dash-chart"><canvas id="dashConsultor"></canvas></div></div>
                     <div class="dash-card"><h3>📊 Vendas por plano de manutenção</h3><div class="dash-chart"><canvas id="dashSolucao"></canvas></div></div>
-                    <div class="dash-card"><h3>🛠️ Planos mais vendidos</h3><div class="dash-chart"><canvas id="dashModelo"></canvas></div></div>
+                    <div class="dash-card"><h3>📡 Vendas de RIO por tipo</h3><div class="dash-chart"><canvas id="dashRioTipos"></canvas></div></div>
                     <div class="dash-card"><h3>🔥 Temperatura do pipeline</h3><div class="dash-chart"><canvas id="dashTemp"></canvas></div></div>
                     <div class="dash-card"><h3>⏱️ Aging dos negócios ativos</h3><div class="dash-chart"><canvas id="dashAging"></canvas></div></div>
                 </div>
@@ -4299,15 +4365,15 @@ def acessar_modulo(nome_modulo):
                     }}
                 }});
 
-                const planos = Object.keys(D.planos || {{}})
-                    .filter(x => Number(D.planos[x]) > 0)
-                    .sort((a,b)=>Number(D.planos[b])-Number(D.planos[a]))
+                const tiposRio = Object.keys(D.rio_tipos || {{}})
+                    .filter(x => Number(D.rio_tipos[x]) > 0)
+                    .sort((a,b)=>Number(D.rio_tipos[b])-Number(D.rio_tipos[a]))
                     .slice(0,10);
-                new Chart(byId('dashModelo'), {{
+                new Chart(byId('dashRioTipos'), {{
                     type:'bar',
                     data:{{
-                        labels:planos,
-                        datasets:[{{label:'Unidades',data:planos.map(x=>Number(D.planos[x]))}}]
+                        labels:tiposRio,
+                        datasets:[{{label:'Unidades RIO',data:tiposRio.map(x=>Number(D.rio_tipos[x]))}}]
                     }},
                     options:{{
                         ...common,
@@ -4556,14 +4622,24 @@ def acessar_modulo(nome_modulo):
                         except Exception:
                             pass
 
+                    falha_upload = False
                     for idx_file in range(3):
                         file_key = f"anexo_{idx_file+1}"
                         if file_key in request.files:
                             file_obj = request.files[file_key]
                             if file_obj and file_obj.filename:
-                                anexos[idx_file] = subir_comprovante_google_drive(file_obj)
+                                try:
+                                    anexos[idx_file] = subir_comprovante_google_drive(
+                                        file_obj,
+                                        permitir_fallback_local=not bool(os.environ.get("RENDER")),
+                                    )
+                                except Exception as erro:
+                                    print(f"Erro ao salvar comprovante da venda: {erro}")
+                                    erro_msg = "Não foi possível salvar o comprovante no Drive. A venda não foi gravada; tente novamente."
+                                    falha_upload = True
+                                    break
 
-                    if cliente_v:
+                    if cliente_v and not falha_upload:
                         dados_venda_linha = [cliente_v, produto_v, data_v, modelo_v, qtd_v, vendedor_v, anexos[0], anexos[1], anexos[2]]
                         if index_edicao:
                             idx_int = int(index_edicao)
@@ -4572,7 +4648,7 @@ def acessar_modulo(nome_modulo):
                         else:
                             aba_vendas.append_row(dados_venda_linha)
                             sucesso_msg = "Registro salvo com sucesso!"
-                    else:
+                    elif not cliente_v and not erro_msg:
                         erro_msg = "Informe o cliente."
 
             linhas_vendas_brutas = aba_vendas.get_all_values()
@@ -5139,18 +5215,65 @@ def acessar_modulo(nome_modulo):
                 print(f"Aviso mapeamento de estado: {e_est}")
 
             mapa_modelo_familia = {}
+            lista_modelos = []
             try:
                 aba_mod_pesquisa = planilha.worksheet("Modelos")
                 regs_mod = obter_registros_seguros(aba_mod_pesquisa)
                 for rm in regs_mod:
-                    m_nome = str(rm.get("MODELO", "")).strip().lower()
+                    valores_modelo = list(rm.values())
+                    modelo_nome = str(
+                        rm.get("MODELO")
+                        or (valores_modelo[1] if len(valores_modelo) > 1 else "")
+                    ).strip()
+                    m_nome = modelo_nome.lower()
                     m_cat = str(rm.get("CATEGORIA", "")).strip().lower()
                     m_tipo = str(rm.get("TIPO", "")).strip().lower()
                     texto_completo_mod = f"{m_nome} {m_cat} {m_tipo}"
                     if m_nome:
                         mapa_modelo_familia[m_nome] = texto_completo_mod
+                        if modelo_nome not in lista_modelos:
+                            lista_modelos.append(modelo_nome)
             except Exception as e_fam:
                 print(f"Aviso mapeamento de modelos: {e_fam}")
+
+            lista_planos_manutencao = []
+            for registro in obter_registros_com_cache(planilha, "PM"):
+                valores_registro = list(registro.values())
+                plano = str(
+                    registro.get("PRODUTO")
+                    or (valores_registro[1] if len(valores_registro) > 1 else "")
+                ).strip()
+                if plano and normalizar_chave_planilha(plano).upper() != "PRODUTO" and plano not in lista_planos_manutencao:
+                    lista_planos_manutencao.append(plano)
+            if not lista_planos_manutencao:
+                lista_planos_manutencao = [
+                    "VolksTotal PRE Prevenção e Economia", "VolksTotal MAX",
+                    "VolksTotal PLUS", "PREV", "MAX", "PLUS",
+                ]
+
+            lista_tipos_rio = []
+            for registro in obter_registros_com_cache(planilha, "RIO"):
+                valores_registro = list(registro.values())
+                tipo_rio = str(
+                    registro.get("PRODUTO")
+                    or (valores_registro[1] if len(valores_registro) > 1 else "")
+                ).strip()
+                if tipo_rio and normalizar_chave_planilha(tipo_rio).upper() != "PRODUTO" and tipo_rio not in lista_tipos_rio:
+                    lista_tipos_rio.append(tipo_rio)
+            if not lista_tipos_rio:
+                lista_tipos_rio = [
+                    "Diagnóstico Remoto", "Análise de Eficiência", "Performance",
+                    "RIO GEO", "Relatório de Bloqueio",
+                ]
+
+            opcoes_planos_manutencao = "".join(
+                f'<option value="{html.escape(plano, quote=True)}">{html.escape(plano)}</option>'
+                for plano in lista_planos_manutencao
+            )
+            opcoes_tipos_rio = "".join(
+                f'<option value="{html.escape(tipo, quote=True)}">{html.escape(tipo)}</option>'
+                for tipo in lista_tipos_rio
+            )
 
             try:
                 aba_neg_sync = planilha.worksheet("Negocios_PM")
@@ -5189,6 +5312,18 @@ def acessar_modulo(nome_modulo):
                         lista_consultores.append(nome_u)
             if not lista_consultores:
                 lista_consultores = [session.get("nome", "Usuário")]
+
+            nome_vendedor_logado = str(nome_usuario_logado or "").strip().lower()
+            opcoes_modelos = "".join(
+                f'<option value="{html.escape(modelo, quote=True)}">{html.escape(modelo)}</option>'
+                for modelo in lista_modelos
+            )
+            opcoes_consultores = "".join(
+                f'<option value="{html.escape(consultor, quote=True)}" '
+                f'{"selected" if consultor.strip().lower() == nome_vendedor_logado else ""}>'
+                f'{html.escape(consultor)}</option>'
+                for consultor in lista_consultores
+            )
 
             sucesso_msg = None
             erro_msg = None
@@ -5433,11 +5568,11 @@ def acessar_modulo(nome_modulo):
                 dados_dashboard["vendedores"][vend]["comissao"] += total_comissao_vend
 
                 link_anexo_1 = reg.get('ANEXO 1', '')
+                url_anexo_atual = url_comprovante_no_app(link_anexo_1) if link_anexo_1 else ""
                 anexos_html = ""
                 if link_anexo_1:
-                    url_imagem = url_comprovante_no_app(link_anexo_1)
-                    if url_imagem:
-                        url_segura = html.escape(url_imagem, quote=True)
+                    if url_anexo_atual:
+                        url_segura = html.escape(url_anexo_atual, quote=True)
                         anexos_html = f'''
                         <div onclick="abrirImagemModal('{url_segura}')" title="Clique para ampliar" style="display: inline-block; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
                             <img src="{url_segura}" alt="Anexo 1" class="img-comprovacao">
@@ -5448,7 +5583,10 @@ def acessar_modulo(nome_modulo):
 
                 argumentos_edicao = ", ".join(
                     json.dumps(str(valor or ""), ensure_ascii=False)
-                    for valor in (cli, contrato_reg, plano_reg, rio_reg, dt_v, mod, qtd_str, vend)
+                    for valor in (
+                        cli, contrato_reg, plano_reg, rio_reg, dt_v, mod, qtd_str,
+                        vend, link_anexo_1, url_anexo_atual,
+                    )
                 )
                 argumentos_edicao = html.escape(argumentos_edicao, quote=True)
                 botoes_v = f"""
@@ -5583,11 +5721,17 @@ def acessar_modulo(nome_modulo):
                                 </div>
                                 <div>
                                     <label>Plano de Manutenção</label>
-                                    <input type="text" name="plano_manutencao" placeholder="Ex: PREV, MAX ou PLUS">
+                                    <select name="plano_manutencao">
+                                        <option value="">Nenhum</option>
+                                        {opcoes_planos_manutencao}
+                                    </select>
                                 </div>
                                 <div>
                                     <label>RIO</label>
-                                    <input type="text" name="rio" placeholder="Ex: Diagnóstico Remoto">
+                                    <select name="rio">
+                                        <option value="">Nenhum</option>
+                                        {opcoes_tipos_rio}
+                                    </select>
                                 </div>
                             </div>
 
@@ -5598,7 +5742,10 @@ def acessar_modulo(nome_modulo):
                                 </div>
                                 <div>
                                     <label>Modelo do Veículo</label>
-                                    <input type="text" name="modelo" placeholder="Ex: Delivery 11.180 / Meteor">
+                                    <select name="modelo">
+                                        <option value="">Selecione um modelo...</option>
+                                        {opcoes_modelos}
+                                    </select>
                                 </div>
                             </div>
 
@@ -5609,13 +5756,21 @@ def acessar_modulo(nome_modulo):
                                 </div>
                                 <div>
                                     <label>Vendedor</label>
-                                    <input type="text" name="vendedor" value="{nome_usuario_logado}" readonly style="background-color: #edf2f7;">
+                                    <select name="vendedor" required>
+                                        <option value="">Selecione um consultor...</option>
+                                        {opcoes_consultores}
+                                    </select>
                                 </div>
                             </div>
 
                             <div style="margin-bottom: 10px;">
                                 <label>Anexo 1 (Comprovação / Imagem)</label>
                                 <input type="file" name="anexo_1" accept="image/*" capture="environment">
+                                <div id="comprovanteAtual" role="status" style="display:none; margin-top:8px; padding:9px 10px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; color:#1e3a5f; font-size:12px;">
+                                    <span id="comprovanteAtualNome"></span>
+                                    <a id="comprovanteAtualLink" href="#" target="_blank" rel="noopener noreferrer" style="display:none; margin-left:8px; color:#0056b3; font-weight:700;">Abrir comprovante</a>
+                                    <div id="comprovanteAtualInstrucao" style="margin-top:3px;"></div>
+                                </div>
                             </div>
 
                             <div style="display: flex; gap: 10px; margin-top: 15px;">
@@ -5646,7 +5801,7 @@ def acessar_modulo(nome_modulo):
                     </div>
                 </div>
 
-                <div id="secaoRelatorioPDF" class="produto-detalhe-card">
+                <div id="secaoRelatorioPDF" class="produto-detalhe-card relatorio-vendas">
                     <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #002244; padding-bottom: 10px; margin-bottom: 14px;">
                         <div>
                             <h3 style="font-size: 16px; color: #002244; margin: 0 0 4px 0;">{titulo_relatorio_txt}</h3>
@@ -5661,16 +5816,16 @@ def acessar_modulo(nome_modulo):
                         <table id="tabelaVendas" style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;" data-sort-dir="asc">
                             <thead>
                                 <tr style="background: #002244; color: #ffffff; border-bottom: 2px solid #001529;">
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 0, 'text')">Cliente ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 1, 'text')">Nº do Contrato ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 2, 'text')">Plano de Manutenção ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 3, 'text')">RIO ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 4, 'data')">Data da Venda ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 5, 'text')">Modelo ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 6, 'num')">Quantidade ↕</th>
-                                    <th style="padding: 10px; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 7, 'text')">Vendedor / Região ↕</th>
-                                    <th style="padding: 10px;" class="no-print">Comprovação</th>
-                                    <th style="padding: 10px;" class="no-print">Ações</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 0, 'text')">Cliente</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 1, 'text')">Nº Contrato</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 2, 'text')">Plano</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 3, 'text')">RIO</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 4, 'data')">Data</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 5, 'text')">Modelo</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 6, 'num')">Qtd.</th>
+                                    <th style="padding: 6px; white-space: nowrap; cursor: pointer;" onclick="ordenarTabela('tabelaVendas', 7, 'text')">Vendedor/Região</th>
+                                    <th style="padding: 6px; white-space: nowrap;" class="no-print">Anexo</th>
+                                    <th style="padding: 6px; white-space: nowrap;" class="no-print">Ações</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -5737,7 +5892,7 @@ def acessar_modulo(nome_modulo):
                     }}
                 }}
 
-                function carregarVendaParaEdicao(idx, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor) {{
+                function carregarVendaParaEdicao(idx, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor, anexoAtual, urlAnexoAtual) {{
                     var container = document.getElementById('containerFormularioVenda');
                     container.style.display = 'block';
                     document.getElementById('iconeSanfonaVenda').innerHTML = '▼';
@@ -5749,14 +5904,51 @@ def acessar_modulo(nome_modulo):
 
                     document.querySelector('[name="cliente"]').value = cliente;
                     document.querySelector('[name="numero_contrato"]').value = contrato;
-                    document.querySelector('[name="plano_manutencao"]').value = plano;
-                    document.querySelector('[name="rio"]').value = rio;
+                    selecionarOpcaoVenda('plano_manutencao', plano);
+                    selecionarOpcaoVenda('rio', rio);
                     document.querySelector('[name="data_venda"]').value = dataVenda;
-                    document.querySelector('[name="modelo"]').value = modelo;
+                    selecionarOpcaoVenda('modelo', modelo);
                     document.querySelector('[name="quantidade"]').value = quantidade;
-                    document.querySelector('[name="vendedor"]').value = vendedor;
+                    selecionarOpcaoVenda('vendedor', vendedor);
+                    mostrarComprovanteAtual(anexoAtual, urlAnexoAtual);
 
                     window.scrollTo({{ top: 0, behavior: 'smooth' }});
+                }}
+
+                function mostrarComprovanteAtual(caminho, url) {{
+                    var painel = document.getElementById('comprovanteAtual');
+                    var nome = document.getElementById('comprovanteAtualNome');
+                    var link = document.getElementById('comprovanteAtualLink');
+                    var instrucao = document.getElementById('comprovanteAtualInstrucao');
+                    var caminhoAtual = String(caminho || '').trim();
+
+                    painel.style.display = caminhoAtual ? 'block' : 'none';
+                    if (!caminhoAtual) return;
+
+                    var nomeArquivo = caminhoAtual.split('/').pop().split(/[?#]/)[0];
+                    nome.textContent = 'Comprovante atual: ' + (nomeArquivo || 'arquivo já cadastrado');
+                    if (url) {{
+                        link.href = url;
+                        link.style.display = 'inline';
+                        instrucao.textContent = 'Escolha outro arquivo somente se quiser substituir este comprovante.';
+                    }} else {{
+                        link.removeAttribute('href');
+                        link.style.display = 'none';
+                        instrucao.textContent = 'O caminho está cadastrado, mas o arquivo não está disponível no app.';
+                    }}
+                }}
+
+                function selecionarOpcaoVenda(nomeCampo, valor) {{
+                    var select = document.querySelector('[name="' + nomeCampo + '"]');
+                    var valorSelecionado = String(valor || '').trim();
+                    if (!select) return;
+
+                    if (valorSelecionado && !Array.from(select.options).some(function(opcao) {{
+                        return opcao.value === valorSelecionado;
+                    }})) {{
+                        select.add(new Option(valorSelecionado, valorSelecionado));
+                    }}
+                    select.value = valorSelecionado;
                 }}
 
                 function cancelarEdicaoVenda() {{
@@ -5773,6 +5965,7 @@ def acessar_modulo(nome_modulo):
                     document.querySelector('[name="rio"]').value = "";
                     document.querySelector('[name="modelo"]').value = "";
                     document.querySelector('[name="quantidade"]').value = "";
+                    mostrarComprovanteAtual('', '');
                 }}
 
                 function aplicarFiltrosVendas() {{

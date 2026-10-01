@@ -551,6 +551,12 @@ def normalizar_chave_planilha(valor):
     return re.sub(r"[^a-z0-9]+", " ", texto).strip()
 
 
+def normalizar_chassi(valor):
+    texto = unicodedata.normalize("NFKD", str(valor or ""))
+    texto = "".join(caractere for caractere in texto if not unicodedata.combining(caractere))
+    return re.sub(r"[^A-Z0-9]", "", texto.upper())
+
+
 def garantir_colunas_venda_pm(aba_vendas):
     cabecalhos = aba_vendas.row_values(1)
     if not cabecalhos:
@@ -1179,20 +1185,44 @@ def importar_relatorios_drive_vendas():
                 "COMENTÁRIOS"
             ])
 
-        # Carrega registros existentes para evitar duplicatas por chave única.
+        # Exige um cabeçalho de chassi para nunca importar sem conferir duplicidade.
         registros_existentes = aba_negocios.get_all_values()
+        if not registros_existentes:
+            return "A aba Negocios_PM está sem cabeçalho; importação interrompida para evitar duplicidade de chassi."
+
+        cabecalhos_negocios = [
+            normalizar_chave_planilha(cabecalho)
+            for cabecalho in registros_existentes[0]
+        ]
+        indice_chassi = next(
+            (
+                indice for indice, cabecalho in enumerate(cabecalhos_negocios)
+                if cabecalho in {"chassi", "chassis"}
+                or "chassi" in cabecalho
+            ),
+            None,
+        )
+        if indice_chassi is None:
+            return "A aba Negocios_PM não possui coluna CHASSIS/CHASSI; importação interrompida para evitar duplicidade."
+
+        # Carrega os chassis existentes pela coluna identificada no cabeçalho,
+        # sem depender de a coluna continuar na posição F.
         chaves_cadastradas = set()
         for r in registros_existentes[1:]:
-            if len(r) >= 5:
-                chassis_existente = normalizar_chave_planilha(r[5] if len(r) > 5 else "")
-                if chassis_existente:
-                    chaves_cadastradas.add(f"CHASSIS:{chassis_existente}")
-                else:
-                    chave_legada = "_".join(
-                        normalizar_chave_planilha(valor)
-                        for valor in (r[1], r[2], r[3], r[4])
-                    )
-                    chaves_cadastradas.add(f"REGISTRO:{chave_legada}")
+            chassis_existente = normalizar_chassi(
+                r[indice_chassi] if indice_chassi < len(r) else ""
+            )
+            if chassis_existente:
+                chaves_cadastradas.add(f"CHASSIS:{chassis_existente}")
+            else:
+                valores_legados = [
+                    r[indice] if indice < len(r) else ""
+                    for indice in (1, 2, 3, 4)
+                ]
+                chave_legada = "_".join(
+                    normalizar_chave_planilha(valor) for valor in valores_legados
+                )
+                chaves_cadastradas.add(f"REGISTRO:{chave_legada}")
 
         # ============================================================
         # MAPA DE VENDEDORES
@@ -1300,6 +1330,7 @@ def importar_relatorios_drive_vendas():
         import pandas as pd
 
         importados_count = 0
+        duplicados_count = 0
         arquivos_concluidos = 0
         erros_importacao = []
         avisos_modelos = []
@@ -1398,7 +1429,7 @@ def importar_relatorios_drive_vendas():
                     )
 
                 if chassis:
-                    chave_unica = f"CHASSIS:{normalizar_chave_planilha(chassis)}"
+                    chave_unica = f"CHASSIS:{normalizar_chassi(chassis)}"
                 else:
                     chave_unica = "REGISTRO:" + "_".join(
                         normalizar_chave_planilha(valor)
@@ -1425,6 +1456,7 @@ def importar_relatorios_drive_vendas():
                 )
                 continue
 
+            duplicados_count += duplicados
             if modelos_nao_cadastrados:
                 avisos_modelos.extend(
                     f"{file_name}: {detalhe}"
@@ -1463,7 +1495,7 @@ def importar_relatorios_drive_vendas():
 
         resumo = (
             f"Sincronização concluída! {importados_count} novos registros importados "
-            f"em {arquivos_concluidos} arquivo(s)."
+            f"em {arquivos_concluidos} arquivo(s); {duplicados_count} chassi(s)/registro(s) duplicado(s) ignorado(s)."
         )
         if erros_importacao:
             resumo += " Pendências: " + "; ".join(erros_importacao)
@@ -3218,6 +3250,25 @@ def acessar_modulo(nome_modulo):
                 valor = "".join(c for c in valor if not unicodedata.combining(c))
                 return re.sub(r"[^A-Z0-9]+", "", valor.upper())
 
+            def chave_registro_campanha(registro):
+                chassis_registro = next(
+                    (
+                        valor for cabecalho, valor in registro.items()
+                        if chave_campanha(cabecalho) in {"CHASSI", "CHASSIS"}
+                        and str(valor or "").strip()
+                    ),
+                    "",
+                )
+                chassis_normalizado = chave_campanha(chassis_registro)
+                if chassis_normalizado:
+                    return f"CH:{chassis_normalizado}"
+
+                chave_sem_chassis = "|".join(
+                    chave_campanha(registro.get(campo, ""))
+                    for campo in ("DATA", "CONSULTOR", "EMPRESA", "MODELOS", "CIRCULAR")
+                )
+                return f"REG:{chave_sem_chassis}" if chave_sem_chassis.strip("|") else ""
+
             # --------------------------------------------------------
             # Tratamento de POST (Salvamento do Grupo)
             # --------------------------------------------------------
@@ -3390,15 +3441,9 @@ def acessar_modulo(nome_modulo):
             anos_encontrados = set([ano_atual_str])
             chaves_campanhas_existentes = set()
             for registro_campanha in registros_salvos_camp:
-                chassis_existente = chave_campanha(registro_campanha.get("CHASSIS", ""))
-                if chassis_existente:
-                    chaves_campanhas_existentes.add(f"CH:{chassis_existente}")
-                else:
-                    chave_sem_chassis = "|".join(chave_campanha(registro_campanha.get(campo, "")) for campo in (
-                        "DATA", "CONSULTOR", "EMPRESA", "MODELOS", "CIRCULAR"
-                    ))
-                    if chave_sem_chassis.strip("|"):
-                        chaves_campanhas_existentes.add(f"REG:{chave_sem_chassis}")
+                chave_existente = chave_registro_campanha(registro_campanha)
+                if chave_existente:
+                    chaves_campanhas_existentes.add(chave_existente)
             novas_linhas_campanha = []
 
             if len(linhas_brutas_negocios) > 1:
@@ -3436,7 +3481,11 @@ def acessar_modulo(nome_modulo):
                         chave_sem_chassis = "|".join(chave_campanha(valor) for valor in (
                             data_campanha, vend_val, cliente_val, modelo_val, regra_circular
                         ))
-                        chave_nova = f"CH:{chave_chassis}" if chave_chassis else f"REG:{chave_sem_chassis}"
+                        chave_nova = (
+                            f"CH:{chave_chassis}"
+                            if chave_chassis
+                            else f"REG:{chave_sem_chassis}"
+                        )
 
                         if chave_nova not in chaves_campanhas_existentes:
                             regra_prev = str(regra_associada.get("REGRA PREV", "")).strip()
@@ -3480,6 +3529,35 @@ def acessar_modulo(nome_modulo):
                     registros_campanha.append(item_dict)
 
             if novas_linhas_campanha:
+                # Confere novamente diretamente na planilha antes de gravar,
+                # bloqueando chassis que tenham sido incluídos desde a leitura inicial.
+                registros_campanha_atualizados = registros_de_linhas_planilha(
+                    aba_campanhas_vw.get_all_values()
+                )
+                chaves_campanhas_atualizadas = {
+                    chave
+                    for registro_atualizado in registros_campanha_atualizados
+                    if (chave := chave_registro_campanha(registro_atualizado))
+                }
+                linhas_sem_duplicidade = []
+                for linha_campanha in novas_linhas_campanha:
+                    registro_novo = dict(zip(
+                        (
+                            "DATA", "CIRCULAR", "CONSULTOR", "EMPRESA", "CHASSIS",
+                            "MODELOS", "G MANUTENÇÃO", "PLANO DE MANUTENÇÃO", "RIO", "STATUS",
+                        ),
+                        linha_campanha,
+                    ))
+                    chave_nova = chave_registro_campanha(registro_novo)
+                    if chave_nova and chave_nova in chaves_campanhas_atualizadas:
+                        continue
+                    linhas_sem_duplicidade.append(linha_campanha)
+                    if chave_nova:
+                        chaves_campanhas_atualizadas.add(chave_nova)
+
+                novas_linhas_campanha = linhas_sem_duplicidade
+
+            if novas_linhas_campanha:
                 aba_campanhas_vw.append_rows(
                     novas_linhas_campanha,
                     value_input_option="USER_ENTERED",
@@ -3493,43 +3571,75 @@ def acessar_modulo(nome_modulo):
                     "copiado(s) para Campanhas_VW."
                 )
 
-            # Mapeia registros salvos em Campanhas_VW (KPIs + STATUS DA TABELA).
-            # Normaliza CHASSIS/EMPRESA para que pequenas diferenças de espaços,
-            # pontuação ou caixa não impeçam o STATUS salvo na planilha de aparecer.
-            mapa_dados_salvos = {}
-            kpis_status = {"Ativo": 0, "Pendente": 0, "Aguardando Consultor": 0, "Total": 0}
+            # Campanhas_VW é a fonte oficial dos dados e status exibidos.
+            # Negocios_PM serve apenas para descobrir e inserir novos elegíveis.
+            registros_campanha = []
+            for registro_salvo in registros_salvos_camp:
+                data_val = str(registro_salvo.get("DATA", "")).strip()
+                data_obj = data_negocio_campanha(data_val)
+                ano_item = str(data_obj.year) if data_obj else ""
+                mes_item = f"{data_obj.month:02d}" if data_obj else ""
 
-            for rc in registros_salvos_camp:
-                ch = str(rc.get("CHASSIS", "")).strip()
-                cli = str(rc.get("EMPRESA", "")).strip()
-                consultor_salvo = str(rc.get("CONSULTOR", "")).strip()
-                status_val = str(rc.get("STATUS", "")).strip() or "Aguardando Consultor"
-
-                if not is_adm and chave_campanha(consultor_salvo) != chave_campanha(usuario_logado):
+                if ano_item:
+                    anos_encontrados.add(ano_item)
+                if ano_selecionado != "todos" and ano_item and ano_item != ano_selecionado:
+                    continue
+                if periodo_selecionado == "semestre1" and mes_item not in {
+                    "01", "02", "03", "04", "05", "06"
+                }:
+                    continue
+                if periodo_selecionado == "semestre2" and mes_item not in {
+                    "07", "08", "09", "10", "11", "12"
+                }:
+                    continue
+                if (
+                    len(periodo_selecionado) == 2
+                    and periodo_selecionado.isdigit()
+                    and mes_item != periodo_selecionado
+                ):
                     continue
 
-                status_norm = chave_campanha(status_val)
+                consultor_salvo = str(registro_salvo.get("CONSULTOR", "")).strip()
+                consultor_norm = chave_campanha(consultor_salvo)
+                if not is_adm and consultor_norm != chave_campanha(usuario_logado):
+                    continue
+                if (
+                    vend_selecionado != "todos"
+                    and consultor_norm != chave_campanha(vend_selecionado)
+                ):
+                    continue
+
+                modelo_salvo = str(
+                    registro_salvo.get("MODELOS", "") or registro_salvo.get("MODELO", "")
+                ).strip()
+                item_campanha = dict(registro_salvo)
+                item_campanha.update({
+                    "CLIENTE": str(
+                        registro_salvo.get("EMPRESA", "") or registro_salvo.get("CLIENTE", "")
+                    ).strip(),
+                    "MODELO": modelo_salvo,
+                    "CHASSIS": str(
+                        registro_salvo.get("CHASSIS", "") or registro_salvo.get("CHASSI", "")
+                    ).strip(),
+                    "VENDEDOR": consultor_salvo,
+                    "_regra": encontrar_regra_cruzada(modelo_salvo, mes_item) or {},
+                    "_mes_campanha": mes_item,
+                })
+                registros_campanha.append(item_campanha)
+
+            # Os KPIs são calculados a partir dos mesmos registros persistidos
+            # que aparecem na tabela e respeitam os filtros selecionados.
+            kpis_status = {"Ativo": 0, "Pendente": 0, "Aguardando Consultor": 0, "Total": 0}
+
+            for reg in registros_campanha:
+                status_norm = chave_campanha(reg.get("STATUS", ""))
                 if status_norm == "ATIVO":
-                    status_val = "Ativo"
+                    kpis_status["Ativo"] += 1
                 elif status_norm == "PENDENTE":
-                    status_val = "Pendente"
-                elif status_norm in ("AGUARDANDOCONSULTOR", "AGUARDANDO"):
-                    status_val = "Aguardando Consultor"
-
-                if status_val in kpis_status:
-                    kpis_status[status_val] += 1
+                    kpis_status["Pendente"] += 1
+                else:
+                    kpis_status["Aguardando Consultor"] += 1
                 kpis_status["Total"] += 1
-
-                dados_status = {
-                    "grupo": str(rc.get("G MANUTENÇÃO", "")).strip(),
-                    "status": status_val,
-                }
-                chave_chassis = chave_campanha(ch)
-                chave_cliente = chave_campanha(cli)
-                if chave_chassis:
-                    mapa_dados_salvos[f"CH:{chave_chassis}"] = dados_status
-                if chave_cliente:
-                    mapa_dados_salvos[f"CLI:{chave_cliente}"] = dados_status
 
             kpis_status["Aguardando Consultor"] = max(
                 0, len(registros_campanha) - kpis_status["Ativo"] - kpis_status["Pendente"]
@@ -3544,34 +3654,41 @@ def acessar_modulo(nome_modulo):
                 modelo = reg.get("MODELO", "")
                 chassis = reg.get("CHASSIS", "") or reg.get("CHASSI", "")
                 vendedor_item = reg.get("VENDEDOR", session.get('nome', ''))
-                regra = reg.get("_regra")
+                regra = reg.get("_regra") or {}
 
-                circular = str(regra.get("CIRCULAR", "")).strip()
+                circular = str(reg.get("CIRCULAR", "") or regra.get("CIRCULAR", "")).strip()
                 link_circular = str(regra.get("LINK_CIRCULAR", "")).strip()
-                mes_campanha = str(regra.get("MÊS", "") or regra.get("MES", "")).strip()
+                mes_numero = reg.get("_mes_campanha", "")
+                mes_campanha = str(
+                    regra.get("MÊS", "") or regra.get("MES", "")
+                    or next(
+                        (nome for nome, numero in meses_campanha.items() if numero == mes_numero),
+                        "",
+                    )
+                ).strip()
                 regra_prev = str(regra.get("REGRA PREV", "")).strip()
                 regra_rio = str(regra.get("REGRA RIO", "")).strip()
                 regra_prev_max = str(regra.get("REGRA PREV / MAX", "")).strip()
 
-                plano_manutencao_txt = f"{regra_prev} / {regra_prev_max}".strip(" /")
-                rio_txt = regra_rio
+                plano_manutencao_txt = str(
+                    reg.get("PLANO DE MANUTENÇÃO", "")
+                    or f"{regra_prev} / {regra_prev_max}".strip(" /")
+                ).strip()
+                rio_txt = str(reg.get("RIO", "") or regra_rio).strip()
 
                 if not link_circular:
                     link_circular = f"https://drive.google.com/drive/search?q={urllib.parse.quote(circular)}"
 
                 circular_html = f'<a href="{link_circular}" target="_blank" rel="noopener noreferrer" style="color: #0066cc; font-weight: 600;">{circular}</a>' if circular else "-"
 
-                chave_chassis_busca = chave_campanha(chassis)
-                chave_cliente_busca = chave_campanha(cliente)
-                dados_salvos = (
-                    mapa_dados_salvos.get(f"CH:{chave_chassis_busca}")
-                    if chave_chassis_busca else None
-                ) or (
-                    mapa_dados_salvos.get(f"CLI:{chave_cliente_busca}")
-                    if chave_cliente_busca else None
-                ) or {"grupo": "", "status": "Aguardando Consultor"}
-                grupo_atual = dados_salvos["grupo"]
-                status_atual = dados_salvos["status"]
+                grupo_atual = str(reg.get("G MANUTENÇÃO", "")).strip()
+                status_norm = chave_campanha(reg.get("STATUS", ""))
+                status_atual = {
+                    "ATIVO": "Ativo",
+                    "PENDENTE": "Pendente",
+                    "AGUARDANDOCONSULTOR": "Aguardando Consultor",
+                    "AGUARDANDO": "Aguardando Consultor",
+                }.get(status_norm, "Aguardando Consultor")
 
                 if is_adm:
                     opcoes_grupo = f"""

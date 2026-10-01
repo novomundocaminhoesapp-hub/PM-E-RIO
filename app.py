@@ -3748,6 +3748,7 @@ def acessar_modulo(nome_modulo):
             qtd_plus = 0
             qtd_rio = 0
             por_tipo_rio = {}
+            vendas_por_consultor_mes = {}
 
             for v in vendas:
                 qtd_venda = v.get("qtd", 1)
@@ -3760,6 +3761,11 @@ def acessar_modulo(nome_modulo):
                 
                 texto_geral_plano = f"{texto_plano} {texto_produto}"
                 texto_geral_rio = f"{texto_rio} {texto_produto} {texto_anexo}"
+
+                tem_pm = (
+                    texto_plano not in ("", "-", "NENHUM", "NAO", "N/A")
+                    or any(modalidade in texto_geral_plano for modalidade in ("PREV", "MAX", "PLUS"))
+                )
 
                 # --- A. Contabilização do PLANO DE MANUTENÇÃO ---
                 if "PREV" in texto_geral_plano:
@@ -3797,6 +3803,20 @@ def acessar_modulo(nome_modulo):
                             if termo in texto_geral_rio:
                                 tem_rio = True
                                 break
+
+                if tem_pm or tem_rio:
+                    chave_consultor = norm(v.get("vendedor", ""))
+                    dados_consultor = vendas_por_consultor_mes.setdefault(
+                        chave_consultor,
+                        {"nome": str(v.get("vendedor", "")).strip(), "meses": {}},
+                    )
+                    dados_mes = dados_consultor["meses"].setdefault(
+                        v["data"].month, {"pm": 0, "rio": 0},
+                    )
+                    if tem_pm:
+                        dados_mes["pm"] += qtd_venda
+                    if tem_rio:
+                        dados_mes["rio"] += qtd_venda
 
                 if tem_rio:
                     qtd_rio += qtd_venda
@@ -3891,6 +3911,7 @@ def acessar_modulo(nome_modulo):
                 texto_v = norm(" ".join([
                     str(v.get("produto", "")),
                     str(v.get("plano", "")),
+                    str(v.get("rio", "")),
                     str(v.get("anexo", ""))
                 ]))
                 if "RIO" in texto_v or "REMOTE DIAGNOSIS" in texto_v or "PERFORMANCE" in texto_v:
@@ -3926,6 +3947,14 @@ def acessar_modulo(nome_modulo):
                 if chave_rio not in chaves_rio_vendas:
                     qtd_rio += 1
                     chaves_rio_vendas.add(chave_rio)
+                    dados_consultor = vendas_por_consultor_mes.setdefault(
+                        norm(n.get("vendedor", "")),
+                        {"nome": str(n.get("vendedor", "")).strip(), "meses": {}},
+                    )
+                    dados_mes = dados_consultor["meses"].setdefault(
+                        n["data"].month, {"pm": 0, "rio": 0},
+                    )
+                    dados_mes["rio"] += 1
 
             # ------------------------------------------------------------
             # KPIs
@@ -4226,6 +4255,52 @@ def acessar_modulo(nome_modulo):
             if not linhas_top3_planos:
                 linhas_top3_planos = '<tr><td colspan="5" class="empty">Nenhum preço mensal disponível na aba PM_Precos.</td></tr>'
 
+            vendedores_tabela = {}
+            if not filtro_mes:
+                vendedores_tabela.update({
+                    norm(nome): nome
+                    for nome in consultores
+                    if passa_pessoa(nome) and passa_uf(nome)
+                })
+            for chave_consultor, dados_consultor in vendas_por_consultor_mes.items():
+                vendedores_tabela.setdefault(chave_consultor, dados_consultor["nome"])
+
+            linhas_vendas_mensais = ""
+            for chave_consultor in sorted(
+                vendedores_tabela,
+                key=lambda chave: norm(vendedores_tabela[chave]),
+            ):
+                nome_consultor = vendedores_tabela[chave_consultor]
+                dados_meses = vendas_por_consultor_mes.get(
+                    chave_consultor, {"meses": {}},
+                )["meses"]
+                celulas_mes = ""
+                for numero_mes in range(1, 13):
+                    dados_mes = dados_meses.get(numero_mes, {"pm": 0, "rio": 0})
+                    celulas_mes += (
+                        f'<td class="num {"has-sales" if dados_mes["pm"] else "no-sales"}">{dados_mes["pm"]}</td>'
+                        f'<td class="num {"has-sales" if dados_mes["rio"] else "no-sales"}">{dados_mes["rio"]}</td>'
+                    )
+                linhas_vendas_mensais += (
+                    f'<tr><th scope="row">{html.escape(nome_consultor or "Sem consultor")}</th>'
+                    f'{celulas_mes}</tr>'
+                )
+
+            if not linhas_vendas_mensais:
+                linhas_vendas_mensais = (
+                    '<tr><td class="empty" colspan="25">'
+                    'Nenhum consultor com vendas encontrado para os filtros atuais.'
+                    '</td></tr>'
+                )
+
+            cabecalho_meses_vendas = "".join(
+                f'<th colspan="2">{html.escape(MESES_PT[numero_mes].capitalize())}</th>'
+                for numero_mes in range(1, 13)
+            )
+            subcabecalho_meses_vendas = (
+                '<th>PM</th><th>RIO</th>' * 12
+            )
+
             html_dashboard = f"""
             <style>
                 .dash-wrap{{max-width:1500px;margin:0 auto;padding:4px 0 40px}}
@@ -4258,6 +4333,17 @@ def acessar_modulo(nome_modulo):
                 .dash-table-precos th:nth-child(3),.dash-table-precos td:nth-child(3){{text-align:center}}
                 .dash-table tr.plano-separador td{{padding:0;height:8px;background:#f1f5f9;border-bottom:1px solid #cbd5e1}}
                 .dash-table .num{{text-align:center;font-weight:800}}
+                .dash-monthly-scroll{{overflow:auto;max-height:560px;border:1px solid #e2e8f0;border-radius:8px}}
+                .dash-monthly-table{{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:11px}}
+                .dash-monthly-table th,.dash-monthly-table td{{min-width:52px;padding:8px 7px;border-bottom:1px solid #e2e8f0;border-right:1px solid #eef2f7;text-align:center;white-space:nowrap}}
+                .dash-monthly-table thead th{{position:sticky;top:0;z-index:2;background:#002244;color:#fff}}
+                .dash-monthly-table thead tr:nth-child(2) th{{top:32px;background:#155e9b}}
+                .dash-monthly-table thead tr:first-child th:first-child{{left:0;z-index:4;min-width:165px;text-align:left}}
+                .dash-monthly-table tbody th{{position:sticky;left:0;z-index:1;min-width:165px;background:#f8fafc;color:#334155;text-align:left}}
+                .dash-monthly-table tbody tr:nth-child(even) td{{background:#f8fafc}}
+                .dash-monthly-table tbody .num{{font-variant-numeric:tabular-nums}}
+                .dash-monthly-table tbody .has-sales{{background:#dcfce7!important;color:#166534;font-weight:900;box-shadow:inset 0 0 0 1px #86efac}}
+                .dash-monthly-table tbody .no-sales{{color:#cbd5e1;font-weight:500}}
                 .dash-link{{color:#0066cc;font-weight:700;text-decoration:none}}
                 .empty{{text-align:center;color:#94a3b8;padding:22px!important}}
                 .status{{display:inline-block;border-radius:999px;padding:4px 7px;font-size:10px;font-weight:800;background:#f1f5f9}}
@@ -4312,6 +4398,23 @@ def acessar_modulo(nome_modulo):
                         <strong>{taxa_conversao_plano:.1f}%</strong>
                         <span>meta mínima: 20%</span>
                     </div>
+                </div>
+
+                <div class="dash-table-card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+                        <h3 style="margin:0;color:#002244;font-size:15px;">📅 Vendas mensais por consultor</h3>
+                        <span class="dash-note" style="margin:0;">Quantidades de planos de manutenção (PM) e RIO</span>
+                    </div>
+                    <div class="dash-monthly-scroll">
+                        <table class="dash-monthly-table">
+                            <thead>
+                                <tr><th rowspan="2">Consultor</th>{cabecalho_meses_vendas}</tr>
+                                <tr>{subcabecalho_meses_vendas}</tr>
+                            </thead>
+                            <tbody>{linhas_vendas_mensais}</tbody>
+                        </table>
+                    </div>
+                    <div class="dash-note">Os valores respeitam os filtros de ano, período, consultor, produto e estado. Em períodos parciais, são exibidos os consultores com vendas no recorte.</div>
                 </div>
 
                 <div class="dash-table-card card-planos-manutencao" style="margin-bottom:14px">

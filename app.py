@@ -1489,39 +1489,68 @@ def identificar_grupo_manutencao(familia, km):
     return "Não identificado"
 
 
+INTERVALOS_REVISAO_MODELO = {
+    "EXPRESS": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
+    "6170": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
+    "9180": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 500},
+    "11180": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 500},
+    "13180": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "14180": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "14210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "17210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "18210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "18260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "18320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "25480": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "26260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "26320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "27260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "30320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "31320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "33480": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 600},
+    "28480": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "29530": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+}
+INTERVALOS_REVISAO_FAMILIA = {
+    "DELIVERY": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "CONSTELLATION": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    "METEOR": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+}
+
+
+def obter_intervalo_revisao(modelo, familia, grupo, intervalo_horas=None):
+    modelo_norm = normalizar_chave_manutencao(modelo)
+    id_modelo = next(
+        (
+            modelo_id
+            for modelos in FAMILIAS_POR_MODELO.values()
+            for modelo_id in modelos
+            if modelo_id in modelo_norm
+        ),
+        "",
+    )
+    if not id_modelo and "EXPRESS" in modelo_norm:
+        id_modelo = "EXPRESS"
+
+    regras_modelo = INTERVALOS_REVISAO_MODELO.get(
+        id_modelo,
+        INTERVALOS_REVISAO_FAMILIA.get(familia, {}),
+    )
+    intervalo = regras_modelo.get(normalizar_chave_manutencao(grupo))
+    if normalizar_chave_manutencao(grupo) == "ESPECIAL" and intervalo is None:
+        intervalo = intervalo_horas
+    if intervalo is None:
+        return "Não informado"
+
+    unidade = "h" if normalizar_chave_manutencao(grupo) == "ESPECIAL" else "km"
+    return f"A cada {intervalo:,.0f} {unidade}".replace(",", ".")
+
+
 def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
     """Seleciona os 3 modelos distintos de menor preço para cada plano."""
 
     def converter_intervalo(valor):
         return converter_intervalo_manutencao(valor)
-
-    intervalos_revisao = {
-        "EXPRESS": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
-        "6170": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
-        "9180": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 500},
-        "11180": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 500},
-        "13180": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "14180": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "14210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "17210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "18210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "18260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "18320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "25480": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "26260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "26320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "27260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "30320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "31320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "33480": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 600},
-        "28480": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "29530": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-    }
-    intervalos_revisao_familia = {
-        "DELIVERY": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "CONSTELLATION": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-        "METEOR": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
-    }
 
     def encontrar_coluna_mensal(chaves, indice):
         alvo = normalizar_chave_manutencao("VALOR MENSAL")
@@ -1550,18 +1579,6 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
 
         periodo = str(registro.get("PERIODO", "")).strip() or "12"
         familia = identificar_familia_modelo(modelo, registros_modelos)
-        id_modelo = next(
-            (
-                modelo_id
-                for modelos in FAMILIAS_POR_MODELO.values()
-                for modelo_id in modelos
-                if modelo_id in normalizar_chave_manutencao(modelo)
-            ),
-            "",
-        )
-        if not id_modelo and "EXPRESS" in normalizar_chave_manutencao(modelo):
-            id_modelo = "EXPRESS"
-
         for plano, indice_plano in configuracoes:
             for unidade, indice_valor in (("KM", indice_plano), ("HORA", indice_plano + 3)):
                 coluna_valor = encontrar_coluna_mensal(chaves, indice_valor)
@@ -1575,22 +1592,12 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
                     continue
 
                 grupo = "Especial" if unidade == "HORA" else identificar_grupo_manutencao(familia, intervalo)
-                grupo_chave = normalizar_chave_manutencao(grupo)
-                regras_modelo = intervalos_revisao.get(
-                    id_modelo,
-                    intervalos_revisao_familia.get(familia, {}),
+                texto_intervalo = obter_intervalo_revisao(
+                    modelo,
+                    familia,
+                    grupo,
+                    intervalo_horas=intervalo if unidade == "HORA" else None,
                 )
-                intervalo_regra = regras_modelo.get(grupo_chave)
-                if unidade == "HORA" and intervalo_regra is None:
-                    intervalo_regra = intervalo
-                if intervalo_regra is None:
-                    texto_intervalo = "Não informado"
-                else:
-                    unidade_intervalo = "h" if grupo_chave == "ESPECIAL" else "km"
-                    texto_intervalo = (
-                        f"A cada {intervalo_regra:,.0f} {unidade_intervalo}"
-                        .replace(",", ".")
-                    )
 
                 candidatos[plano].append({
                     "tipo": plano,
@@ -1850,7 +1857,7 @@ TEMPLATE_HTML = r"""
 
         .plano-titulo { font-size: 14px; font-weight: 700; color: #1a202c; margin-bottom: 10px; text-transform: uppercase; border-bottom: 1px solid #edf2f7; padding-bottom: 6px; }
         .plano-linha-tripla { display: flex; gap: 8px; margin-bottom: 8px; }
-        .plano-linha-com-grupo { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
+        .plano-linha-com-grupo { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
         @media (max-width: 600px) { .plano-linha-com-grupo { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         .plano-col { flex: 1; background: #f7fafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #edf2f7; }
 
@@ -7172,6 +7179,11 @@ def acessar_modulo(nome_modulo):
                         familia_modelo,
                         converter_intervalo_manutencao(km_geral_val),
                     )
+                    intervalo_revisao_km = obter_intervalo_revisao(
+                        titulo_principal,
+                        familia_modelo,
+                        grupo_manutencao_km,
+                    )
                     planos_km_info = [
                         {"nome": "Plano PREV", "classe": "prev", "km_col": "PREV_VALOR KM" if "PREV_VALOR KM" in item_escolhido else "KM", "mensal_col": "VALOR MENSAL" if "VALOR MENSAL" in item_escolhido else "", "total_col": "TOTAL CONTRATO" if "TOTAL CONTRATO" in item_escolhido else ""},
                         {"nome": "Plano MAX", "classe": "max", "km_col": "MAX_VALOR KM" if "MAX_VALOR KM" in item_escolhido else "KM_1", "mensal_col": "VALOR MENSAL_1" if "VALOR MENSAL_1" in item_escolhido else "", "total_col": "TOTAL CONTRATO_1" if "TOTAL CONTRATO_1" in item_escolhido else ""},
@@ -7205,11 +7217,21 @@ def acessar_modulo(nome_modulo):
                                         <div class="detalhe-label">Grupo de Manutenção</div>
                                         <div class="detalhe-valor" style="font-weight: 600;">{grupo_manutencao_km}</div>
                                     </div>
+                                    <div class="plano-col">
+                                        <div class="detalhe-label">Intervalo da Revisão</div>
+                                        <div class="detalhe-valor" style="font-weight: 600;">{intervalo_revisao_km}</div>
+                                    </div>
                                 </div>
                             </div>
                             """
 
                     hora_geral_val = item_escolhido.get("HORA", "")
+                    intervalo_revisao_horas = obter_intervalo_revisao(
+                        titulo_principal,
+                        familia_modelo,
+                        "Especial",
+                        intervalo_horas=converter_intervalo_manutencao(hora_geral_val),
+                    )
                     planos_hora_info = [
                         {"nome": "Plano PREV", "classe": "prev", "hora_col": "PREV_VALOR HORA" if "PREV_VALOR HORA" in item_escolhido else "HORA"},
                         {"nome": "Plano MAX", "classe": "max", "hora_col": "MAX_VALOR HORA" if "MAX_VALOR HORA" in item_escolhido else "HORA_1"},
@@ -7263,6 +7285,10 @@ def acessar_modulo(nome_modulo):
                                         <div class="plano-col">
                                             <div class="detalhe-label">Grupo de Manutenção</div>
                                             <div class="detalhe-valor" style="font-weight: 600;">Especial</div>
+                                        </div>
+                                        <div class="plano-col">
+                                            <div class="detalhe-label">Intervalo da Revisão</div>
+                                            <div class="detalhe-valor" style="font-weight: 600;">{intervalo_revisao_horas}</div>
                                         </div>
                                     </div>
                                 </div>

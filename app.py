@@ -1399,45 +1399,102 @@ def converter_numero(valor):
         return None
 
 
+FAMILIAS_POR_MODELO = {
+    "DELIVERY": {"6170", "9180", "11180", "13180", "14180", "14210", "17210", "18210", "18260", "18320"},
+    "CONSTELLATION": {"25480", "26260", "26320", "27260", "30320", "31320", "33480"},
+    "METEOR": {"28480", "29530"},
+}
+
+
+def normalizar_chave_manutencao(valor):
+    texto = unicodedata.normalize("NFKD", str(valor).upper())
+    texto = "".join(caractere for caractere in texto if not unicodedata.combining(caractere))
+    return re.sub(r"[^A-Z0-9]", "", texto)
+
+
+def converter_intervalo_manutencao(valor):
+    texto = re.sub(
+        r"[^0-9,.-]",
+        "",
+        str("" if valor is None else valor).strip().lower(),
+    )
+    if not texto:
+        return None
+    if "," in texto and "." in texto:
+        if texto.rfind(",") > texto.rfind("."):
+            texto = texto.replace(".", "").replace(",", ".")
+        else:
+            texto = texto.replace(",", "")
+    elif "," in texto:
+        if re.fullmatch(r"-?\d{1,3}(?:,\d{3})+", texto):
+            texto = texto.replace(",", "")
+        else:
+            texto = texto.replace(",", ".")
+    elif re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", texto):
+        texto = texto.replace(".", "")
+    try:
+        return float(texto)
+    except ValueError:
+        return None
+
+
+def identificar_familia_modelo(modelo, registros_modelos=None):
+    modelo_norm = normalizar_chave_manutencao(modelo)
+    if "DELIVERY" in modelo_norm or "EXPRESS" in modelo_norm:
+        return "DELIVERY"
+    if "CONSTELLATION" in modelo_norm:
+        return "CONSTELLATION"
+    if "METEOR" in modelo_norm:
+        return "METEOR"
+
+    for registro_modelo in registros_modelos or []:
+        nome_modelo = str(
+            registro_modelo.get("MODELO")
+            or registro_modelo.get("NOME")
+            or registro_modelo.get("DESCRICAO")
+            or ""
+        ).strip()
+        nome_norm = normalizar_chave_manutencao(nome_modelo)
+        if not nome_norm or not (nome_norm in modelo_norm or modelo_norm in nome_norm):
+            continue
+        metadados = normalizar_chave_manutencao(" ".join(
+            str(registro_modelo.get(campo, "") or "")
+            for campo in ("FAMILIA", "CATEGORIA", "TIPO", "DESCRICAO")
+        ))
+        for familia in ("DELIVERY", "CONSTELLATION", "METEOR", "EXPRESS"):
+            if familia in metadados:
+                return "DELIVERY" if familia == "EXPRESS" else familia
+
+    for familia, modelos in FAMILIAS_POR_MODELO.items():
+        if any(modelo_id in modelo_norm for modelo_id in modelos):
+            return familia
+    return ""
+
+
+def identificar_grupo_manutencao(familia, km):
+    if km is None or not familia:
+        return "Não identificado"
+    if familia == "DELIVERY":
+        if km <= 3250:
+            return "Severo"
+        if km <= 6500:
+            return "Misto"
+        return "Rodoviário"
+    if familia in ("CONSTELLATION", "METEOR"):
+        if km <= 6500:
+            return "Severo"
+        if km <= 10000:
+            return "Misto"
+        return "Rodoviário"
+    return "Não identificado"
+
+
 def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
     """Seleciona os 3 modelos distintos de menor preço para cada plano."""
-    import re
-
-    def normalizar_chave(chave):
-        texto = unicodedata.normalize("NFKD", str(chave).upper())
-        texto = "".join(caractere for caractere in texto if not unicodedata.combining(caractere))
-        return re.sub(r"[^A-Z0-9]", "", texto)
 
     def converter_intervalo(valor):
-        texto = re.sub(
-            r"[^0-9,.-]",
-            "",
-            str("" if valor is None else valor).strip().lower(),
-        )
-        if not texto:
-            return None
-        if "," in texto and "." in texto:
-            if texto.rfind(",") > texto.rfind("."):
-                texto = texto.replace(".", "").replace(",", ".")
-            else:
-                texto = texto.replace(",", "")
-        elif "," in texto:
-            if re.fullmatch(r"-?\d{1,3}(?:,\d{3})+", texto):
-                texto = texto.replace(",", "")
-            else:
-                texto = texto.replace(",", ".")
-        elif re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", texto):
-            texto = texto.replace(".", "")
-        try:
-            return float(texto)
-        except ValueError:
-            return None
+        return converter_intervalo_manutencao(valor)
 
-    familias_por_modelo = {
-        "DELIVERY": {"6170", "9180", "11180", "13180", "14180", "14210", "17210", "18210", "18260", "18320"},
-        "CONSTELLATION": {"25480", "26260", "26320", "27260", "30320", "31320", "33480"},
-        "METEOR": {"28480", "29530"},
-    }
     intervalos_revisao = {
         "EXPRESS": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
         "6170": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
@@ -1466,59 +1523,10 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
         "METEOR": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
     }
 
-    def familia_modelo(modelo):
-        modelo_norm = normalizar_chave(modelo)
-        if "DELIVERY" in modelo_norm or "EXPRESS" in modelo_norm:
-            return "DELIVERY"
-        if "CONSTELLATION" in modelo_norm:
-            return "CONSTELLATION"
-        if "METEOR" in modelo_norm:
-            return "METEOR"
-
-        for registro_modelo in registros_modelos or []:
-            nome_modelo = str(
-                registro_modelo.get("MODELO")
-                or registro_modelo.get("NOME")
-                or registro_modelo.get("DESCRICAO")
-                or ""
-            ).strip()
-            nome_norm = normalizar_chave(nome_modelo)
-            if not nome_norm or not (nome_norm in modelo_norm or modelo_norm in nome_norm):
-                continue
-            metadados = normalizar_chave(" ".join(
-                str(registro_modelo.get(campo, "") or "")
-                for campo in ("FAMILIA", "CATEGORIA", "TIPO", "DESCRICAO")
-            ))
-            for familia in ("DELIVERY", "CONSTELLATION", "METEOR", "EXPRESS"):
-                if familia in metadados:
-                    return "DELIVERY" if familia == "EXPRESS" else familia
-
-        for familia, modelos in familias_por_modelo.items():
-            if any(modelo_id in modelo_norm for modelo_id in modelos):
-                return familia
-        return ""
-
-    def identificar_grupo(familia, km):
-        if km is None or not familia:
-            return "Não identificado"
-        if familia == "DELIVERY":
-            if km <= 3250:
-                return "Severo"
-            if km <= 6500:
-                return "Misto"
-            return "Rodoviário"
-        if familia in ("CONSTELLATION", "METEOR"):
-            if km <= 6500:
-                return "Severo"
-            if km <= 10000:
-                return "Misto"
-            return "Rodoviário"
-        return "Não identificado"
-
     def encontrar_coluna_mensal(chaves, indice):
-        alvo = normalizar_chave("VALOR MENSAL")
+        alvo = normalizar_chave_manutencao("VALOR MENSAL")
         for chave in chaves:
-            normalizada = normalizar_chave(chave)
+            normalizada = normalizar_chave_manutencao(chave)
             if not normalizada.startswith(alvo):
                 continue
             sufixo = normalizada[len(alvo):]
@@ -1528,7 +1536,7 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
 
     def encontrar_coluna_intervalo(chaves, unidade):
         base = "KM" if unidade == "KM" else "HORA"
-        por_chave_norm = {normalizar_chave(chave): chave for chave in chaves}
+        por_chave_norm = {normalizar_chave_manutencao(chave): chave for chave in chaves}
         return por_chave_norm.get(base)
 
     candidatos = {"PREV": [], "MAX": [], "PLUS": []}
@@ -1541,17 +1549,17 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
             continue
 
         periodo = str(registro.get("PERIODO", "")).strip() or "12"
-        familia = familia_modelo(modelo)
+        familia = identificar_familia_modelo(modelo, registros_modelos)
         id_modelo = next(
             (
                 modelo_id
-                for modelos in familias_por_modelo.values()
+                for modelos in FAMILIAS_POR_MODELO.values()
                 for modelo_id in modelos
-                if modelo_id in normalizar_chave(modelo)
+                if modelo_id in normalizar_chave_manutencao(modelo)
             ),
             "",
         )
-        if not id_modelo and "EXPRESS" in normalizar_chave(modelo):
+        if not id_modelo and "EXPRESS" in normalizar_chave_manutencao(modelo):
             id_modelo = "EXPRESS"
 
         for plano, indice_plano in configuracoes:
@@ -1566,8 +1574,8 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
                 if valor is None or valor <= 0 or (unidade == "HORA" and not intervalo):
                     continue
 
-                grupo = "Especial" if unidade == "HORA" else identificar_grupo(familia, intervalo)
-                grupo_chave = normalizar_chave(grupo)
+                grupo = "Especial" if unidade == "HORA" else identificar_grupo_manutencao(familia, intervalo)
+                grupo_chave = normalizar_chave_manutencao(grupo)
                 regras_modelo = intervalos_revisao.get(
                     id_modelo,
                     intervalos_revisao_familia.get(familia, {}),
@@ -1605,7 +1613,7 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
         )
         melhor_por_modelo = {}
         for item in ordenados:
-            chave_modelo = normalizar_chave(item["modelo"])
+            chave_modelo = normalizar_chave_manutencao(item["modelo"])
             melhor_por_modelo.setdefault(chave_modelo, item)
         resultado.extend(list(melhor_por_modelo.values())[:3])
 
@@ -1842,6 +1850,8 @@ TEMPLATE_HTML = r"""
 
         .plano-titulo { font-size: 14px; font-weight: 700; color: #1a202c; margin-bottom: 10px; text-transform: uppercase; border-bottom: 1px solid #edf2f7; padding-bottom: 6px; }
         .plano-linha-tripla { display: flex; gap: 8px; margin-bottom: 8px; }
+        .plano-linha-com-grupo { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
+        @media (max-width: 600px) { .plano-linha-com-grupo { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         .plano-col { flex: 1; background: #f7fafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #edf2f7; }
 
         .acoes-ficha-tecnica { display: flex; gap: 8px; margin-top: 8px; }
@@ -7125,6 +7135,7 @@ def acessar_modulo(nome_modulo):
         try:
             planilha = conectar_google_sheets()
             dados_precos = obter_registros_com_cache(planilha, "PM_Precos")
+            dados_modelos = obter_registros_com_cache(planilha, "Modelos")
 
             pilulas_valores = []
             for item in dados_precos:
@@ -7156,6 +7167,11 @@ def acessar_modulo(nome_modulo):
                     bloco_ficha_tecnica_html = ""
 
                     km_geral_val = item_escolhido.get("KM", "")
+                    familia_modelo = identificar_familia_modelo(titulo_principal, dados_modelos)
+                    grupo_manutencao_km = identificar_grupo_manutencao(
+                        familia_modelo,
+                        converter_intervalo_manutencao(km_geral_val),
+                    )
                     planos_km_info = [
                         {"nome": "Plano PREV", "classe": "prev", "km_col": "PREV_VALOR KM" if "PREV_VALOR KM" in item_escolhido else "KM", "mensal_col": "VALOR MENSAL" if "VALOR MENSAL" in item_escolhido else "", "total_col": "TOTAL CONTRATO" if "TOTAL CONTRATO" in item_escolhido else ""},
                         {"nome": "Plano MAX", "classe": "max", "km_col": "MAX_VALOR KM" if "MAX_VALOR KM" in item_escolhido else "KM_1", "mensal_col": "VALOR MENSAL_1" if "VALOR MENSAL_1" in item_escolhido else "", "total_col": "TOTAL CONTRATO_1" if "TOTAL CONTRATO_1" in item_escolhido else ""},
@@ -7172,7 +7188,7 @@ def acessar_modulo(nome_modulo):
                             cards_km_html += f"""
                             <div class="card-plano {p['classe']}">
                                 <div class="plano-titulo">{p['nome']} (KM)</div>
-                                <div class="plano-linha-tripla">
+                                <div class="plano-linha-com-grupo">
                                     <div class="plano-col">
                                         <div class="detalhe-label">Valor KM</div>
                                         <div class="detalhe-valor" style="font-weight: 600;">{km_val}</div>
@@ -7184,6 +7200,10 @@ def acessar_modulo(nome_modulo):
                                     <div class="plano-col">
                                         <div class="detalhe-label">Total Contrato</div>
                                         <div class="detalhe-valor" style="font-weight: 600; color: #2b6cb0;">{total_val}</div>
+                                    </div>
+                                    <div class="plano-col">
+                                        <div class="detalhe-label">Grupo de Manutenção</div>
+                                        <div class="detalhe-valor" style="font-weight: 600;">{grupo_manutencao_km}</div>
                                     </div>
                                 </div>
                             </div>
@@ -7227,7 +7247,7 @@ def acessar_modulo(nome_modulo):
                                 cards_horas_html += f"""
                                 <div class="card-plano {p['classe']}">
                                     <div class="plano-titulo">{p['nome']} (HORAS)</div>
-                                    <div class="plano-linha-tripla">
+                                    <div class="plano-linha-com-grupo">
                                         <div class="plano-col">
                                             <div class="detalhe-label">Valor Hora</div>
                                             <div class="detalhe-valor" style="font-weight: 600;">{hora_val}</div>
@@ -7239,6 +7259,10 @@ def acessar_modulo(nome_modulo):
                                         <div class="plano-col">
                                             <div class="detalhe-label">Total Contrato</div>
                                             <div class="detalhe-valor" style="font-weight: 600; color: #2b6cb0;">{total_val}</div>
+                                        </div>
+                                        <div class="plano-col">
+                                            <div class="detalhe-label">Grupo de Manutenção</div>
+                                            <div class="detalhe-valor" style="font-weight: 600;">Especial</div>
                                         </div>
                                     </div>
                                 </div>

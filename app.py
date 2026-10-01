@@ -1208,14 +1208,32 @@ def importar_relatorios_drive_vendas():
                 mod_nome = str(m.get("MODELO", "") or m.get("NOME", "") or m.get("DESCRICAO", "")).strip()
                 if mod_nome:
                     mapa_modelos[mod_nome.upper()] = mod_nome
-        except Exception:
+        except Exception as erro_modelos:
+            print(f"Erro ao carregar modelos para importar relatório: {erro_modelos}")
             mapa_modelos = {}
 
+        def extrair_numeracoes_modelo(valor):
+            texto = str(valor or "").upper()
+            return {
+                f"{match.group(1)}{match.group(2)}"
+                for match in re.finditer(r"(?<!\d)(\d{1,2})[.\s]?(\d{3})(?!\d)", texto)
+            }
+
+        modelos_por_numeracao = {}
+        for chave, nome_modelo in mapa_modelos.items():
+            for numeracao in extrair_numeracoes_modelo(nome_modelo):
+                modelos_por_numeracao.setdefault(numeracao, nome_modelo)
+
         def identificar_modelo(modelo_bruto):
-            if not modelo_bruto or str(modelo_bruto).lower() == 'nan':
+            if modelo_bruto is None or not str(modelo_bruto).strip() or str(modelo_bruto).lower() == 'nan':
                 return ""
 
             m_bruto_str = str(modelo_bruto).upper()
+
+            for numeracao in extrair_numeracoes_modelo(m_bruto_str):
+                modelo_cadastrado = modelos_por_numeracao.get(numeracao)
+                if modelo_cadastrado:
+                    return modelo_cadastrado
 
             m_limpo = m_bruto_str.replace(".", "").replace("-", "").replace(" ", "").replace("/", "")
             for chave, real in mapa_modelos.items():
@@ -1243,7 +1261,7 @@ def importar_relatorios_drive_vendas():
                 if palavras_chave and all(p in m_bruto_str for p in palavras_chave):
                     return real
 
-            return str(modelo_bruto).strip()
+            return ""
 
         import io
         import pandas as pd
@@ -1251,6 +1269,12 @@ def importar_relatorios_drive_vendas():
         importados_count = 0
         arquivos_concluidos = 0
         erros_importacao = []
+        avisos_modelos = []
+        modelos_cadastrados = set(mapa_modelos.values())
+        if not modelos_cadastrados:
+            avisos_modelos.append(
+                "A aba Modelos está vazia ou indisponível; os nomes originais foram preservados."
+            )
 
         # ============================================================
         # PROCESSA OS RELATÓRIOS DO DRIVE
@@ -1309,6 +1333,7 @@ def importar_relatorios_drive_vendas():
             linhas_arquivo = []
             chaves_arquivo = set()
             registros_invalidos = 0
+            modelos_nao_cadastrados = []
             duplicados = 0
 
             for _, row in df_rel.iterrows():
@@ -1333,6 +1358,11 @@ def importar_relatorios_drive_vendas():
                 modelo = identificar_modelo(modelo_bruto)
                 chassis_bruto = obter_valor_relatorio(row, "CHASSIS", "CHASSI")
                 chassis = str(chassis_bruto).strip() if chassis_bruto is not None else ""
+                if modelo not in modelos_cadastrados:
+                    chassis_conferencia = chassis or "sem chassi"
+                    modelos_nao_cadastrados.append(
+                        f"{data_venda} | {cliente} | modelo original: {modelo} | chassi: {chassis_conferencia}"
+                    )
 
                 if chassis:
                     chave_unica = f"CHASSIS:{normalizar_chave_planilha(chassis)}"
@@ -1354,11 +1384,6 @@ def importar_relatorios_drive_vendas():
                     cliente,
                     modelo,
                     chassis,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
                 ])
 
             if registros_invalidos:
@@ -1367,9 +1392,18 @@ def importar_relatorios_drive_vendas():
                 )
                 continue
 
+            if modelos_nao_cadastrados:
+                avisos_modelos.extend(
+                    f"{file_name}: {detalhe}"
+                    for detalhe in modelos_nao_cadastrados
+                )
+
             try:
                 if linhas_arquivo:
-                    aba_negocios.append_rows(linhas_arquivo)
+                    aba_negocios.append_rows(
+                        linhas_arquivo,
+                        insert_data_option="INSERT_ROWS",
+                    )
                     chaves_cadastradas.update(chaves_arquivo)
                     invalidar_cache_ab_as("Negocios_PM")
                     importados_count += len(linhas_arquivo)
@@ -1400,6 +1434,8 @@ def importar_relatorios_drive_vendas():
         )
         if erros_importacao:
             resumo += " Pendências: " + "; ".join(erros_importacao)
+        if avisos_modelos:
+            resumo += " Conferência manual: " + "; ".join(avisos_modelos)
         return resumo
 
     except Exception as e:
@@ -6532,6 +6568,7 @@ def acessar_modulo(nome_modulo):
             if request.method == "GET" and request.args.get("sincronizar") == "1":
                 msg_sync = importar_relatorios_drive_vendas()
                 print(msg_sync)
+                session["msg_sync_negocios"] = msg_sync
                 return redirect(url_for("acessar_modulo", nome_modulo="negocios"))
 
             perfil_negocios = str(session.get("perfil", "")).strip().upper()
@@ -6545,8 +6582,25 @@ def acessar_modulo(nome_modulo):
                 aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=11)
                 aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "CHASSIS", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS"])
             
-            sucesso_msg = None
-            erro_msg = None
+            msg_sync = session.pop("msg_sync_negocios", None)
+            aviso_sync = None
+            sucesso_msg = (
+                html.escape(msg_sync)
+                if msg_sync and (
+                    msg_sync.startswith("Sincronização concluída!")
+                    or msg_sync == "Nenhum arquivo novo para importar."
+                )
+                else None
+            )
+            if sucesso_msg and " Conferência manual: " in msg_sync:
+                resumo_sync, aviso_sync = msg_sync.split(" Conferência manual: ", 1)
+                sucesso_msg = html.escape(resumo_sync)
+                aviso_sync = html.escape(aviso_sync)
+            erro_msg = (
+                html.escape(msg_sync)
+                if msg_sync and sucesso_msg is None
+                else None
+            )
 
             # 1. Busca dinâmica de Vendedores (Apenas quem tem CONSULTOR no perfil)
             aba_usuarios = planilha.worksheet("Usuarios")
@@ -6881,6 +6935,7 @@ def acessar_modulo(nome_modulo):
 
                 {f'<div class="sucesso">{sucesso_msg}</div>' if sucesso_msg else ''}
                 {f'<div class="error">{erro_msg}</div>' if erro_msg else ''}
+                {f'<div style="background:#fffaf0; color:#744210; border:1px solid #f6ad55; padding:12px; border-radius:6px; margin-bottom:15px; font-size:13px;"><b>Importado com dados para conferência manual:</b><br>{aviso_sync}</div>' if aviso_sync else ''}
 
                 <!-- Botão Oculto / Sanfona para Registrar Nova Negociação -->
                 <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 6px; margin-bottom: 15px; overflow: hidden;">

@@ -7230,16 +7230,22 @@ def acessar_modulo(nome_modulo):
 
                     chaves_item = list(item_escolhido.keys())
                     hora_geral_val = ""
-                    for indice_hora, plano_hora in enumerate(("PREV", "MAX", "PLUS")):
+                    for indice_hora in range(3):
                         coluna_hora_resumo = encontrar_coluna_por_indice(
                             chaves_item,
-                            f"{plano_hora}_VALOR HORA",
-                            0,
-                        ) or encontrar_coluna_por_indice(chaves_item, "HORA", indice_hora)
+                            "HORA",
+                            indice_hora,
+                        )
                         valor_hora_resumo = item_escolhido.get(coluna_hora_resumo, "") if coluna_hora_resumo else ""
                         if str(valor_hora_resumo).strip():
                             hora_geral_val = valor_hora_resumo
                             break
+                    horas_contrato = converter_intervalo_manutencao(hora_geral_val)
+                    horas_contrato_exibicao = (
+                        f"{horas_contrato:,.0f} h".replace(",", ".")
+                        if horas_contrato is not None
+                        else "-"
+                    )
                     intervalo_revisao_horas = obter_intervalo_revisao(
                         titulo_principal,
                         familia_modelo,
@@ -7340,7 +7346,7 @@ def acessar_modulo(nome_modulo):
                             { '<div style="font-size: 13px; font-weight: 700; color: #4a5568; margin-bottom: 6px; text-transform: uppercase;">Valores por Quilometragem (KM)</div>' if cards_km_html else '' }
                             <div class="grid-planos">{cards_km_html}</div>
 
-                            { '<div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; margin-top: 18px; margin-bottom: 14px;"><div style="display: flex; gap: 10px;"><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Horas (H)</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + str(hora_geral_val) + '</div></div><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Período do Contrato</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + str(periodo_val) + ' Meses</div></div></div></div>' if hora_geral_val else '' }
+                            { '<div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px; margin-top: 18px; margin-bottom: 14px;"><div style="display: flex; gap: 10px;"><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Horas (H)</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + horas_contrato_exibicao + '</div></div><div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;"><div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Período do Contrato</div><div style="font-size: 15px; font-weight: 700; color: #1a202c;">' + str(periodo_val) + ' Meses</div></div></div></div>' if hora_geral_val else '' }
 
                             { '<div style="font-size: 13px; font-weight: 700; color: #4a5568; margin-top: 10px; margin-bottom: 6px; text-transform: uppercase;">Valores por Horas (H)</div>' if cards_horas_html else '' }
                             <div class="grid-planos">{cards_horas_html}</div>

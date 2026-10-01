@@ -1070,40 +1070,59 @@ def obter_conteudo_pastas_drive():
 def importar_relatorios_drive_vendas():
     """
     Varre a pasta 'Rel_Vendas' no Google Drive ignorando arquivos já rotulados como [IMPORTADO],
-    padroniza Vendedores (aba Usuarios) e Modelos (aba Modelos),
-    evita duplicatas e insere os registros pendentes de forma otimizada e rápida.
+    preserva os dados do relatório em Negocios_PM e marca o arquivo como importado
+    somente depois que todos os registros válidos forem gravados ou identificados como duplicados.
     """
     try:
-        if 'GOOGLE_CREDENTIALS' in os.environ:
-            credenciais_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
-            credenciais = Credentials.from_service_account_info(credenciais_dict, scopes=escopos)
-        else:
-            credenciais = Credentials.from_service_account_file("credenciais.json", scopes=escopos)
-
-        service = build('drive', 'v3', credentials=credenciais)
-
-        if 'GOOGLE_CREDENTIALS' in os.environ:
-            gc = gspread.authorize(Credentials.from_service_account_info(json.loads(os.environ['GOOGLE_CREDENTIALS']), scopes=escopos))
-        else:
-            gc = gspread.authorize(Credentials.from_service_account_file("credenciais.json", scopes=escopos))
-
-        planilha = gc.open("PM e RIO Novo")
-
+        service = conectar_google_drive()
+        planilha = conectar_google_sheets()
         query_folder = "name = 'Rel_Vendas' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        folders_res = service.files().list(q=query_folder, fields="files(id, name)").execute()
+        folders_res = service.files().list(
+            q=query_folder,
+            fields="files(id, name)",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
         folders = folders_res.get('files', [])
 
         if not folders:
             return "Pasta Rel_Vendas não encontrada no Drive."
+        if len(folders) != 1:
+            return "Há mais de uma pasta Rel_Vendas no Drive; a importação foi interrompida para evitar importar da pasta errada."
 
         folder_id = folders[0]['id']
 
         # Busca apenas arquivos que NÃO contêm '[IMPORTADO]' no nome.
         query_files = f"'{folder_id}' in parents and not name contains '[IMPORTADO]' and trashed = false"
-        files_res = service.files().list(q=query_files, fields="files(id, name, mimeType)").execute()
-        files = files_res.get('files', [])
+        files = []
+        page_token = None
+        while True:
+            files_res = service.files().list(
+                q=query_files,
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageSize=1000,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            files.extend(
+                arquivo
+                for arquivo in files_res.get('files', [])
+                if "[IMPORTADO]" not in str(arquivo.get("name", "")).upper()
+            )
+            page_token = files_res.get('nextPageToken')
+            if not page_token:
+                break
 
-        if not files:
+        arquivos_planilha = [
+            arquivo for arquivo in files
+            if os.path.splitext(arquivo.get("name", "") or "")[1].lower()
+            in {".xls", ".xlsx", ".xlsm"}
+            or arquivo.get("mimeType") == "application/vnd.google-apps.spreadsheet"
+        ]
+
+        if not arquivos_planilha:
             return "Nenhum arquivo novo para importar."
 
         # ============================================================
@@ -1132,8 +1151,15 @@ def importar_relatorios_drive_vendas():
         chaves_cadastradas = set()
         for r in registros_existentes[1:]:
             if len(r) >= 5:
-                chave = f"{str(r[1]).strip()}_{str(r[2]).strip()}_{str(r[3]).strip()}_{str(r[4]).strip()}".upper()
-                chaves_cadastradas.add(chave)
+                chassis_existente = normalizar_chave_planilha(r[5] if len(r) > 5 else "")
+                if chassis_existente:
+                    chaves_cadastradas.add(f"CHASSIS:{chassis_existente}")
+                else:
+                    chave_legada = "_".join(
+                        normalizar_chave_planilha(valor)
+                        for valor in (r[1], r[2], r[3], r[4])
+                    )
+                    chaves_cadastradas.add(f"REGISTRO:{chave_legada}")
 
         # ============================================================
         # MAPA DE VENDEDORES
@@ -1154,7 +1180,7 @@ def importar_relatorios_drive_vendas():
 
         def identificar_vendedor(nome_bruto):
             if not nome_bruto:
-                return None
+                return ""
             n_limpo = str(nome_bruto).strip().upper()
 
             if n_limpo in mapa_usuarios:
@@ -1169,7 +1195,7 @@ def importar_relatorios_drive_vendas():
                     if all(parte in n_limpo for parte in partes_chave):
                         return real
 
-            return None
+            return str(nome_bruto).strip()
 
         # ============================================================
         # MAPA DE MODELOS
@@ -1223,117 +1249,158 @@ def importar_relatorios_drive_vendas():
         import pandas as pd
 
         importados_count = 0
-        novas_linhas_lote = []
+        arquivos_concluidos = 0
+        erros_importacao = []
 
         # ============================================================
         # PROCESSA OS RELATÓRIOS DO DRIVE
         # ============================================================
-        for f in files:
-            file_name = f['name']
-            file_id = f['id']
+        for arquivo in arquivos_planilha:
+            file_name = arquivo['name']
+            file_id = arquivo['id']
+            file_mime = arquivo.get("mimeType", "")
 
             try:
-                request_file = service.files().get_media(fileId=file_id)
-                fh = io.BytesIO(request_file.execute())
+                if file_mime == "application/vnd.google-apps.spreadsheet":
+                    conteudo_arquivo = service.files().export_media(
+                        fileId=file_id,
+                        mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    ).execute()
+                else:
+                    conteudo_arquivo = service.files().get_media(
+                        fileId=file_id,
+                        supportsAllDrives=True,
+                    ).execute()
+                fh = io.BytesIO(conteudo_arquivo)
             except Exception as ex_download:
                 print(f"Erro ao baixar arquivo {file_name}: {ex_download}")
+                erros_importacao.append(f"{file_name}: falha no download")
                 continue
 
             try:
                 fh.seek(0)
-                df_rel = pd.read_excel(fh, engine='xlrd')
-            except Exception:
-                try:
-                    fh.seek(0)
-                    df_rel = pd.read_excel(fh)
-                except Exception as ex_excel:
-                    print(f"Erro ao ler arquivo excel {file_name}: {ex_excel}")
+                engine_excel = "xlrd" if os.path.splitext(file_name)[1].lower() == ".xls" else None
+                df_rel = pd.read_excel(fh, engine=engine_excel)
+            except Exception as ex_excel:
+                print(f"Erro ao ler arquivo excel {file_name}: {ex_excel}")
+                erros_importacao.append(f"{file_name}: formato Excel inválido")
+                continue
+
+            if df_rel is None or df_rel.empty:
+                erros_importacao.append(f"{file_name}: relatório sem registros")
+                continue
+
+            colunas_relatorio = {
+                normalizar_chave_planilha(coluna): coluna
+                for coluna in df_rel.columns
+            }
+
+            def obter_valor_relatorio(linha, *nomes_coluna):
+                for nome_coluna in nomes_coluna:
+                    coluna = colunas_relatorio.get(normalizar_chave_planilha(nome_coluna))
+                    if coluna is None:
+                        continue
+                    valor = linha.get(coluna)
+                    if pd.isna(valor) or str(valor).strip().lower() in {"", "nan", "none"}:
+                        continue
+                    return valor
+                return None
+
+            linhas_arquivo = []
+            chaves_arquivo = set()
+            registros_invalidos = 0
+            duplicados = 0
+
+            for _, row in df_rel.iterrows():
+                cliente_bruto = obter_valor_relatorio(row, "CLIENTE")
+                modelo_bruto = obter_valor_relatorio(row, "MODELO", "MODELO NA MARCA")
+                raw_data = obter_valor_relatorio(row, "DATA", "DATA DA VENDA")
+                if cliente_bruto is None and modelo_bruto is None and raw_data is None:
+                    continue
+                if cliente_bruto is None or modelo_bruto is None or raw_data is None:
+                    registros_invalidos += 1
                     continue
 
-            if df_rel is not None and not df_rel.empty:
-                df_rel.columns = [str(c).strip().upper() for c in df_rel.columns]
+                data_convertida = pd.to_datetime(raw_data, errors="coerce", dayfirst=True)
+                if pd.isna(data_convertida):
+                    registros_invalidos += 1
+                    continue
+                data_venda = data_convertida.strftime("%d/%m/%Y")
 
-                for i, row in df_rel.iterrows():
-                    cliente = str(row.get('CLIENTE', '')).strip()
-                    if not cliente or cliente.lower() == 'nan':
-                        continue
+                cliente = str(cliente_bruto).strip()
+                vendedor_bruto = obter_valor_relatorio(row, "VENDEDOR")
+                vendedor = identificar_vendedor(vendedor_bruto) if vendedor_bruto is not None else ""
+                modelo = identificar_modelo(modelo_bruto)
+                chassis_bruto = obter_valor_relatorio(row, "CHASSIS", "CHASSI")
+                chassis = str(chassis_bruto).strip() if chassis_bruto is not None else ""
 
-                    vendedor_bruto = row.get('VENDEDOR', '')
-                    vendedor_encontrado = identificar_vendedor(vendedor_bruto)
+                if chassis:
+                    chave_unica = f"CHASSIS:{normalizar_chave_planilha(chassis)}"
+                else:
+                    chave_unica = "REGISTRO:" + "_".join(
+                        normalizar_chave_planilha(valor)
+                        for valor in (data_venda, vendedor, cliente, modelo)
+                    )
 
-                    if not vendedor_encontrado:
-                        continue
+                if chave_unica in chaves_cadastradas or chave_unica in chaves_arquivo:
+                    duplicados += 1
+                    continue
 
-                    modelo_bruto = row.get('MODELO', '')
-                    modelo_encontrado = identificar_modelo(modelo_bruto)
+                chaves_arquivo.add(chave_unica)
+                linhas_arquivo.append([
+                    "Frio",
+                    data_venda,
+                    vendedor,
+                    cliente,
+                    modelo,
+                    chassis,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ])
 
-                    # CHASSIS é o nome principal. CHASSI também é aceito
-                    # para não perder o valor caso o relatório use esse cabeçalho.
-                    chassis_bruto = row.get('CHASSIS', '')
-                    if not chassis_bruto or str(chassis_bruto).strip().lower() == 'nan':
-                        chassis_bruto = row.get('CHASSI', '')
+            if registros_invalidos:
+                erros_importacao.append(
+                    f"{file_name}: {registros_invalidos} linha(s) sem cliente, modelo ou data válida"
+                )
+                continue
 
-                    if not chassis_bruto or str(chassis_bruto).strip().lower() == 'nan':
-                        chassis_bruto = ""
-                    else:
-                        chassis_bruto = str(chassis_bruto).strip()
-
-                    raw_data = row.get('DATA', datetime.now().strftime('%d/%m/%Y'))
-
-                    if hasattr(raw_data, 'strftime'):
-                        data_venda = raw_data.strftime('%d/%m/%Y')
-                    else:
-                        d_str = str(raw_data).split()[0]
-                        try:
-                            from datetime import datetime as dt
-                            d_obj = dt.strptime(d_str, '%Y-%m-%d')
-                            data_venda = d_obj.strftime('%d/%m/%Y')
-                        except Exception:
-                            data_venda = datetime.now().strftime('%d/%m/%Y')
-
-                    # Chave única continua baseada nos campos originais,
-                    # sem alterar a regra de duplicidade existente.
-                    chave_unica = f"{data_venda}_{vendedor_encontrado}_{cliente}_{modelo_encontrado}".upper()
-
-                    if chave_unica in chaves_cadastradas:
-                        continue
-
-                    chaves_cadastradas.add(chave_unica)
-
-                    # Mantém TEMPERATURA = Frio e acrescenta CHASSIS
-                    # na posição correta da aba Negocios_PM.
-                    novas_linhas_lote.append([
-                        "Frio",
-                        data_venda,
-                        vendedor_encontrado,
-                        cliente,
-                        modelo_encontrado,
-                        chassis_bruto,
-                        "",
-                        "",
-                        "",
-                        "",
-                        ""
-                    ])
-
-                    importados_count += 1
-
-            # Renomeia imediatamente o arquivo no Drive para '[IMPORTADO]'
-            # para manter o comportamento original do sistema.
             try:
-                novo_nome = f"[IMPORTADO] {file_name}"
-                service.files().update(fileId=file_id, body={'name': novo_nome}).execute()
+                if linhas_arquivo:
+                    aba_negocios.append_rows(linhas_arquivo)
+                    chaves_cadastradas.update(chaves_arquivo)
+                    invalidar_cache_ab_as("Negocios_PM")
+                    importados_count += len(linhas_arquivo)
+            except Exception as ex_gravacao:
+                print(f"Erro ao gravar negócios do arquivo {file_name}: {ex_gravacao}")
+                erros_importacao.append(f"{file_name}: falha ao gravar na aba Negocios_PM")
+                continue
+
+            try:
+                novo_nome = (
+                    file_name
+                    if file_name.upper().startswith("[IMPORTADO]")
+                    else f"[IMPORTADO] {file_name}"
+                )
+                service.files().update(
+                    fileId=file_id,
+                    body={"name": novo_nome},
+                    supportsAllDrives=True,
+                ).execute()
+                arquivos_concluidos += 1
             except Exception as ex_ren:
                 print(f"Erro ao renomear arquivo no Drive: {ex_ren}")
+                erros_importacao.append(f"{file_name}: registros gravados, mas não foi possível renomear")
 
-        # ============================================================
-        # GRAVA OS REGISTROS NO GOOGLE SHEETS
-        # ============================================================
-        if novas_linhas_lote:
-            aba_negocios.append_rows(novas_linhas_lote)
-            invalidar_cache_ab_as("Negocios_PM")
-
-        return f"Sincronização concluída! {importados_count} novos registros importados."
+        resumo = (
+            f"Sincronização concluída! {importados_count} novos registros importados "
+            f"em {arquivos_concluidos} arquivo(s)."
+        )
+        if erros_importacao:
+            resumo += " Pendências: " + "; ".join(erros_importacao)
+        return resumo
 
     except Exception as e:
         import traceback
@@ -2709,7 +2776,7 @@ TEMPLATE_HTML = r"""
                 {% endif %}
                 {% if session.get('perm_negocios') %}
                 <li class="drawer-item {% if modulo_ativo == 'negocios' %}active{% endif %}">
-                    <a href="/modulo/negocios" onclick="closeDrawer()"><span class="drawer-icon">🤝</span> Negócios em Andamento</a>
+                    <a href="/modulo/negocios?sincronizar=1" onclick="closeDrawer()"><span class="drawer-icon">🤝</span> Negócios em Andamento</a>
                 </li>
                 {% endif %}
                 {% if session.get('perm_visitas') %}
@@ -6460,10 +6527,15 @@ def acessar_modulo(nome_modulo):
 
     elif nome_modulo == "negocios":
         try:
-            # Sincroniza o Drive apenas se entrou na página direto (sem filtros ativos na URL)
-            if not request.args:
+            # A sincronização só é disparada pelo link do menu. Redirecionar
+            # remove o sinalizador para não repetir a importação ao atualizar.
+            if request.method == "GET" and request.args.get("sincronizar") == "1":
                 msg_sync = importar_relatorios_drive_vendas()
                 print(msg_sync)
+                return redirect(url_for("acessar_modulo", nome_modulo="negocios"))
+
+            perfil_negocios = str(session.get("perfil", "")).strip().upper()
+            is_gestao_negocios = perfil_negocios in {"ADM", "DIRETOR", "GERENTE"}
 
             planilha = conectar_google_sheets()
 
@@ -6715,6 +6787,8 @@ def acessar_modulo(nome_modulo):
                         continue
 
                     if temp_lower == "fechado":
+                        continue
+                    if temp_lower == "perdida" and not is_gestao_negocios:
                         continue
 
                     kpis["total"] += 1

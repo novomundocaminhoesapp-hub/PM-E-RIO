@@ -1585,7 +1585,7 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
         for plano, indice_plano in configuracoes:
             for unidade, indice_valor in (("KM", indice_plano), ("HORA", indice_plano + 3)):
                 coluna_valor = encontrar_coluna_mensal(chaves, indice_valor)
-                coluna_intervalo = encontrar_coluna_intervalo(chaves, unidade, indice_plano)
+                coluna_intervalo = encontrar_coluna_intervalo(chaves, unidade, 0)
                 if not coluna_valor:
                     continue
 

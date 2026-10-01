@@ -330,7 +330,8 @@ TEMPO_CACHE_DRIVE_SEGS = 600
 # regras. Isso evita que cada parte do sistema faça um cálculo diferente.
 COMISSAO_APM_PM = 250.0
 COMISSAO_APM_RIO = 150.0
-COMISSAO_VENDEDOR_RIO = 200.0
+COMISSAO_VENDEDOR_PM = 200.0
+COMISSAO_VENDEDOR_RIO = 150.0
 
 
 def normalizar_texto_comissao(valor):
@@ -676,34 +677,12 @@ def detectar_produtos_comissao(produto, modelo, registro=None):
     return is_pm, is_rio
 
 
-def calcular_comissao_vendedor_pm(modelo, mapa_modelo_familia):
-    """Regra vigente do vendedor para Plano de Manutenção."""
-    mod_lower = normalizar_texto_comissao(modelo)
-    info_modelo_texto = mapa_modelo_familia.get(mod_lower, "")
-    if not info_modelo_texto:
-        for k_mod, v_mod in mapa_modelo_familia.items():
-            k_norm = normalizar_texto_comissao(k_mod)
-            if k_norm and (k_norm in mod_lower or mod_lower in k_norm):
-                info_modelo_texto = normalizar_texto_comissao(v_mod)
-                break
-
-    texto_analise = f"{mod_lower} {normalizar_texto_comissao(info_modelo_texto)}"
-
-    if "delivery" in texto_analise:
-        return 200.0
-    if "constellation" in texto_analise:
-        return 300.0
-    if any(termo in texto_analise for termo in ("meteor", "cavalo", "420", "530", "460")):
-        return 500.0
-    return 300.0
-
-
-def calcular_comissoes_venda(produto, modelo, quantidade, mapa_modelo_familia, registro=None):
+def calcular_comissoes_venda(produto, modelo, quantidade, registro=None):
     """Calcula APM e vendedor para uma venda, em um único ponto do sistema."""
     qtd = parse_quantidade_comissao(quantidade)
     is_pm, is_rio = detectar_produtos_comissao(produto, modelo, registro)
 
-    vendedor_pm_unit = calcular_comissao_vendedor_pm(modelo, mapa_modelo_familia) if is_pm else 0.0
+    vendedor_pm_unit = COMISSAO_VENDEDOR_PM if is_pm else 0.0
     vendedor_rio_unit = COMISSAO_VENDEDOR_RIO if is_rio else 0.0
 
     return {
@@ -3999,7 +3978,7 @@ def acessar_modulo(nome_modulo):
             )
             comissao_apm_pm = qtd_pm * COMISSAO_APM_PM
             comissao_apm_rio = qtd_rio * COMISSAO_APM_RIO
-            comissao_vendedor_pm = qtd_pm * 150.0
+            comissao_vendedor_pm = qtd_pm * COMISSAO_VENDEDOR_PM
             comissao_vendedor_rio = qtd_rio * COMISSAO_VENDEDOR_RIO
             comissao_apm_total = comissao_apm_pm + comissao_apm_rio
             comissao_vendedor_total = comissao_vendedor_pm + comissao_vendedor_rio
@@ -5627,7 +5606,6 @@ def acessar_modulo(nome_modulo):
                     produto=prod,
                     modelo=mod,
                     quantidade=qtd_str,
-                    mapa_modelo_familia=mapa_modelo_familia,
                     registro=reg,
                 )
                 qtd_num = calculo["qtd"]
@@ -5747,11 +5725,11 @@ def acessar_modulo(nome_modulo):
                         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px; margin-bottom: 8px;">
                             <div style="font-weight: 700; color: #002244; font-size: 13px; margin-bottom: 4px;">Consultor(a): {v_nome}</div>
                             <div style="font-size: 12px; color: #4a5568; display: flex; justify-content: space-between;">
-                                <span>Planos de Manutenção ({d_v['pm_qtd']} un.):</span>
+                                <span>Planos de Manutenção ({d_v['pm_qtd']} un. × R$ {formata_br(COMISSAO_VENDEDOR_PM)}):</span>
                                 <b>R$ {formata_br(d_v['pm_total'])}</b>
                             </div>
                             <div style="font-size: 12px; color: #4a5568; display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                <span>Telemetria RIO ({d_v['rio_qtd']} un. × R$ {COMISSAO_VENDEDOR_RIO:,.2f}):</span>
+                                <span>Telemetria RIO ({d_v['rio_qtd']} un. × R$ {formata_br(COMISSAO_VENDEDOR_RIO)}):</span>
                                 <b>R$ {formata_br(d_v['rio_total'])}</b>
                             </div>
                             <div style="font-size: 13px; color: #2f855a; font-weight: 700; border-top: 1px dashed #cbd5e0; padding-top: 4px; display: flex; justify-content: space-between;">
@@ -5783,11 +5761,11 @@ def acessar_modulo(nome_modulo):
                 <h3 style="font-size: 15px; color: #002244; margin-bottom: 12px; border-bottom: 2px solid #cbd5e0; padding-bottom: 6px;">🎯 Resumo da Sua Comissão (APM - Apoio ao Plano de Manutenção)</h3>
                 <div style="font-weight: 700; color: #002244; font-size: 13px; margin-bottom: 8px;">Logado como: {nome_usuario_logado} (Vendedor APM)</div>
                 <div style="font-size: 13px; color: #4a5568; display: flex; justify-content: space-between; margin-bottom: 4px;">
-                    <span>Planos de Manutenção ({total_qtd_pm_geral} un. × R$ 250,00):</span>
+                    <span>Planos de Manutenção ({total_qtd_pm_geral} un. × R$ {formata_br(COMISSAO_APM_PM)}):</span>
                     <b>R$ {formata_br(comissao_minha_pm)}</b>
                 </div>
                 <div style="font-size: 13px; color: #4a5568; display: flex; justify-content: space-between; margin-bottom: 8px;">
-                    <span>Telemetria RIO ({total_qtd_rio_geral} un. × R$ 150,00):</span>
+                    <span>Telemetria RIO ({total_qtd_rio_geral} un. × R$ {formata_br(COMISSAO_APM_RIO)}):</span>
                     <b>R$ {formata_br(comissao_minha_rio)}</b>
                 </div>
                 <div style="font-size: 15px; color: #2f855a; font-weight: 700; border-top: 1px dashed #cbd5e0; padding-top: 8px; display: flex; justify-content: space-between;">

@@ -13,6 +13,7 @@ import mimetypes
 from google import genai
 
 from flask import Flask, abort, redirect, render_template_string, request, session, url_for, jsonify, send_file
+from werkzeug.exceptions import HTTPException
 from google.oauth2.service_account import Credentials
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
@@ -557,6 +558,45 @@ def normalizar_chassi(valor):
     return re.sub(r"[^A-Z0-9]", "", texto.upper())
 
 
+def normalizar_identidade_comercial(valor):
+    texto = unicodedata.normalize("NFKD", str(valor or ""))
+    texto = "".join(caractere for caractere in texto if not unicodedata.combining(caractere))
+    return re.sub(r"[^A-Z0-9]", "", texto.upper())
+
+
+def usuario_eh_gestao(perfil):
+    return str(perfil or "").strip().upper() in {"ADM", "DIRETOR", "GERENTE"}
+
+
+def registro_pertence_ao_usuario(registro, nome_usuario):
+    nome_normalizado = normalizar_identidade_comercial(nome_usuario)
+    if not nome_normalizado:
+        return False
+
+    proprietarios = [
+        normalizar_identidade_comercial(valor)
+        for cabecalho, valor in registro.items()
+        if normalizar_chave_planilha(cabecalho) in {"vendedor", "consultor"}
+        and str(valor or "").strip()
+    ]
+    return bool(proprietarios) and all(
+        proprietario == nome_normalizado for proprietario in proprietarios
+    )
+
+
+def registro_planilha_pertence_ao_usuario(aba, numero_linha, nome_usuario):
+    if numero_linha <= 1:
+        return False
+    cabecalhos = aba.row_values(1)
+    valores = aba.row_values(numero_linha)
+    registro = {
+        str(cabecalho).strip(): valores[indice]
+        for indice, cabecalho in enumerate(cabecalhos)
+        if cabecalho and indice < len(valores)
+    }
+    return registro_pertence_ao_usuario(registro, nome_usuario)
+
+
 def garantir_colunas_venda_pm(aba_vendas):
     cabecalhos = aba_vendas.row_values(1)
     if not cabecalhos:
@@ -925,7 +965,7 @@ def carregar_dados_login():
     return dados
 
 
-def obter_registros_com_cache(planilha, nome_aba, ttl=None):
+def obter_registros_com_cache(planilha, nome_aba, ttl=None, falhar_em_erro=False):
     """Lê uma aba com cache independente por aba."""
     global CACHE_PLANILHAS
     agora = time.time()
@@ -944,6 +984,8 @@ def obter_registros_com_cache(planilha, nome_aba, ttl=None):
         except Exception as e:
             duracao_ms = (time.perf_counter() - inicio_leitura) * 1000
             print(f"Erro ao carregar aba {nome_aba} duracao_ms={duracao_ms:.0f}: {e}")
+            if falhar_em_erro:
+                raise
             return []
     return CACHE_PLANILHAS["dados"].get(nome_aba, [])
 
@@ -3094,7 +3136,36 @@ def login():
                     
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
 
-                    return redirect(url_for("acessar_modulo", nome_modulo="dashboard"))
+                    modulos_permitidos_pos_login = [
+                        (modulo, session.get(permissao, False))
+                        for modulo, permissao in (
+                            ("dashboard", "perm_dashboard"),
+                            ("rio", "perm_rio"),
+                            ("pm", "perm_pm"),
+                            ("valores", "perm_valores"),
+                            ("informes", "perm_informes"),
+                            ("fichatecnica", "perm_fichatecnica"),
+                            ("argumentos", "perm_argumentos"),
+                            ("negocios", "perm_negocios"),
+                            ("visitas", "perm_visitas"),
+                            ("vendas", "perm_vendas"),
+                            ("camp_vw_prev", "perm_camp_vw_prev"),
+                            ("traton", "perm_traton"),
+                            ("locacao_vendas", "perm_locacao_vendas"),
+                            ("locacao_negocios", "perm_locacao_negocios"),
+                            ("consorcio_vendas", "perm_consorcio_vendas"),
+                            ("consorcio_negocios", "perm_consorcio_negocios"),
+                        )
+                        if session.get(permissao, False)
+                    ]
+                    if modulos_permitidos_pos_login:
+                        return redirect(url_for(
+                            "acessar_modulo",
+                            nome_modulo=modulos_permitidos_pos_login[0][0],
+                        ))
+
+                    session.clear()
+                    erro = "Login válido, mas nenhum módulo está autorizado para este usuário. Solicite acesso ao administrador."
                 else:
                     tentativas = session.get("tentativas_erro", 0) + 1
                     session["tentativas_erro"] = tentativas
@@ -3285,8 +3356,6 @@ def acessar_modulo(nome_modulo):
                     vendedor_reg = request.form.get("vendedor_reg", "").strip() or session.get("nome", "Usuário")
 
                     if grupo_manutencao in ["Rodoviário", "Misto", "Severo"]:
-                        data_atual = datetime.now().strftime("%d/%m/%Y")
-                        
                         registros_camp_existentes = obter_registros_seguros(aba_campanhas_vw)
                         encontrado_idx = None
                         registro_encontrado = None
@@ -3309,6 +3378,11 @@ def acessar_modulo(nome_modulo):
                                 registro_encontrado = rc
                                 status_existente = str(rc.get("STATUS", "Aguardando Consultor")).strip() or "Aguardando Consultor"
                                 break
+
+                        data_atual = (
+                            str(registro_encontrado.get("DATA", "")).strip()
+                            if registro_encontrado else ""
+                        ) or datetime.now().strftime("%d/%m/%Y")
 
                         if is_adm:
                             status_solicitado = request.form.get("status", "").strip()
@@ -4013,11 +4087,11 @@ def acessar_modulo(nome_modulo):
                     return 1
 
             def carregar_aba(nome):
-                try:
-                    return obter_registros_com_cache(planilha, nome)
-                except Exception as e_aba:
-                    print(f"Dashboard: erro ao carregar {nome}: {e_aba}")
-                    return []
+                return obter_registros_com_cache(
+                    planilha,
+                    nome,
+                    falhar_em_erro=True,
+                )
 
             # Dashboard atual: somente Plano de Manutenção / RIO.
             # Locação e Consórcio permanecem fora desta visão por enquanto.
@@ -4187,18 +4261,30 @@ def acessar_modulo(nome_modulo):
                     qtd = qtd_valor(r.get("QUANTIDADE", 1))
                     cliente = str(r.get("CLIENTE", "")).strip()
                     modelo = str(r.get("MODELO", "")).strip()
+                    chassis = next(
+                        (
+                            str(valor).strip()
+                            for cabecalho, valor in r.items()
+                            if normalizar_chave_planilha(cabecalho) in {"chassis", "chassi"}
+                            and str(valor or "").strip()
+                        ),
+                        "",
+                    )
+                    contrato = obter_numero_contrato(r)
                     
                     chave = (
                         norm(origem), norm(cliente), norm(produto),
                         norm(plano_manutencao), norm(rio_val),
                         norm(modelo), norm(vendedor),
-                        dt.strftime("%Y-%m-%d") if dt else ""
+                        dt.strftime("%Y-%m-%d") if dt else "",
+                        norm(chassis), norm(contrato), qtd,
                     )
                     vendas.append({
                         "origem": origem,
                         "solucao": solucao,
                         "cliente": cliente,
-                        "contrato": obter_numero_contrato(r),
+                        "contrato": contrato,
+                        "chassis": chassis,
                         "produto": produto,
                         "plano": plano_manutencao,
                         "rio": rio_val,
@@ -5107,7 +5193,10 @@ def acessar_modulo(nome_modulo):
                     temp_lower = temp_val.lower()
 
                     # Restrição: Apenas registros do usuário logado E remove fechados e perdidas
-                    if vend_val == usuario_logado and temp_lower not in ["fechado", "perdida"]:
+                    if (
+                        registro_pertence_ao_usuario(item_dict, usuario_logado)
+                        and temp_lower not in ["fechado", "perdida"]
+                    ):
                         registros_visitas.append(item_dict)
                         kpis["total"] += 1
                         if temp_lower in kpis:
@@ -5205,6 +5294,8 @@ def acessar_modulo(nome_modulo):
         nome_aba_planilha = "Vendas_LOC" if nome_modulo == "locacao_vendas" else "Vendas_Consorcio"
         try:
             planilha = conectar_google_sheets()
+            is_gestao_operacional = usuario_eh_gestao(session.get("perfil"))
+            usuario_operacional = str(session.get("nome", "")).strip()
             try:
                 aba_vendas = planilha.worksheet(nome_aba_planilha)
             except gspread.exceptions.WorksheetNotFound:
@@ -5245,6 +5336,11 @@ def acessar_modulo(nome_modulo):
                 clientes_ja_em_vendas = set(str(r.get("CLIENTE", "")).strip().lower() for r in regs_vendas_atuais)
 
                 for rn in regs_neg:
+                    if (
+                        not is_gestao_operacional
+                        and not registro_pertence_ao_usuario(rn, usuario_operacional)
+                    ):
+                        continue
                     temp_n = str(rn.get("TEMPERATURA", "")).strip().lower()
                     if temp_n == "fechado":
                         cli_n = str(rn.get("CLIENTE", "")).strip()
@@ -5266,10 +5362,30 @@ def acessar_modulo(nome_modulo):
 
             if request.method == "POST" and "acao_form" in request.form:
                 acao_form = request.form.get("acao_form", "").strip()
+                if not is_gestao_operacional:
+                    indice_alvo = request.form.get(
+                        "index_linha" if acao_form == "excluir" else "index_edicao",
+                        "",
+                    ).strip()
+                    if acao_form == "excluir" and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_vendas, int(indice_alvo), usuario_operacional
+                        )
+                    ):
+                        abort(403)
+                    if acao_form == "cadastrar" and indice_alvo and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_vendas, int(indice_alvo), usuario_operacional
+                        )
+                    ):
+                        abort(403)
                 if acao_form == "excluir":
                     index_linha = int(request.form.get("index_linha", 0))
                     if index_linha > 1:
                         aba_vendas.delete_rows(index_linha)
+                        invalidar_cache_ab_as(nome_aba_planilha)
                         sucesso_msg = "Registro excluído com sucesso!"
                 elif acao_form == "cadastrar":
                     index_edicao = request.form.get("index_edicao", "").strip()
@@ -5278,7 +5394,10 @@ def acessar_modulo(nome_modulo):
                     data_v = request.form.get("data_venda", "").strip()
                     modelo_v = request.form.get("modelo", "").strip()
                     qtd_v = request.form.get("quantidade", "").strip()
-                    vendedor_v = request.form.get("vendedor", "").strip()
+                    vendedor_v = (
+                        request.form.get("vendedor", "").strip()
+                        if is_gestao_operacional else usuario_operacional
+                    )
                     
                     anexos = ["", "", ""]
                     if index_edicao:
@@ -5312,9 +5431,11 @@ def acessar_modulo(nome_modulo):
                         if index_edicao:
                             idx_int = int(index_edicao)
                             aba_vendas.update(f"A{idx_int}:I{idx_int}", [dados_venda_linha])
+                            invalidar_cache_ab_as(nome_aba_planilha)
                             sucesso_msg = "Registro atualizado com sucesso!"
                         else:
                             aba_vendas.append_row(dados_venda_linha)
+                            invalidar_cache_ab_as(nome_aba_planilha)
                             sucesso_msg = "Registro salvo com sucesso!"
                     elif not cliente_v and not erro_msg:
                         erro_msg = "Informe o cliente."
@@ -5343,6 +5464,12 @@ def acessar_modulo(nome_modulo):
                     for i, val in enumerate(linha_v):
                         if i < len(cab_v) and cab_v[i]:
                             dict_v[cab_v[i]] = val
+
+                    if (
+                        not is_gestao_operacional
+                        and not registro_pertence_ao_usuario(dict_v, usuario_operacional)
+                    ):
+                        continue
 
                     data_venda_val = dict_v.get('DATA DA VENDA', '').strip()
                     match_mes = re.search(r'^\d{1,2}/(\d{1,2})/(?:\d{2}|\d{4})', data_venda_val)
@@ -5539,6 +5666,8 @@ def acessar_modulo(nome_modulo):
                 </div>
             </div>
             """
+        except HTTPException:
+            raise
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar o módulo:</b> {e}</div>'
 
@@ -5548,6 +5677,8 @@ def acessar_modulo(nome_modulo):
 
         try:
             planilha = conectar_google_sheets()
+            is_gestao_operacional = usuario_eh_gestao(session.get("perfil"))
+            usuario_operacional = str(session.get("nome", "")).strip()
             try:
                 aba_negocios = planilha.worksheet(nome_aba_planilha)
             except gspread.exceptions.WorksheetNotFound:
@@ -5559,17 +5690,40 @@ def acessar_modulo(nome_modulo):
 
             if request.method == "POST" and "acao_form" in request.form:
                 acao_form = request.form.get("acao_form", "").strip()
+                if not is_gestao_operacional:
+                    indice_alvo = request.form.get(
+                        "index_linha" if acao_form == "excluir" else "index_edicao",
+                        "",
+                    ).strip()
+                    if acao_form == "excluir" and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_negocios, int(indice_alvo), usuario_operacional
+                        )
+                    ):
+                        abort(403)
+                    if acao_form != "excluir" and indice_alvo and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_negocios, int(indice_alvo), usuario_operacional
+                        )
+                    ):
+                        abort(403)
 
                 if acao_form == "excluir":
                     index_linha = int(request.form.get("index_linha", 0))
                     if index_linha > 1:
                         aba_negocios.delete_rows(index_linha)
+                        invalidar_cache_ab_as(nome_aba_planilha)
                         sucesso_msg = "Registro excluído com sucesso!"
                 else:
                     index_edicao = request.form.get("index_edicao", "").strip()
                     temperatura = request.form.get("temperatura", "").strip()
                     data_neg = request.form.get("data", "").strip()
-                    vendedor_form = request.form.get("vendedor", "").strip()
+                    vendedor_form = (
+                        request.form.get("vendedor", "").strip()
+                        if is_gestao_operacional else usuario_operacional
+                    )
                     cliente = request.form.get("cliente", "").strip()
                     modelo = request.form.get("modelo", "").strip()
                     plano_manutencao = request.form.get("plano_manutencao", "").strip()
@@ -5582,9 +5736,11 @@ def acessar_modulo(nome_modulo):
                         if index_edicao:
                             idx_int = int(index_edicao)
                             aba_negocios.update(f"A{idx_int}:I{idx_int}", [dados_linha])
+                            invalidar_cache_ab_as(nome_aba_planilha)
                             sucesso_msg = "Negócio atualizado com sucesso!"
                         else:
                             aba_negocios.append_row(dados_linha)
+                            invalidar_cache_ab_as(nome_aba_planilha)
                             sucesso_msg = "Negócio cadastrado com sucesso!"
 
                         if temperatura.strip().lower() == "fechado":
@@ -5613,6 +5769,8 @@ def acessar_modulo(nome_modulo):
                     lista_consultores.append(nome_u)
             if not lista_consultores:
                 lista_consultores = [session.get("nome", "Usuário")]
+            if not is_gestao_operacional:
+                lista_consultores = [usuario_operacional] if usuario_operacional else []
 
             aba_modelos = planilha.worksheet("Modelos")
             registros_modelos = obter_registros_seguros(aba_modelos)
@@ -5661,6 +5819,12 @@ def acessar_modulo(nome_modulo):
                     for i, val in enumerate(linha):
                         if i < len(cabecalhos) and cabecalhos[i]:
                             item_dict[cabecalhos[i]] = val
+
+                    if (
+                        not is_gestao_operacional
+                        and not registro_pertence_ao_usuario(item_dict, usuario_operacional)
+                    ):
+                        continue
 
                     temp_val = item_dict.get('TEMPERATURA','')
                     data_val = item_dict.get('DATA','').strip()
@@ -5846,6 +6010,8 @@ def acessar_modulo(nome_modulo):
                 </div>
             </div>
             """
+        except HTTPException:
+            raise
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar o módulo:</b> {e}</div>'
 
@@ -5854,6 +6020,8 @@ def acessar_modulo(nome_modulo):
             # Sincronização automática dos relatórios da pasta Rel_Vendas do Drive
          
             planilha = conectar_google_sheets()
+            is_gestao_vendas = usuario_eh_gestao(session.get("perfil"))
+            usuario_vendas = str(session.get("nome", "")).strip()
             try:
                 aba_vendas = planilha.worksheet("Vendas_PM")
             except gspread.exceptions.WorksheetNotFound:
@@ -5865,7 +6033,8 @@ def acessar_modulo(nome_modulo):
                 ])
 
             garantir_colunas_venda_pm(aba_vendas)
-            migrar_comprovantes_static(aba_vendas)
+            if is_gestao_vendas:
+                migrar_comprovantes_static(aba_vendas)
 
             mapa_vendedor_estado = {}
             try:
@@ -5961,6 +6130,10 @@ def acessar_modulo(nome_modulo):
                     (idx_neg, rn)
                     for idx_neg, rn in enumerate(regs_neg, start=2)
                     if str(rn.get("TEMPERATURA", "")).strip().lower() == "fechado"
+                    and (
+                        is_gestao_vendas
+                        or registro_pertence_ao_usuario(rn, usuario_vendas)
+                    )
                 ]
                 for idx_neg, rn in reversed(negocios_fechados_pendentes):
                     try:
@@ -5984,6 +6157,8 @@ def acessar_modulo(nome_modulo):
                         lista_consultores.append(nome_u)
             if not lista_consultores:
                 lista_consultores = [session.get("nome", "Usuário")]
+            if not is_gestao_vendas:
+                lista_consultores = [usuario_vendas] if usuario_vendas else []
 
             nome_vendedor_logado = str(nome_usuario_logado or "").strip().lower()
             opcoes_modelos = "".join(
@@ -6002,10 +6177,30 @@ def acessar_modulo(nome_modulo):
 
             if request.method == "POST" and "acao_form" in request.form:
                 acao_form = request.form.get("acao_form", "").strip()
+                if not is_gestao_vendas:
+                    indice_alvo = request.form.get(
+                        "index_linha" if acao_form == "excluir" else "index_edicao",
+                        "",
+                    ).strip()
+                    if acao_form == "excluir" and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_vendas, int(indice_alvo), usuario_vendas
+                        )
+                    ):
+                        abort(403)
+                    if acao_form == "cadastrar" and indice_alvo and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_vendas, int(indice_alvo), usuario_vendas
+                        )
+                    ):
+                        abort(403)
                 if acao_form == "excluir":
                     index_linha = int(request.form.get("index_linha", 0))
                     if index_linha > 1:
                         aba_vendas.delete_rows(index_linha)
+                        invalidar_cache_ab_as("Vendas_PM")
                         sucesso_msg = "Registro de venda excluído com sucesso!"
                 elif acao_form == "cadastrar":
                     index_edicao = request.form.get("index_edicao", "").strip()
@@ -6024,7 +6219,10 @@ def acessar_modulo(nome_modulo):
                     modelo_v = request.form.get("modelo", "").strip()
                     chassis_v = request.form.get("chassis", "").strip()
                     qtd_v = request.form.get("quantidade", "").strip()
-                    vendedor_v = request.form.get("vendedor", "").strip()
+                    vendedor_v = (
+                        request.form.get("vendedor", "").strip()
+                        if is_gestao_vendas else usuario_vendas
+                    )
                     placa_venda_existente = ""
                     
                     anexo_1_url = ""
@@ -6084,9 +6282,11 @@ def acessar_modulo(nome_modulo):
                         if index_edicao:
                             idx_int = int(index_edicao)
                             aba_vendas.update(f"A{idx_int}:{ultima_coluna}{idx_int}", [dados_venda_linha])
+                            invalidar_cache_ab_as("Vendas_PM")
                             sucesso_msg = "Venda atualizada com sucesso!"
                         else:
                             aba_vendas.append_row(dados_venda_linha)
+                            invalidar_cache_ab_as("Vendas_PM")
                             sucesso_msg = "Venda registrada com sucesso!"
                     else:
                         erro_msg = "Informe o cliente e ao menos um produto (Plano de Manutenção ou RIO)."
@@ -6096,6 +6296,8 @@ def acessar_modulo(nome_modulo):
             # Captura de Filtros padronizados
             busca_cliente = request.args.get("busca", "").strip().lower()
             vend_selecionado = request.args.get("vend", "todos").strip().lower()
+            if not is_gestao_vendas:
+                vend_selecionado = usuario_vendas.lower()
             ano_selecionado = request.args.get("ano", str(datetime.now().year)).strip()
             periodo_selecionado = request.args.get("periodo", "anointeiro").strip().lower()
 
@@ -6141,6 +6343,12 @@ def acessar_modulo(nome_modulo):
                     for i, val in enumerate(linha_v):
                         if i < len(cab_v) and cab_v[i]:
                             dict_v[cab_v[i]] = val
+
+                    if (
+                        not is_gestao_vendas
+                        and not registro_pertence_ao_usuario(dict_v, usuario_vendas)
+                    ):
+                        continue
 
                     cli_val = str(dict_v.get('CLIENTE', '')).strip().lower()
                     vend_val = str(dict_v.get('VENDEDOR', '')).strip().lower()
@@ -6820,6 +7028,8 @@ def acessar_modulo(nome_modulo):
                 }}
             </script>
             """
+        except HTTPException:
+            raise
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar Vendas:</b> {e}</div>'
 
@@ -6834,7 +7044,8 @@ def acessar_modulo(nome_modulo):
                 return redirect(url_for("acessar_modulo", nome_modulo="negocios"))
 
             perfil_negocios = str(session.get("perfil", "")).strip().upper()
-            is_gestao_negocios = perfil_negocios in {"ADM", "DIRETOR", "GERENTE"}
+            is_gestao_negocios = usuario_eh_gestao(perfil_negocios)
+            usuario_negocios = str(session.get("nome", "")).strip()
 
             planilha = conectar_google_sheets()
 
@@ -6877,6 +7088,8 @@ def acessar_modulo(nome_modulo):
             
             if not lista_consultores:
                 lista_consultores = [session.get("nome", "Usuário")]
+            if not is_gestao_negocios:
+                lista_consultores = [usuario_negocios] if usuario_negocios else []
 
             # 2. Busca dinâmica de Modelos
             lista_modelos = []
@@ -6923,17 +7136,39 @@ def acessar_modulo(nome_modulo):
 
             if request.method == "POST" and "acao_form" in request.form:
                 acao_form = request.form.get("acao_form", "").strip()
-
+                if not is_gestao_negocios:
+                    indice_alvo = request.form.get(
+                        "index_linha" if acao_form == "excluir" else "index_edicao",
+                        "",
+                    ).strip()
+                    if acao_form == "excluir" and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_negocios, int(indice_alvo), usuario_negocios
+                        )
+                    ):
+                        abort(403)
+                    if acao_form != "excluir" and indice_alvo and (
+                        not indice_alvo.isdigit()
+                        or not registro_planilha_pertence_ao_usuario(
+                            aba_negocios, int(indice_alvo), usuario_negocios
+                        )
+                    ):
+                        abort(403)
                 if acao_form == "excluir":
                     index_linha = int(request.form.get("index_linha", 0))
                     if index_linha > 1:
                         aba_negocios.delete_rows(index_linha)
+                        invalidar_cache_ab_as("Negocios_PM")
                         sucesso_msg = "Registro excluído com sucesso!"
                 else:
                     index_edicao = request.form.get("index_edicao", "").strip()
                     temperatura = request.form.get("temperatura", "").strip()
                     data_neg = request.form.get("data", "").strip()
-                    vendedor_form = request.form.get("vendedor", "").strip()
+                    vendedor_form = (
+                        request.form.get("vendedor", "").strip()
+                        if is_gestao_negocios else usuario_negocios
+                    )
                     cliente = request.form.get("cliente", "").strip()
                     modelo = request.form.get("modelo", "").strip()
                     chassis = request.form.get("chassis", "").strip()  # <--- CAPTURA O CHASSIS
@@ -6948,9 +7183,11 @@ def acessar_modulo(nome_modulo):
                         if index_edicao:
                             idx_int = int(index_edicao)
                             aba_negocios.update(f"A{idx_int}:K{idx_int}", [dados_linha])  # <--- ATUALIZADO PARA K
+                            invalidar_cache_ab_as("Negocios_PM")
                             sucesso_msg = "Negócio atualizado com sucesso!"
                         else:
                             aba_negocios.append_row(dados_linha)
+                            invalidar_cache_ab_as("Negocios_PM")
                             sucesso_msg = "Negócio cadastrado com sucesso!"
 
                         if temperatura.lower() == "fechado":
@@ -7017,6 +7254,8 @@ def acessar_modulo(nome_modulo):
             # Captura de Filtros via URL
             busca_cliente = request.args.get("busca", "").strip().lower()
             vend_selecionado = request.args.get("vend", "todos").strip().lower()
+            if not is_gestao_negocios:
+                vend_selecionado = usuario_negocios.lower()
             ano_selecionado = request.args.get("ano", str(datetime.now().year)).strip()
             periodo_selecionado = request.args.get("periodo", "anointeiro").strip().lower()
             temp_selecionada = request.args.get("temp", "todas").strip().lower()
@@ -7092,6 +7331,12 @@ def acessar_modulo(nome_modulo):
                         m_mes = re.search(r'^\d{1,2}/(\d{1,2})/', data_val)
                         mes_item = m_mes.group(1).zfill(2) if m_mes else ""
 
+                    if (
+                        not is_gestao_negocios
+                        and not registro_pertence_ao_usuario(item_dict, usuario_negocios)
+                    ):
+                        continue
+
                     if ano_selecionado and ano_item != ano_selecionado:
                         continue
 
@@ -7113,7 +7358,11 @@ def acessar_modulo(nome_modulo):
 
                     if busca_cliente and busca_cliente not in cli_val:
                         continue
-                    if vend_selecionado != "todos" and vend_val != vend_selecionado:
+                    if (
+                        vend_selecionado != "todos"
+                        and normalizar_identidade_comercial(vend_val)
+                        != normalizar_identidade_comercial(vend_selecionado)
+                    ):
                         continue
                     if temp_selecionada != "todas" and temp_lower != temp_selecionada:
                         continue
@@ -7291,6 +7540,8 @@ def acessar_modulo(nome_modulo):
             </div>
 
             """
+        except HTTPException:
+            raise
         except Exception as e:
             conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px;"><b>Erro ao carregar Negócios:</b> {e}</div>'
     

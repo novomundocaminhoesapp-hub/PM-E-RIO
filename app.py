@@ -321,6 +321,12 @@ TEMPO_CACHE_ABAS = {
 }
 CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
 TEMPO_CACHE_DRIVE_SEGS = 600
+CACHE_ATUALIZACOES_ABAS = {
+    "hashes": {},
+    "eventos": [],
+    "atualizacoes": [],
+    "timestamp": 0,
+}
 
 
 # =====================================================================
@@ -951,6 +957,10 @@ def invalidar_cache_ab_as(*nomes_abas):
 
 def obter_registros_seguros(aba):
     linhas = aba.get_all_values()
+    return registros_de_linhas_planilha(linhas)
+
+
+def registros_de_linhas_planilha(linhas):
     if not linhas or len(linhas) <= 1:
         return []
     cabecalhos = linhas[0]
@@ -969,6 +979,29 @@ def obter_registros_seguros(aba):
         if any(str(v).strip() for v in item_dict.values()):
             dados.append(item_dict)
     return dados
+
+
+def obter_linhas_abas_em_lote(planilha, nomes_abas, worksheets=None):
+    """Lê várias abas com uma única chamada values.batchGet."""
+    abas_disponiveis = worksheets if worksheets is not None else planilha.worksheets()
+    titulos_disponiveis = {aba.title for aba in abas_disponiveis}
+    nomes_existentes = [nome for nome in nomes_abas if nome in titulos_disponiveis]
+    resultado = {nome: [] for nome in nomes_abas}
+    if not nomes_existentes:
+        return resultado
+
+    intervalos = [
+        f"'{nome.replace(chr(39), chr(39) * 2)}'!A:ZZ"
+        for nome in nomes_existentes
+    ]
+    resposta = planilha.values_batch_get(
+        intervalos,
+        params={"valueRenderOption": "FORMATTED_VALUE"},
+    )
+    faixas = resposta.get("valueRanges", [])
+    for nome, faixa in zip(nomes_existentes, faixas):
+        resultado[nome] = faixa.get("values", [])
+    return resultado
 
 
 def obter_conteudo_pastas_drive():
@@ -2579,14 +2612,24 @@ TEMPLATE_HTML = r"""
 
         function carregarNotificacoes() {
             fetch('/api/atualizacoes?limite=12', {cache:'no-store'})
-                .then(function(res) { return res.ok ? res.json() : {atualizacoes:[]}; })
+                .then(function(res) {
+                    if (!res.ok) {
+                        throw new Error('Não foi possível consultar atualizações (' + res.status + ').');
+                    }
+                    return res.json();
+                })
                 .then(function(data) {
                     var lista = data.atualizacoes || [];
                     window.__notificacoes = lista;
                     atualizarBadgeNotificacoes(lista);
                     renderizarNotificacoes(lista);
                 })
-                .catch(function() {});
+                .catch(function() {
+                    var painel = document.getElementById('painelNotificacoes');
+                    if (painel) {
+                        painel.innerHTML = '<div class="notificacao-vazia">Atualizações temporariamente indisponíveis. Tente novamente em alguns minutos.</div>';
+                    }
+                });
         }
 
         function toggleNotificacoes() {
@@ -3153,11 +3196,15 @@ def acessar_modulo(nome_modulo):
             planilha = conectar_google_sheets()
 
             # Garante que a aba Campanhas_VW existe
-            try:
-                aba_campanhas_vw = planilha.worksheet("Campanhas_VW")
-            except gspread.exceptions.WorksheetNotFound:
+            abas_planilha = planilha.worksheets()
+            aba_campanhas_vw = next(
+                (aba for aba in abas_planilha if aba.title == "Campanhas_VW"),
+                None,
+            )
+            if aba_campanhas_vw is None:
                 aba_campanhas_vw = planilha.add_worksheet(title="Campanhas_VW", rows=1000, cols=10)
                 aba_campanhas_vw.append_row(["DATA", "CIRCULAR", "CONSULTOR", "EMPRESA", "CHASSIS", "MODELOS", "G MANUTENÇÃO", "PLANO DE MANUTENÇÃO", "RIO", "STATUS"])
+                abas_planilha.append(aba_campanhas_vw)
 
             sucesso_msg = None
             erro_msg = None
@@ -3165,6 +3212,11 @@ def acessar_modulo(nome_modulo):
             perfil_usuario = str(session.get("perfil", "")).strip().upper()
             usuario_logado = str(session.get("nome", "")).strip().upper()
             is_adm = perfil_usuario in ["ADM", "DIRETOR", "GERENTE"]
+
+            def chave_campanha(valor):
+                valor = unicodedata.normalize("NFKD", str(valor or ""))
+                valor = "".join(c for c in valor if not unicodedata.combining(c))
+                return re.sub(r"[^A-Z0-9]+", "", valor.upper())
 
             # --------------------------------------------------------
             # Tratamento de POST (Salvamento do Grupo)
@@ -3186,57 +3238,83 @@ def acessar_modulo(nome_modulo):
                         
                         registros_camp_existentes = obter_registros_seguros(aba_campanhas_vw)
                         encontrado_idx = None
+                        registro_encontrado = None
                         status_existente = "Aguardando Consultor"
+                        vendedor_norm = chave_campanha(vendedor_reg)
+                        cliente_norm = chave_campanha(cliente_alvo)
 
                         for idx_c, rc in enumerate(registros_camp_existentes, start=2):
-                            ch_plan = str(rc.get("CHASSIS", "")).strip().upper()
-                            cli_plan = str(rc.get("EMPRESA", "")).strip().upper()
-                            if chassis_alvo and ch_plan == chassis_alvo.upper():
+                            ch_plan = chave_campanha(rc.get("CHASSIS", ""))
+                            cli_plan = chave_campanha(rc.get("EMPRESA", ""))
+                            vendedor_plan = chave_campanha(rc.get("CONSULTOR", ""))
+                            chassis_norm = chave_campanha(chassis_alvo)
+                            if chassis_norm and ch_plan == chassis_norm:
                                 encontrado_idx = idx_c
+                                registro_encontrado = rc
                                 status_existente = str(rc.get("STATUS", "Aguardando Consultor")).strip() or "Aguardando Consultor"
                                 break
-                            elif not chassis_alvo and cli_plan == cliente_alvo.upper():
+                            elif not chassis_norm and cli_plan == cliente_norm and vendedor_plan == vendedor_norm:
                                 encontrado_idx = idx_c
+                                registro_encontrado = rc
                                 status_existente = str(rc.get("STATUS", "Aguardando Consultor")).strip() or "Aguardando Consultor"
                                 break
 
-                        status_alvo = request.form.get("status", "").strip() if is_adm else (status_existente if status_existente != "Aguardando Consultor" else "Pendente")
-
-                        nova_linha_campanha = [data_atual, circular_alvo, vendedor_reg, cliente_alvo, chassis_alvo, modelo_alvo, grupo_manutencao, plano_manutencao_salvar, rio_salvar, status_alvo]
-
-                        if encontrado_idx:
-                            aba_campanhas_vw.update(f"A{encontrado_idx}:J{encontrado_idx}", [nova_linha_campanha])
+                        if is_adm:
+                            status_solicitado = request.form.get("status", "").strip()
+                            status_alvo = (
+                                status_solicitado
+                                if status_solicitado in {"Ativo", "Pendente", "Aguardando Consultor"}
+                                else status_existente
+                            )
+                            nova_linha_campanha = [
+                                data_atual, circular_alvo, vendedor_reg, cliente_alvo,
+                                chassis_alvo, modelo_alvo, grupo_manutencao,
+                                plano_manutencao_salvar, rio_salvar, status_alvo,
+                            ]
+                            if encontrado_idx:
+                                aba_campanhas_vw.update(f"A{encontrado_idx}:J{encontrado_idx}", [nova_linha_campanha])
+                            else:
+                                aba_campanhas_vw.append_row(nova_linha_campanha)
+                            sucesso_msg = "Grupo de manutenção e dados da campanha salvos."
                         else:
-                            aba_campanhas_vw.append_row(nova_linha_campanha)
+                            consultor_registro = chave_campanha(
+                                registro_encontrado.get("CONSULTOR", "")
+                            ) if registro_encontrado else ""
+                            if not encontrado_idx or consultor_registro != chave_campanha(usuario_logado):
+                                erro_msg = "Você só pode informar o grupo de manutenção dos seus próprios negócios da campanha."
+                            else:
+                                atualizacoes_consultor = [
+                                    {"range": f"G{encontrado_idx}", "values": [[grupo_manutencao]]}
+                                ]
+                                if chave_campanha(status_existente) in {
+                                    "AGUARDANDOCONSULTOR", "AGUARDANDO"
+                                }:
+                                    atualizacoes_consultor.append({
+                                        "range": f"J{encontrado_idx}",
+                                        "values": [["Pendente"]],
+                                    })
+                                aba_campanhas_vw.batch_update(atualizacoes_consultor)
+                                sucesso_msg = (
+                                    "Grupo de manutenção enviado para análise da gestão. "
+                                    "Os demais dados e o status permanecem sob responsabilidade da gestão."
+                                )
 
                         if CACHE_CAMPANHAS is not None:
                             CACHE_CAMPANHAS.clear()
-
-                        sucesso_msg = "Grupo de manutenção salvo e enviado com sucesso!"
                     else:
                         erro_msg = "Selecione um Grupo de Manutenção válido."
 
-            # --------------------------------------------------------
-            # Leitura com Cache Otimizado
-            # --------------------------------------------------------
-            cache_key = "dados_campanha_v2"
-            if cache_key in CACHE_CAMPANHAS:
-                regras, registros_usuarios, linhas_brutas_negocios, _ = CACHE_CAMPANHAS[cache_key]
-            else:
-                aba_regras = planilha.worksheet("Regras_Camp_VW")
-                regras = obter_registros_seguros(aba_regras)
-
-                aba_usuarios = planilha.worksheet("Usuarios")
-                registros_usuarios = obter_registros_seguros(aba_usuarios)
-
-                aba_negocios = planilha.worksheet("Negocios_PM")
-                linhas_brutas_negocios = aba_negocios.get_all_values()
-
-                CACHE_CAMPANHAS[cache_key] = (regras, registros_usuarios, linhas_brutas_negocios, [])
-
-            # Campanhas_VW é editada diretamente na planilha com frequência.
-            # Não usamos cache para STATUS/GRUPO: sempre lemos a versão atual.
-            registros_salvos_camp = obter_registros_seguros(aba_campanhas_vw)
+            # Recarrega regras e negócios para considerar alterações recentes
+            # antes de sincronizar os candidatos para Campanhas_VW.
+            dados_campanha = obter_linhas_abas_em_lote(
+                planilha,
+                ["Regras_Camp_VW", "Usuarios", "Negocios_PM", "Campanhas_VW"],
+                worksheets=abas_planilha,
+            )
+            regras = registros_de_linhas_planilha(dados_campanha["Regras_Camp_VW"])
+            registros_usuarios = registros_de_linhas_planilha(dados_campanha["Usuarios"])
+            linhas_brutas_negocios = dados_campanha["Negocios_PM"]
+            registros_salvos_camp = registros_de_linhas_planilha(dados_campanha["Campanhas_VW"])
 
             # --------------------------------------------------------
             # Carrega consultores com perfil CONSULTOR PE ou AL
@@ -3265,28 +3343,63 @@ def acessar_modulo(nome_modulo):
                     return re.sub(r'\D', '', match.group(1))
                 return ""
 
+            meses_campanha = {
+                "JANEIRO": "01", "FEVEREIRO": "02", "MARCO": "03",
+                "ABRIL": "04", "MAIO": "05", "JUNHO": "06",
+                "JULHO": "07", "AGOSTO": "08", "SETEMBRO": "09",
+                "OUTUBRO": "10", "NOVEMBRO": "11", "DEZEMBRO": "12",
+            }
+
+            def normalizar_mes_campanha(valor):
+                texto = normalizar_chave_manutencao(valor)
+                if texto.isdigit():
+                    return texto.zfill(2) if 1 <= int(texto) <= 12 else ""
+                return meses_campanha.get(texto, "")
+
             mapa_regras_base = {}
             for regra in regras:
                 m_regra = str(regra.get("MODELOS", "") or regra.get("MODELO", "")).strip()
                 m_base = extrair_modelo_base(m_regra)
-                if m_base:
-                    if m_base not in mapa_regras_base:
-                        mapa_regras_base[m_base] = []
-                    mapa_regras_base[m_base].append(regra)
+                mes_regra = normalizar_mes_campanha(
+                    regra.get("MÊS", "") or regra.get("MES", "")
+                )
+                if m_base and mes_regra:
+                    mapa_regras_base.setdefault((mes_regra, m_base), []).append(regra)
 
             def encontrar_regra_cruzada(modelo_negocio, mes_numero=""):
                 m_base_negocio = extrair_modelo_base(modelo_negocio)
-                if not m_base_negocio or m_base_negocio not in mapa_regras_base:
+                mes_regra = normalizar_mes_campanha(mes_numero)
+                if not m_base_negocio or not mes_regra:
                     return None
+                candidatas = mapa_regras_base.get((mes_regra, m_base_negocio), [])
+                return candidatas[0] if candidatas else None
 
-                candidatas = mapa_regras_base[m_base_negocio]
-                return candidatas[0]
+            def data_negocio_campanha(valor):
+                texto = str(valor or "").strip()
+                for formato in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
+                    try:
+                        return datetime.strptime(texto, formato)
+                    except ValueError:
+                        continue
+                return None
 
             # --------------------------------------------------------
             # Negócios: cruzando estritamente com os modelos da Regra
             # --------------------------------------------------------
             registros_campanha = []
             anos_encontrados = set([ano_atual_str])
+            chaves_campanhas_existentes = set()
+            for registro_campanha in registros_salvos_camp:
+                chassis_existente = chave_campanha(registro_campanha.get("CHASSIS", ""))
+                if chassis_existente:
+                    chaves_campanhas_existentes.add(f"CH:{chassis_existente}")
+                else:
+                    chave_sem_chassis = "|".join(chave_campanha(registro_campanha.get(campo, "")) for campo in (
+                        "DATA", "CONSULTOR", "EMPRESA", "MODELOS", "CIRCULAR"
+                    ))
+                    if chave_sem_chassis.strip("|"):
+                        chaves_campanhas_existentes.add(f"REG:{chave_sem_chassis}")
+            novas_linhas_campanha = []
 
             if len(linhas_brutas_negocios) > 1:
                 cabecalhos = [str(c).upper().strip() for c in linhas_brutas_negocios[0]]
@@ -3306,27 +3419,43 @@ def acessar_modulo(nome_modulo):
                     if temp_val in ["fechado", "perdida"]:
                         continue
 
-                    ano_item = ""
-                    mes_item = ""
-                    for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
-                        try:
-                            dt_obj = datetime.strptime(data_val.split()[0], fmt.split()[0])
-                            ano_item = str(dt_obj.year)
-                            mes_item = f"{dt_obj.month:02d}"
-                            break
-                        except ValueError:
-                            pass
-
-                    if not ano_item:
-                        m_ano = re.search(r'/(\d{4}|\d{2})$', data_val)
-                        if m_ano:
-                            a = m_ano.group(1)
-                            ano_item = "20" + a if len(a) == 2 else a
-                        m_mes = re.search(r'^\d{1,2}/(\d{1,2})/', data_val)
-                        mes_item = m_mes.group(1).zfill(2) if m_mes else ""
+                    data_obj = data_negocio_campanha(data_val)
+                    ano_item = str(data_obj.year) if data_obj else ""
+                    mes_item = f"{data_obj.month:02d}" if data_obj else ""
 
                     if ano_item:
                         anos_encontrados.add(ano_item)
+
+                    regra_associada = encontrar_regra_cruzada(modelo_val, mes_item)
+                    if regra_associada:
+                        cliente_val = str(item_dict.get("CLIENTE", "")).strip()
+                        chassis_val = str(item_dict.get("CHASSIS", "") or item_dict.get("CHASSI", "")).strip()
+                        regra_circular = str(regra_associada.get("CIRCULAR", "")).strip()
+                        data_campanha = data_obj.strftime("%d/%m/%Y") if data_obj else data_val
+                        chave_chassis = chave_campanha(chassis_val)
+                        chave_sem_chassis = "|".join(chave_campanha(valor) for valor in (
+                            data_campanha, vend_val, cliente_val, modelo_val, regra_circular
+                        ))
+                        chave_nova = f"CH:{chave_chassis}" if chave_chassis else f"REG:{chave_sem_chassis}"
+
+                        if chave_nova not in chaves_campanhas_existentes:
+                            regra_prev = str(regra_associada.get("REGRA PREV", "")).strip()
+                            regra_prev_max = str(regra_associada.get("REGRA PREV / MAX", "")).strip()
+                            regra_rio = str(regra_associada.get("REGRA RIO", "")).strip()
+                            plano_campanha = f"{regra_prev} / {regra_prev_max}".strip(" /")
+                            novas_linhas_campanha.append([
+                                data_campanha,
+                                regra_circular,
+                                vend_val,
+                                cliente_val,
+                                chassis_val,
+                                modelo_val,
+                                "",
+                                plano_campanha,
+                                regra_rio,
+                                "Aguardando Consultor",
+                            ])
+                            chaves_campanhas_existentes.add(chave_nova)
 
                     if ano_selecionado != "todos" and ano_item and ano_item != ano_selecionado:
                         continue
@@ -3338,11 +3467,10 @@ def acessar_modulo(nome_modulo):
                     elif len(periodo_selecionado) == 2 and periodo_selecionado.isdigit() and mes_item != periodo_selecionado:
                         continue
 
-                    regra_associada = encontrar_regra_cruzada(modelo_val, mes_item)
                     if not regra_associada:
                         continue
 
-                    if not is_adm and vend_val.upper() != usuario_logado:
+                    if not is_adm and chave_campanha(vend_val) != chave_campanha(usuario_logado):
                         continue
 
                     if vend_selecionado != "todos" and vend_val.strip().lower() != vend_selecionado:
@@ -3351,16 +3479,25 @@ def acessar_modulo(nome_modulo):
                     item_dict["_regra"] = regra_associada
                     registros_campanha.append(item_dict)
 
+            if novas_linhas_campanha:
+                aba_campanhas_vw.append_rows(
+                    novas_linhas_campanha,
+                    value_input_option="USER_ENTERED",
+                    insert_data_option="INSERT_ROWS",
+                )
+                if CACHE_CAMPANHAS is not None:
+                    CACHE_CAMPANHAS.clear()
+                registros_salvos_camp = obter_registros_seguros(aba_campanhas_vw)
+                sucesso_msg = (
+                    f"{len(novas_linhas_campanha)} negócio(s) elegível(is) "
+                    "copiado(s) para Campanhas_VW."
+                )
+
             # Mapeia registros salvos em Campanhas_VW (KPIs + STATUS DA TABELA).
             # Normaliza CHASSIS/EMPRESA para que pequenas diferenças de espaços,
             # pontuação ou caixa não impeçam o STATUS salvo na planilha de aparecer.
             mapa_dados_salvos = {}
             kpis_status = {"Ativo": 0, "Pendente": 0, "Aguardando Consultor": 0, "Total": 0}
-
-            def chave_campanha(valor):
-                valor = unicodedata.normalize("NFKD", str(valor or ""))
-                valor = "".join(c for c in valor if not unicodedata.combining(c))
-                return re.sub(r"[^A-Z0-9]+", "", valor.upper())
 
             for rc in registros_salvos_camp:
                 ch = str(rc.get("CHASSIS", "")).strip()
@@ -3527,7 +3664,7 @@ def acessar_modulo(nome_modulo):
             linhas_pdf = ""
             for r in registros_salvos_camp:
                 consultor_salvo = str(r.get("CONSULTOR", "")).strip()
-                if not is_adm and consultor_salvo.upper() != usuario_logado:
+                if not is_adm and chave_campanha(consultor_salvo) != chave_campanha(usuario_logado):
                     continue
                 
                 linhas_pdf += f"""
@@ -3680,7 +3817,15 @@ def acessar_modulo(nome_modulo):
 
         except Exception as e:
             traceback.print_exc()
-            conteudo = f'<div style="color:#c53030; background:#fff5f5; padding:15px; border-radius:8px; margin: 15px;"><b>Erro ao carregar Campanha VW PREV:</b> {e}</div>'
+            erro_campanha = str(e)
+            if "429" in erro_campanha or "quota" in erro_campanha.lower():
+                mensagem_campanha = (
+                    "O Google Sheets atingiu o limite temporário de consultas. "
+                    "A leitura da campanha agora usa uma consulta em lote; aguarde alguns minutos e tente novamente."
+                )
+            else:
+                mensagem_campanha = f"Erro ao carregar Campanha VW PREV: {html.escape(erro_campanha)}"
+            conteudo = f'<div style="color:#c53030; background:#fff5f5; padding:15px; border-radius:8px; margin: 15px;">{mensagem_campanha}</div>'
 
     elif nome_modulo == "dashboard":
         try:
@@ -7984,12 +8129,11 @@ def chat_ia():
 
 @app.route("/api/atualizacoes", methods=["GET"])
 def api_atualizacoes():
-    """Retorna somente atualizações do menu Informes e Circulares.
+    """Retorna informes publicados e alterações observadas nas abas dos módulos.
 
     Importante: nunca retorna link de acesso à planilha/Drive. O sino leva
-    diretamente ao menu interno do sistema onde o informe pode ser consultado.
-    O ID inclui um hash do conteúdo para que uma alteração no mesmo informe
-    volte a aparecer como uma nova notificação.
+    diretamente ao menu interno do sistema onde o conteúdo pode ser consultado.
+    Alterações de abas são comparadas com o último estado observado pelo processo.
     """
     if not session.get("logado"):
         return jsonify({"atualizacoes": [], "nao_lidas": 0}), 401
@@ -7999,69 +8143,128 @@ def api_atualizacoes():
     except (ValueError, TypeError):
         limite = 12
 
+    agora = time.time()
+    if (
+        CACHE_ATUALIZACOES_ABAS["timestamp"]
+        and agora - CACHE_ATUALIZACOES_ABAS["timestamp"] < 300
+    ):
+        final_cache = CACHE_ATUALIZACOES_ABAS["atualizacoes"][:limite]
+        return jsonify({"atualizacoes": final_cache, "nao_lidas": len(final_cache)})
+
     atualizacoes = []
+    nomes_modulos_por_aba = {
+        "RIO": [("Telemetria RIO", "rio"), ("Dashboard Executivo", "dashboard")],
+        "PM": [("Plano de Manutenção", "pm"), ("Dashboard Executivo", "dashboard")],
+        "PM_Precos": [("Tabela de Valores", "valores"), ("Dashboard Executivo", "dashboard")],
+        "Informes": [("Informes e Circulares", "informes"), ("Dashboard Executivo", "dashboard")],
+        "Modelos": [("Ficha Técnica", "fichatecnica"), ("Dashboard Executivo", "dashboard")],
+        "Argumentos": [("Argumentos de Venda", "argumentos")],
+        "Negocios_PM": [("Visitas e Acompanhamento", "visitas"), ("Dashboard Executivo", "dashboard")],
+        "Vendas_PM": [("Dashboard Executivo", "dashboard")],
+        "Campanhas_VW": [("Campanha VW PREV", "camp_vw_prev")],
+        "Regras_Camp_VW": [("Campanha VW PREV", "camp_vw_prev")],
+    }
 
     try:
         planilha = conectar_google_sheets()
-        informes = obter_registros_com_cache(planilha, "Informes", ttl=120)
+        dados_abas = obter_linhas_abas_em_lote(planilha, list(nomes_modulos_por_aba))
+        for nome_aba, destinos in nomes_modulos_por_aba.items():
+            registros_aba = registros_de_linhas_planilha(dados_abas[nome_aba])
 
-        for i, item in enumerate(informes):
-            assunto = str(item.get("ASSUNTO", "")).strip()
-            info = str(item.get("INFORMAÇÃO", "") or item.get("INFORMACAO", "")).strip()
-            circular = str(item.get("CIRCULAR", "")).strip()
-            data_atualizacao = str(
-                item.get("DATA", "")
-                or item.get("DATA ATUALIZAÇÃO", "")
-                or item.get("DATA ATUALIZACAO", "")
-                or item.get("MÊS", "")
-                or item.get("MES", "")
-            ).strip()
+            hash_aba = hashlib.sha256(
+                json.dumps(registros_aba, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            hash_anterior = CACHE_ATUALIZACOES_ABAS["hashes"].get(nome_aba)
+            CACHE_ATUALIZACOES_ABAS["hashes"][nome_aba] = hash_aba
 
-            if not assunto and not circular and not info:
+            # A primeira leitura estabelece o estado inicial e não transforma
+            # todo o conteúdo já existente em uma falsa atualização.
+            if hash_anterior is not None and hash_anterior != hash_aba:
+                momento = datetime.now().strftime("%d/%m/%Y %H:%M")
+                id_evento = hashlib.sha256(
+                    f"{nome_aba}|{hash_anterior}|{hash_aba}|{momento}".encode("utf-8")
+                ).hexdigest()[:20]
+                for titulo, modulo in destinos:
+                    CACHE_ATUALIZACOES_ABAS["eventos"].append({
+                        "id": f"aba:{id_evento}:{modulo}",
+                        "tipo": "Atualização",
+                        "titulo": f"{titulo} atualizado",
+                        "descricao": f"Foram detectadas alterações nos dados relacionados a {titulo}.",
+                        "data": momento,
+                        "link": f"/modulo/{modulo}",
+                    })
+                CACHE_ATUALIZACOES_ABAS["eventos"] = CACHE_ATUALIZACOES_ABAS["eventos"][-100:]
+
+            if nome_aba != "Informes":
                 continue
 
-            # Link exclusivamente para o menu interno do aplicativo.
-            if assunto:
-                link_interno = "/modulo/informes?item=" + urllib.parse.quote(assunto)
-            else:
-                link_interno = "/modulo/informes"
+            for item in registros_aba:
+                assunto = str(item.get("ASSUNTO", "")).strip()
+                info = str(item.get("INFORMAÇÃO", "") or item.get("INFORMACAO", "")).strip()
+                circular = str(item.get("CIRCULAR", "")).strip()
+                data_atualizacao = str(
+                    item.get("DATA", "")
+                    or item.get("DATA ATUALIZAÇÃO", "")
+                    or item.get("DATA ATUALIZACAO", "")
+                    or item.get("MÊS", "")
+                    or item.get("MES", "")
+                ).strip()
 
-            base_id = "|".join((assunto, circular, info, data_atualizacao))
-            hash_conteudo = hashlib.sha1(base_id.encode("utf-8", "ignore")).hexdigest()[:16]
-            chave_informe = hashlib.sha1("|".join((assunto, circular)).encode("utf-8", "ignore")).hexdigest()[:16]
+                if not assunto and not circular and not info:
+                    continue
 
-            descricao_partes = []
-            if circular:
-                descricao_partes.append(f"Circular: {circular}")
-            if info:
-                descricao_partes.append(info[:180])
-            descricao = " — ".join(descricao_partes) or "Atualização disponível no menu Informes e Circulares."
+                if assunto:
+                    link_interno = "/modulo/informes?item=" + urllib.parse.quote(assunto)
+                else:
+                    link_interno = "/modulo/informes"
 
-            atualizacoes.append({
-                "id": f"informe:{chave_informe}:{hash_conteudo}",
-                "tipo": "Atualização",
-                "titulo": assunto or "Novo informe disponível",
-                "descricao": descricao,
-                "data": data_atualizacao,
-                "link": link_interno,
-            })
+                base_id = "|".join((assunto, circular, info, data_atualizacao))
+                hash_conteudo = hashlib.sha1(base_id.encode("utf-8", "ignore")).hexdigest()[:16]
+                chave_informe = hashlib.sha1("|".join((assunto, circular)).encode("utf-8", "ignore")).hexdigest()[:16]
+
+                descricao_partes = []
+                if circular:
+                    descricao_partes.append(f"Circular: {circular}")
+                if info:
+                    descricao_partes.append(info[:180])
+                descricao = " — ".join(descricao_partes) or "Atualização disponível no menu Informes e Circulares."
+
+                atualizacoes.append({
+                    "id": f"informe:{chave_informe}:{hash_conteudo}",
+                    "tipo": "Atualização",
+                    "titulo": assunto or "Novo informe disponível",
+                    "descricao": descricao,
+                    "data": data_atualizacao,
+                    "link": link_interno,
+                })
 
     except Exception as e:
-        print(f"API atualizações: erro na aba Informes: {e}")
+        print(f"API atualizações: erro ao verificar as abas: {e}")
+        if CACHE_ATUALIZACOES_ABAS["timestamp"]:
+            final_cache = CACHE_ATUALIZACOES_ABAS["atualizacoes"][:limite]
+            return jsonify({"atualizacoes": final_cache, "nao_lidas": len(final_cache)})
+        return jsonify({
+            "atualizacoes": [],
+            "nao_lidas": 0,
+            "erro": "Google Sheets indisponível temporariamente para verificar atualizações.",
+        }), 503
 
     # Mais recentes primeiro quando houver uma data reconhecível; mantém a
     # ordem da planilha como critério de desempate.
     def chave_atualizacao(item):
         texto = str(item.get("data", "")).strip()
-        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+        for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
             try:
                 return datetime.strptime(texto, fmt)
             except ValueError:
                 pass
         return datetime.min
 
+    atualizacoes.extend(CACHE_ATUALIZACOES_ABAS["eventos"])
     atualizacoes.sort(key=chave_atualizacao, reverse=True)
-    final = atualizacoes[:limite]
+    CACHE_ATUALIZACOES_ABAS["atualizacoes"] = atualizacoes[:30]
+    CACHE_ATUALIZACOES_ABAS["timestamp"] = time.time()
+    final = CACHE_ATUALIZACOES_ABAS["atualizacoes"][:limite]
     return jsonify({"atualizacoes": final, "nao_lidas": len(final)})
 
 

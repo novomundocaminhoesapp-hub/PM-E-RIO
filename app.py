@@ -1412,6 +1412,18 @@ def normalizar_chave_manutencao(valor):
     return re.sub(r"[^A-Z0-9]", "", texto)
 
 
+def encontrar_coluna_por_indice(chaves, base, indice):
+    base_normalizada = normalizar_chave_manutencao(base)
+    for chave in chaves:
+        chave_normalizada = normalizar_chave_manutencao(chave)
+        if not chave_normalizada.startswith(base_normalizada):
+            continue
+        sufixo = chave_normalizada[len(base_normalizada):]
+        if (indice == 0 and not sufixo) or sufixo == str(indice):
+            return chave
+    return None
+
+
 def converter_intervalo_manutencao(valor):
     texto = re.sub(
         r"[^0-9,.-]",
@@ -1553,20 +1565,11 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
         return converter_intervalo_manutencao(valor)
 
     def encontrar_coluna_mensal(chaves, indice):
-        alvo = normalizar_chave_manutencao("VALOR MENSAL")
-        for chave in chaves:
-            normalizada = normalizar_chave_manutencao(chave)
-            if not normalizada.startswith(alvo):
-                continue
-            sufixo = normalizada[len(alvo):]
-            if (not sufixo and indice == 0) or (sufixo.isdigit() and int(sufixo) == indice):
-                return chave
-        return None
+        return encontrar_coluna_por_indice(chaves, "VALOR MENSAL", indice)
 
-    def encontrar_coluna_intervalo(chaves, unidade):
+    def encontrar_coluna_intervalo(chaves, unidade, indice):
         base = "KM" if unidade == "KM" else "HORA"
-        por_chave_norm = {normalizar_chave_manutencao(chave): chave for chave in chaves}
-        return por_chave_norm.get(base)
+        return encontrar_coluna_por_indice(chaves, base, indice)
 
     candidatos = {"PREV": [], "MAX": [], "PLUS": []}
     configuracoes = (("PREV", 0), ("MAX", 1), ("PLUS", 2))
@@ -1582,7 +1585,7 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
         for plano, indice_plano in configuracoes:
             for unidade, indice_valor in (("KM", indice_plano), ("HORA", indice_plano + 3)):
                 coluna_valor = encontrar_coluna_mensal(chaves, indice_valor)
-                coluna_intervalo = encontrar_coluna_intervalo(chaves, unidade)
+                coluna_intervalo = encontrar_coluna_intervalo(chaves, unidade, indice_plano)
                 if not coluna_valor:
                     continue
 
@@ -7225,7 +7228,18 @@ def acessar_modulo(nome_modulo):
                             </div>
                             """
 
-                    hora_geral_val = item_escolhido.get("HORA", "")
+                    chaves_item = list(item_escolhido.keys())
+                    hora_geral_val = ""
+                    for indice_hora, plano_hora in enumerate(("PREV", "MAX", "PLUS")):
+                        coluna_hora_resumo = encontrar_coluna_por_indice(
+                            chaves_item,
+                            f"{plano_hora}_VALOR HORA",
+                            0,
+                        ) or encontrar_coluna_por_indice(chaves_item, "HORA", indice_hora)
+                        valor_hora_resumo = item_escolhido.get(coluna_hora_resumo, "") if coluna_hora_resumo else ""
+                        if str(valor_hora_resumo).strip():
+                            hora_geral_val = valor_hora_resumo
+                            break
                     intervalo_revisao_horas = obter_intervalo_revisao(
                         titulo_principal,
                         familia_modelo,
@@ -7233,40 +7247,43 @@ def acessar_modulo(nome_modulo):
                         intervalo_horas=converter_intervalo_manutencao(hora_geral_val),
                     )
                     planos_hora_info = [
-                        {"nome": "Plano PREV", "classe": "prev", "hora_col": "PREV_VALOR HORA" if "PREV_VALOR HORA" in item_escolhido else "HORA"},
-                        {"nome": "Plano MAX", "classe": "max", "hora_col": "MAX_VALOR HORA" if "MAX_VALOR HORA" in item_escolhido else "HORA_1"},
-                        {"nome": "Plano PLUS", "classe": "plus", "hora_col": "PLUS_VALOR HORA" if "PLUS_VALOR HORA" in item_escolhido else "HORA_2"}
+                        {"nome": "Plano PREV", "classe": "prev", "hora_indice": 0, "mensal_indice": 3},
+                        {"nome": "Plano MAX", "classe": "max", "hora_indice": 1, "mensal_indice": 4},
+                        {"nome": "Plano PLUS", "classe": "plus", "hora_indice": 2, "mensal_indice": 5},
                     ]
 
                     cards_horas_html = ""
-                    if hora_geral_val:
-                        for p in planos_hora_info:
-                            hora_val_crua = item_escolhido.get(p["hora_col"], "")
-                            mensal_val_crua = ""
-                            total_val_crua = ""
+                    for p in planos_hora_info:
+                        nome_coluna_hora = f"{p['nome'].replace('Plano ', '').upper()}_VALOR HORA"
+                        coluna_hora = encontrar_coluna_por_indice(
+                            chaves_item,
+                            nome_coluna_hora,
+                            0,
+                        ) or encontrar_coluna_por_indice(
+                            chaves_item,
+                            "HORA",
+                            p["hora_indice"],
+                        )
+                        coluna_mensal = encontrar_coluna_por_indice(
+                            chaves_item,
+                            "VALOR MENSAL",
+                            p["mensal_indice"],
+                        )
+                        coluna_total = encontrar_coluna_por_indice(
+                            chaves_item,
+                            "TOTAL CONTRATO",
+                            p["mensal_indice"],
+                        )
+                        hora_val_crua = item_escolhido.get(coluna_hora, "") if coluna_hora else ""
+                        mensal_val_crua = item_escolhido.get(coluna_mensal, "") if coluna_mensal else ""
+                        total_val_crua = item_escolhido.get(coluna_total, "") if coluna_total else ""
 
-                            if p["nome"] == "Plano PREV":
-                                chaves_mensal = [k for k in item_escolhido.keys() if k.startswith("VALOR MENSAL")]
-                                if len(chaves_mensal) > 3: mensal_val_crua = item_escolhido.get(chaves_mensal[3], "")
-                                chaves_total = [k for k in item_escolhido.keys() if k.startswith("TOTAL CONTRATO")]
-                                if len(chaves_total) > 3: total_val_crua = item_escolhido.get(chaves_total[3], "")
-                            elif p["nome"] == "Plano MAX":
-                                chaves_mensal = [k for k in item_escolhido.keys() if k.startswith("VALOR MENSAL")]
-                                if len(chaves_mensal) > 4: mensal_val_crua = item_escolhido.get(chaves_mensal[4], "")
-                                chaves_total = [k for k in item_escolhido.keys() if k.startswith("TOTAL CONTRATO")]
-                                if len(chaves_total) > 4: total_val_crua = item_escolhido.get(chaves_total[4], "")
-                            elif p["nome"] == "Plano PLUS":
-                                chaves_mensal = [k for k in item_escolhido.keys() if k.startswith("VALOR MENSAL")]
-                                if len(chaves_mensal) > 5: mensal_val_crua = item_escolhido.get(chaves_mensal[5], "")
-                                chaves_total = [k for k in item_escolhido.keys() if k.startswith("TOTAL CONTRATO")]
-                                if len(chaves_total) > 5: total_val_crua = item_escolhido.get(chaves_total[5], "")
+                        hora_val = formatar_moeda(hora_val_crua, manter_todos_decimais=True)
+                        mensal_val = formatar_moeda(mensal_val_crua, manter_todos_decimais=False)
+                        total_val = formatar_moeda(total_val_crua, manter_todos_decimais=False)
 
-                            hora_val = formatar_moeda(hora_val_crua, manter_todos_decimais=True)
-                            mensal_val = formatar_moeda(mensal_val_crua, manter_todos_decimais=False)
-                            total_val = formatar_moeda(total_val_crua, manter_todos_decimais=False)
-
-                            if hora_val != "-" or mensal_val != "-" or total_val != "-":
-                                cards_horas_html += f"""
+                        if hora_val != "-" or mensal_val != "-" or total_val != "-":
+                            cards_horas_html += f"""
                                 <div class="card-plano {p['classe']}">
                                     <div class="plano-titulo">{p['nome']} (HORAS)</div>
                                     <div class="plano-linha-com-grupo">

@@ -1399,119 +1399,215 @@ def converter_numero(valor):
         return None
 
 
-def obter_top3_planos_melhor_preco(registros):
-    """Seleciona 3 modelos distintos de PREV, MAX e PLUS.
-
-    A leitura das colunas é feita de forma tolerante porque o Google Sheets
-    pode devolver cabeçalhos repetidos com sufixos diferentes (.1, .2, _1,
-    _2 etc.). Assim, o dashboard não fica limitado ao PREV quando os nomes
-    das colunas de MAX/PLUS variam.
-    """
+def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
+    """Seleciona os 3 modelos distintos de menor preço para cada plano."""
     import re
 
     def normalizar_chave(chave):
-        return re.sub(r"[^A-Z0-9]", "", str(chave).upper())
+        texto = unicodedata.normalize("NFKD", str(chave).upper())
+        texto = "".join(caractere for caractere in texto if not unicodedata.combining(caractere))
+        return re.sub(r"[^A-Z0-9]", "", texto)
 
-    def encontrar_coluna(chaves, base, indice):
-        # 1) Preferência pelos nomes já utilizados no sistema.
-        candidatos_exatos = {
-            "PREV": ["VALOR MENSAL", "VALOR MENSAL.0", "VALOR MENSAL_0"],
-            "MAX": ["VALOR MENSAL.1", "VALOR MENSAL_1"],
-            "PLUS": ["VALOR MENSAL.2", "VALOR MENSAL_2"],
-        }
-        for nome in candidatos_exatos.get(base, []):
-            if nome in chaves:
-                return nome
+    def converter_intervalo(valor):
+        texto = re.sub(
+            r"[^0-9,.-]",
+            "",
+            str("" if valor is None else valor).strip().lower(),
+        )
+        if not texto:
+            return None
+        if "," in texto and "." in texto:
+            if texto.rfind(",") > texto.rfind("."):
+                texto = texto.replace(".", "").replace(",", ".")
+            else:
+                texto = texto.replace(",", "")
+        elif "," in texto:
+            if re.fullmatch(r"-?\d{1,3}(?:,\d{3})+", texto):
+                texto = texto.replace(",", "")
+            else:
+                texto = texto.replace(",", ".")
+        elif re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", texto):
+            texto = texto.replace(".", "")
+        try:
+            return float(texto)
+        except ValueError:
+            return None
 
-        # 2) Procura por VALOR MENSAL + índice, aceitando .1, _1, espaço 1 etc.
-        alvo = normalizar_chave("VALORMENSAL")
-        encontrados = []
-        for k in chaves:
-            nk = normalizar_chave(k)
-            if nk == alvo and indice == 0:
-                encontrados.append(k)
-            elif nk.startswith(alvo):
-                sufixo = nk[len(alvo):]
-                if sufixo.isdigit() and int(sufixo) == indice:
-                    encontrados.append(k)
-        if encontrados:
-            return encontrados[0]
-        return None
+    familias_por_modelo = {
+        "DELIVERY": {"6170", "9180", "11180", "13180", "14180", "14210", "17210", "18210", "18260", "18320"},
+        "CONSTELLATION": {"25480", "26260", "26320", "27260", "30320", "31320", "33480"},
+        "METEOR": {"28480", "29530"},
+    }
+    intervalos_revisao = {
+        "EXPRESS": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
+        "6170": {"RODOVIARIO": 30000, "MISTO": 20000, "SEVERO": 20000, "ESPECIAL": 500},
+        "9180": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 500},
+        "11180": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 500},
+        "13180": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "14180": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "14210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "17210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "18210": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "18260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "18320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "25480": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "26260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "26320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "27260": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "30320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "31320": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "33480": {"RODOVIARIO": 40000, "MISTO": 30000, "SEVERO": 20000, "ESPECIAL": 600},
+        "28480": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "29530": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    }
+    intervalos_revisao_familia = {
+        "DELIVERY": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "CONSTELLATION": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+        "METEOR": {"RODOVIARIO": 50000, "MISTO": 40000, "SEVERO": 20000, "ESPECIAL": 600},
+    }
 
-    def encontrar_coluna_relacionada(chaves, palavras, indice, fallback_base):
-        # Primeiro tenta os nomes tradicionais do arquivo.
-        for k in chaves:
-            nk = normalizar_chave(k)
-            if fallback_base and nk == normalizar_chave(fallback_base):
-                return k
+    def familia_modelo(modelo):
+        modelo_norm = normalizar_chave(modelo)
+        if "DELIVERY" in modelo_norm or "EXPRESS" in modelo_norm:
+            return "DELIVERY"
+        if "CONSTELLATION" in modelo_norm:
+            return "CONSTELLATION"
+        if "METEOR" in modelo_norm:
+            return "METEOR"
 
-        # Depois aceita variações com o mesmo índice.
-        for k in chaves:
-            nk = normalizar_chave(k)
-            if not any(normalizar_chave(palavra) in nk for palavra in palavras):
+        for registro_modelo in registros_modelos or []:
+            nome_modelo = str(
+                registro_modelo.get("MODELO")
+                or registro_modelo.get("NOME")
+                or registro_modelo.get("DESCRICAO")
+                or ""
+            ).strip()
+            nome_norm = normalizar_chave(nome_modelo)
+            if not nome_norm or not (nome_norm in modelo_norm or modelo_norm in nome_norm):
                 continue
-            # Remove o nome-base e identifica o índice final.
-            numeros = re.findall(r"\d+$", nk)
-            idx = int(numeros[-1]) if numeros else 0
-            if idx == indice:
-                return k
+            metadados = normalizar_chave(" ".join(
+                str(registro_modelo.get(campo, "") or "")
+                for campo in ("FAMILIA", "CATEGORIA", "TIPO", "DESCRICAO")
+            ))
+            for familia in ("DELIVERY", "CONSTELLATION", "METEOR", "EXPRESS"):
+                if familia in metadados:
+                    return "DELIVERY" if familia == "EXPRESS" else familia
+
+        for familia, modelos in familias_por_modelo.items():
+            if any(modelo_id in modelo_norm for modelo_id in modelos):
+                return familia
+        return ""
+
+    def identificar_grupo(familia, km):
+        if km is None or not familia:
+            return "Não identificado"
+        if familia == "DELIVERY":
+            if km <= 3250:
+                return "Severo"
+            if km <= 6500:
+                return "Misto"
+            return "Rodoviário"
+        if familia in ("CONSTELLATION", "METEOR"):
+            if km <= 6500:
+                return "Severo"
+            if km <= 10000:
+                return "Misto"
+            return "Rodoviário"
+        return "Não identificado"
+
+    def encontrar_coluna_mensal(chaves, indice):
+        alvo = normalizar_chave("VALOR MENSAL")
+        for chave in chaves:
+            normalizada = normalizar_chave(chave)
+            if not normalizada.startswith(alvo):
+                continue
+            sufixo = normalizada[len(alvo):]
+            if (not sufixo and indice == 0) or (sufixo.isdigit() and int(sufixo) == indice):
+                return chave
         return None
+
+    def encontrar_coluna_intervalo(chaves, unidade):
+        base = "KM" if unidade == "KM" else "HORA"
+        por_chave_norm = {normalizar_chave(chave): chave for chave in chaves}
+        return por_chave_norm.get(base)
 
     candidatos = {"PREV": [], "MAX": [], "PLUS": []}
     configuracoes = (("PREV", 0), ("MAX", 1), ("PLUS", 2))
 
-    for r in registros:
-        chaves = list(r.keys())
-        modelo = str(r.get("MODELO", "") or r.get("PRODUTO", "")).strip()
+    for registro in registros:
+        chaves = list(registro.keys())
+        modelo = str(registro.get("MODELO") or registro.get("PRODUTO") or "").strip()
         if not modelo:
             continue
 
-        km = str(r.get("KM", "")).strip()
-        periodo = str(r.get("PERIODO", "")).strip() or "12"
+        periodo = str(registro.get("PERIODO", "")).strip() or "12"
+        familia = familia_modelo(modelo)
+        id_modelo = next(
+            (
+                modelo_id
+                for modelos in familias_por_modelo.values()
+                for modelo_id in modelos
+                if modelo_id in normalizar_chave(modelo)
+            ),
+            "",
+        )
+        if not id_modelo and "EXPRESS" in normalizar_chave(modelo):
+            id_modelo = "EXPRESS"
 
-        for tipo, indice in configuracoes:
-            col_valor = encontrar_coluna(chaves, tipo, indice)
-            if not col_valor:
-                continue
+        for plano, indice_plano in configuracoes:
+            for unidade, indice_valor in (("KM", indice_plano), ("HORA", indice_plano + 3)):
+                coluna_valor = encontrar_coluna_mensal(chaves, indice_valor)
+                coluna_intervalo = encontrar_coluna_intervalo(chaves, unidade)
+                if not coluna_valor:
+                    continue
 
-            valor = converter_numero(r.get(col_valor))
-            if valor is None or valor <= 0:
-                continue
+                valor = converter_numero(registro.get(coluna_valor))
+                intervalo = converter_intervalo(registro.get(coluna_intervalo)) if coluna_intervalo else None
+                if valor is None or valor <= 0 or (unidade == "HORA" and not intervalo):
+                    continue
 
-            # KM e contrato acompanham a mesma posição do plano.
-            if tipo == "PREV":
-                col_km = encontrar_coluna_relacionada(chaves, ["PREV_VALOR KM", "VALOR KM"], 0, "PREV_VALOR KM")
-                col_total = encontrar_coluna_relacionada(chaves, ["TOTAL CONTRATO"], 0, "TOTAL CONTRATO")
-            elif tipo == "MAX":
-                col_km = encontrar_coluna_relacionada(chaves, ["MAX_VALOR KM", "VALOR KM"], 1, "MAX_VALOR KM")
-                col_total = encontrar_coluna_relacionada(chaves, ["TOTAL CONTRATO"], 1, "TOTAL CONTRATO.1")
-            else:
-                col_km = encontrar_coluna_relacionada(chaves, ["PLUS_VALOR KM", "VALOR KM"], 2, "PLUS_VALOR KM")
-                col_total = encontrar_coluna_relacionada(chaves, ["TOTAL CONTRATO"], 2, "TOTAL CONTRATO.2")
+                grupo = "Especial" if unidade == "HORA" else identificar_grupo(familia, intervalo)
+                grupo_chave = normalizar_chave(grupo)
+                regras_modelo = intervalos_revisao.get(
+                    id_modelo,
+                    intervalos_revisao_familia.get(familia, {}),
+                )
+                intervalo_regra = regras_modelo.get(grupo_chave)
+                if unidade == "HORA" and intervalo_regra is None:
+                    intervalo_regra = intervalo
+                if intervalo_regra is None:
+                    texto_intervalo = "Não informado"
+                else:
+                    unidade_intervalo = "h" if grupo_chave == "ESPECIAL" else "km"
+                    texto_intervalo = (
+                        f"A cada {intervalo_regra:,.0f} {unidade_intervalo}"
+                        .replace(",", ".")
+                    )
 
-            candidatos[tipo].append({
-                "tipo": tipo,
-                "plano": f"Plano {tipo}",
-                "modelo": modelo,
-                "valor": round(valor, 2),
-                "valor_km": converter_numero(r.get(col_km)) if col_km else None,
-                "total_contrato": converter_numero(r.get(col_total)) if col_total else None,
-                "periodo": periodo,
-                "km": km,
-            })
+                candidatos[plano].append({
+                    "tipo": plano,
+                    "plano": f"Plano {plano}",
+                    "modelo": modelo,
+                    "valor": round(valor, 2),
+                    "periodo": periodo,
+                    "km": intervalo if unidade == "KM" else None,
+                    "horas": intervalo if unidade == "HORA" else None,
+                    "unidade": unidade,
+                    "grupo_manutencao": grupo,
+                    "intervalo_revisao": texto_intervalo,
+                })
 
     resultado = []
-    for tipo in ("PREV", "MAX", "PLUS"):
-        ordenados = sorted(candidatos[tipo], key=lambda x: (x["valor"], str(x["modelo"]).upper()))
-        vistos = set()
+    for plano in ("PREV", "MAX", "PLUS"):
+        ordenados = sorted(
+            candidatos[plano],
+            key=lambda item: (item["valor"], str(item["modelo"]).upper()),
+        )
+        melhor_por_modelo = {}
         for item in ordenados:
-            chave = str(item["modelo"]).strip().upper()
-            if chave in vistos:
-                continue
-            vistos.add(chave)
-            resultado.append(item)
-            if len(vistos) >= 3:
-                break
+            chave_modelo = normalizar_chave(item["modelo"])
+            melhor_por_modelo.setdefault(chave_modelo, item)
+        resultado.extend(list(melhor_por_modelo.values())[:3])
 
     print(
         "Dashboard PM_Precos: "
@@ -3551,7 +3647,10 @@ def acessar_modulo(nome_modulo):
             dados_login = carregar_dados_login()
             usuarios = dados_login.get("Usuarios", [])
             pm_precos_dashboard = dados_login.get("PM_Precos", [])
-            top3_planos = obter_top3_planos_melhor_preco(pm_precos_dashboard)
+            top3_planos = obter_top3_planos_melhor_preco(
+                pm_precos_dashboard,
+                dados_login.get("Modelos", []),
+            )
             # Catálogo de produtos do dashboard:
             # - PM: coluna PRODUTO da aba PM
             # - RIO: coluna PRODUTO da aba RIO
@@ -4241,19 +4340,27 @@ def acessar_modulo(nome_modulo):
             for p_plano in top3_planos:
                 plano_atual = str(p_plano.get("plano", "")).strip().upper()
                 if ultimo_plano is not None and plano_atual != ultimo_plano:
-                    linhas_top3_planos += "<tr class=\"plano-separador\"><td colspan=\"5\"></td></tr>"
+                    linhas_top3_planos += "<tr class=\"plano-separador\"><td colspan=\"7\"></td></tr>"
+                intervalo = p_plano.get("horas") if p_plano["unidade"] == "HORA" else p_plano.get("km")
+                unidade_intervalo = "h" if p_plano["unidade"] == "HORA" else "km"
+                intervalo_exibicao = (
+                    f"{intervalo:,.0f} {unidade_intervalo}".replace(",", ".")
+                    if intervalo is not None else "-"
+                )
                 linhas_top3_planos += (
                     f"<tr>"
                     f"<td><b>{html.escape(str(p_plano['plano']))}</b></td>"
                     f"<td>{html.escape(str(p_plano['modelo']))}</td>"
                     f"<td class='num'>R$ {p_plano['valor']:,.2f}</td>"
                     f"<td>{html.escape(str(p_plano['periodo'] or '-'))} meses</td>"
-                    f"<td>{html.escape(str(p_plano['km'] or '-'))}</td>"
+                    f"<td>{html.escape(intervalo_exibicao)}</td>"
+                    f"<td><span class='grupo-manutencao grupo-{normalizar_chave_planilha(p_plano['grupo_manutencao']).replace(' ', '-').lower()}'>{html.escape(p_plano['grupo_manutencao'])}</span></td>"
+                    f"<td>{html.escape(p_plano['intervalo_revisao'])}</td>"
                     f"</tr>"
                 )
                 ultimo_plano = plano_atual
             if not linhas_top3_planos:
-                linhas_top3_planos = '<tr><td colspan="5" class="empty">Nenhum preço mensal disponível na aba PM_Precos.</td></tr>'
+                linhas_top3_planos = '<tr><td colspan="7" class="empty">Nenhum preço mensal disponível na aba PM_Precos.</td></tr>'
 
             vendedores_tabela = {}
             if not filtro_mes:
@@ -4333,6 +4440,11 @@ def acessar_modulo(nome_modulo):
                 .dash-table-precos th:nth-child(3),.dash-table-precos td:nth-child(3){{text-align:center}}
                 .dash-table tr.plano-separador td{{padding:0;height:8px;background:#f1f5f9;border-bottom:1px solid #cbd5e1}}
                 .dash-table .num{{text-align:center;font-weight:800}}
+                .grupo-manutencao{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:800;white-space:nowrap}}
+                .grupo-rodoviario{{background:#dbeafe;color:#1e40af}}
+                .grupo-misto{{background:#fef3c7;color:#92400e}}
+                .grupo-severo{{background:#fee2e2;color:#991b1b}}
+                .grupo-especial{{background:#ede9fe;color:#5b21b6}}
                 .dash-monthly-scroll{{overflow:auto;max-height:560px;border:1px solid #e2e8f0;border-radius:8px}}
                 .dash-monthly-table{{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:11px}}
                 .dash-monthly-table th,.dash-monthly-table td{{min-width:52px;padding:8px 7px;border-bottom:1px solid #e2e8f0;border-right:1px solid #eef2f7;text-align:center;white-space:nowrap}}
@@ -4419,8 +4531,8 @@ def acessar_modulo(nome_modulo):
 
                 <div class="dash-table-card card-planos-manutencao" style="margin-bottom:14px">
                     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
-                        <h3 style="margin:0;">💰 Menor preço de manutenção por plano</h3>
-                        <span class="dash-note" style="margin:0;">PREV · MAX · PLUS · menor valor mensal de cada modalidade</span>
+                        <h3 style="margin:0;">💰 Melhor preço para plano de manutenção</h3>
+                        <span class="dash-note" style="margin:0;">3 modelos com menor preço mensal em PREV · MAX · PLUS</span>
                     </div>
                     <div class="dash-table-scroll" style="margin-top:10px;">
                         <table class="dash-table dash-table-precos">
@@ -4429,8 +4541,10 @@ def acessar_modulo(nome_modulo):
                                     <th>Plano</th>
                                     <th>Modelo</th>
                                     <th>Valor mensal</th>
-                                    <th>Tempo</th>
-                                    <th>KM</th>
+                                    <th>Contrato</th>
+                                    <th>KM / Horas</th>
+                                    <th>Grupo de manutenção</th>
+                                    <th>Intervalo de revisão</th>
                                 </tr>
                             </thead>
                             <tbody>

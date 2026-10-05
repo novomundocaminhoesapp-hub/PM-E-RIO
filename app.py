@@ -2727,6 +2727,33 @@ TEMPLATE_HTML = r"""
         document.addEventListener('DOMContentLoaded', function() {
             carregarNotificacoes();
             window.setInterval(carregarNotificacoes, 300000);
+
+            var barraSuperiorNegocios = document.getElementById('barraScrollNegocios');
+            var conteudoBarraNegocios = document.getElementById('barraScrollNegociosInner');
+            var areaTabelaNegocios = document.getElementById('negociosTabelaWrapPrincipal');
+            var tabelaNegocios = document.getElementById('tabelaNegociosPrincipal');
+
+            if (barraSuperiorNegocios && conteudoBarraNegocios && areaTabelaNegocios && tabelaNegocios) {
+                var sincronizandoRolagemNegocios = false;
+                var ajustarLarguraBarraNegocios = function() {
+                    conteudoBarraNegocios.style.width = tabelaNegocios.scrollWidth + 'px';
+                };
+                var sincronizarRolagemNegocios = function(origem, destino) {
+                    if (sincronizandoRolagemNegocios) return;
+                    sincronizandoRolagemNegocios = true;
+                    destino.scrollLeft = origem.scrollLeft;
+                    sincronizandoRolagemNegocios = false;
+                };
+
+                ajustarLarguraBarraNegocios();
+                barraSuperiorNegocios.addEventListener('scroll', function() {
+                    sincronizarRolagemNegocios(barraSuperiorNegocios, areaTabelaNegocios);
+                });
+                areaTabelaNegocios.addEventListener('scroll', function() {
+                    sincronizarRolagemNegocios(areaTabelaNegocios, barraSuperiorNegocios);
+                });
+                window.addEventListener('resize', ajustarLarguraBarraNegocios);
+            }
         });
 
         function forcarAtualizacao() {

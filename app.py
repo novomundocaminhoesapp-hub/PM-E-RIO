@@ -945,12 +945,40 @@ def carregar_dados_login():
         return CACHE_LOGIN_DADOS["dados"]
 
     planilha = conectar_google_sheets()
-    abas = ["PM", "RIO", "PM_Precos", "Informes", "Argumentos", "Modelos", "Usuarios",
+    abas = ["PM", "RIO", "PM_Precos", "Promocao VW", "Informes", "Argumentos", "Modelos", "Usuarios",
             "Negocios_PM", "Vendas_PM", "Vendas_LOC", "Negocio_LOC",
             "Vendas_Consorcio", "Negocios_Consorcio"]
 
     dados = {}
     for nome_aba in abas:
+        if nome_aba == "Promocao VW":
+            try:
+                chave_aba_promocao = normalizar_chave_manutencao(nome_aba)
+                aba_promocao = next(
+                    (
+                        aba
+                        for aba in planilha.worksheets()
+                        if normalizar_chave_manutencao(aba.title)
+                        == chave_aba_promocao
+                    ),
+                    None,
+                )
+                if aba_promocao is None:
+                    print(
+                        "Aba opcional da campanha VW não encontrada na planilha "
+                        "'PM e RIO Novo'; o quadro da campanha ficará oculto."
+                    )
+                    dados[nome_aba] = []
+                else:
+                    dados[nome_aba] = obter_registros_com_cache(
+                        planilha,
+                        aba_promocao.title,
+                    )
+            except Exception as e:
+                print(f"Erro ao carregar aba opcional da campanha VW: {e}")
+                dados[nome_aba] = []
+            continue
+
         try:
             dados[nome_aba] = obter_registros_com_cache(planilha, nome_aba)
         except Exception as e:
@@ -1611,7 +1639,7 @@ def converter_numero(valor):
 
 FAMILIAS_POR_MODELO = {
     "DELIVERY": {"6170", "9180", "11180", "13180", "14180", "14210", "17210", "18210", "18260", "18320"},
-    "CONSTELLATION": {"25480", "26260", "26320", "27260", "30320", "31320", "33480"},
+    "CONSTELLATION": {"20480", "25480", "26260", "26320", "27260", "30320", "31320", "33480"},
     "METEOR": {"28480", "29530"},
 }
 
@@ -1844,6 +1872,54 @@ def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
         f"PLUS={len([x for x in resultado if x['tipo']=='PLUS'])}"
     )
     return resultado
+
+
+def obter_precos_campanha_vw(registros, registros_modelos=None):
+    """Monta os preços válidos da campanha VW, separados por plano."""
+    resultado = []
+    configuracoes = (("PREV", 0), ("MAX", 1))
+
+    for registro in registros:
+        chaves = list(registro.keys())
+        modelo = str(
+            registro.get("MODELO") or registro.get("PRODUTO") or ""
+        ).strip()
+        if not modelo:
+            continue
+
+        periodo = converter_numero(registro.get("PERIODO"))
+        coluna_km = encontrar_coluna_por_indice(chaves, "KM", 0)
+        km = converter_intervalo_manutencao(registro.get(coluna_km)) if coluna_km else None
+        familia = identificar_familia_modelo(modelo, registros_modelos)
+        grupo = identificar_grupo_manutencao(familia, km)
+        intervalo_revisao = obter_intervalo_revisao(
+            modelo,
+            familia,
+            grupo,
+        )
+
+        for plano, indice in configuracoes:
+            coluna_valor = encontrar_coluna_por_indice(
+                chaves,
+                "VALOR MENSAL",
+                indice,
+            )
+            valor = converter_numero(registro.get(coluna_valor)) if coluna_valor else None
+            if valor is None or valor <= 0:
+                continue
+
+            resultado.append({
+                "plano": f"Plano {plano}",
+                "modelo": modelo,
+                "valor": round(valor, 2),
+                "periodo": periodo,
+                "km": km,
+                "grupo_manutencao": grupo,
+                "intervalo_revisao": intervalo_revisao,
+            })
+
+    return resultado
+
 
 def formatar_moeda(valor, manter_todos_decimais=False):
     if valor is None or str(valor).strip() in ["", "-"]:
@@ -4137,6 +4213,10 @@ def acessar_modulo(nome_modulo):
                 pm_precos_dashboard,
                 dados_login.get("Modelos", []),
             )
+            precos_campanha_vw = obter_precos_campanha_vw(
+                dados_login.get("Promocao VW", []),
+                dados_login.get("Modelos", []),
+            )
             # Catálogo de produtos do dashboard:
             # - PM: coluna PRODUTO da aba PM
             # - RIO: coluna PRODUTO da aba RIO
@@ -4860,6 +4940,68 @@ def acessar_modulo(nome_modulo):
             if not linhas_top3_planos:
                 linhas_top3_planos = '<tr><td colspan="7" class="empty">Nenhum preço mensal disponível na aba PM_Precos.</td></tr>'
 
+            linhas_campanha_vw = ""
+            ultimo_plano_campanha = None
+            for preco_campanha in precos_campanha_vw:
+                plano_atual = preco_campanha["plano"]
+                if ultimo_plano_campanha and plano_atual != ultimo_plano_campanha:
+                    linhas_campanha_vw += (
+                        '<tr class="plano-separador"><td colspan="7"></td></tr>'
+                    )
+                km_campanha = preco_campanha["km"]
+                km_exibicao = (
+                    f'{km_campanha:,.0f} km'.replace(",", ".")
+                    if km_campanha is not None else "-"
+                )
+                periodo_campanha = preco_campanha["periodo"]
+                contrato_exibicao = (
+                    f'{periodo_campanha:,.0f} meses'.replace(",", ".")
+                    if periodo_campanha is not None else "-"
+                )
+                classe_grupo = normalizar_chave_planilha(
+                    preco_campanha["grupo_manutencao"]
+                ).replace(" ", "-").lower()
+                linhas_campanha_vw += (
+                    "<tr>"
+                    f'<td><b>{html.escape(preco_campanha["plano"])}</b></td>'
+                    f'<td>{html.escape(preco_campanha["modelo"])}</td>'
+                    f'<td class="num">R$ {preco_campanha["valor"]:,.2f}</td>'
+                    f'<td>{html.escape(contrato_exibicao)}</td>'
+                    f'<td>{html.escape(km_exibicao)}</td>'
+                    f'<td><span class="grupo-manutencao grupo-{classe_grupo}">'
+                    f'{html.escape(preco_campanha["grupo_manutencao"])}</span></td>'
+                    f'<td>{html.escape(preco_campanha["intervalo_revisao"])}</td>'
+                    "</tr>"
+                )
+                ultimo_plano_campanha = plano_atual
+
+            quadro_campanha_vw = ""
+            if linhas_campanha_vw:
+                quadro_campanha_vw = f"""
+                <div class="dash-table-card" style="margin-bottom:14px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <h3 style="margin:0;">🎯 Outubro Volks | Total Prev ou Max com até 70% de desconto para os Gigantes VW</h3>
+                        <span class="dash-note" style="margin:0;">Valores promocionais da campanha</span>
+                    </div>
+                    <div class="dash-table-scroll" style="margin-top:10px;">
+                        <table class="dash-table dash-table-precos">
+                            <thead>
+                                <tr>
+                                    <th>Plano</th>
+                                    <th>Modelo</th>
+                                    <th>Valor mensal</th>
+                                    <th>Contrato</th>
+                                    <th>KM / Horas</th>
+                                    <th>Grupo de manutenção</th>
+                                    <th>Intervalo de revisão</th>
+                                </tr>
+                            </thead>
+                            <tbody>{linhas_campanha_vw}</tbody>
+                        </table>
+                    </div>
+                </div>
+                """
+
             vendedores_tabela = {}
             if not filtro_mes:
                 vendedores_tabela.update({
@@ -5026,6 +5168,8 @@ def acessar_modulo(nome_modulo):
                     </div>
                     <div class="dash-note">Os valores respeitam os filtros de ano, período, consultor, produto e estado. Em períodos parciais, são exibidos os consultores com vendas no recorte.</div>
                 </div>
+
+                {quadro_campanha_vw}
 
                 <div class="dash-table-card card-planos-manutencao" style="margin-bottom:14px">
                     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">

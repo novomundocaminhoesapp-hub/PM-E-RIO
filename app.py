@@ -3185,6 +3185,10 @@ TEMPLATE_HTML = r"""
         .notificacao-titulo { font-size:12px; font-weight:800; margin-top:2px; }
         .notificacao-desc { font-size:11px; color:#64748b; margin-top:3px; line-height:1.35; }
         .notificacao-vazia { padding:18px 10px; text-align:center; color:#64748b; font-size:12px; }
+        .topbar-right .notificacao-tentar-novamente {
+            display:block; margin:0 auto 8px; padding:7px 10px; border-radius:6px;
+            background:#002244; color:#fff; font-size:12px;
+        }
 
 
         .drawer-overlay {
@@ -3893,6 +3897,10 @@ TEMPLATE_HTML = r"""
         }
 
         function carregarNotificacoes() {
+            var painel = document.getElementById('painelNotificacoes');
+            if (painel && painel.style.display === 'block') {
+                painel.textContent = 'Carregando atualizações...';
+            }
             fetch('/api/atualizacoes?limite=12', {cache:'no-store'})
                 .then(function(res) {
                     if (!res.ok) {
@@ -3906,19 +3914,30 @@ TEMPLATE_HTML = r"""
                     atualizarBadgeNotificacoes(lista);
                     renderizarNotificacoes(lista);
                 })
-                .catch(function() {
-                    var painel = document.getElementById('painelNotificacoes');
+                .catch(function(error) {
+                    console.error('Erro ao carregar atualizações:', error);
                     if (painel) {
-                        painel.innerHTML = '<div class="notificacao-vazia">Atualizações temporariamente indisponíveis. Tente novamente em alguns minutos.</div>';
+                        painel.replaceChildren();
+                        var mensagem = document.createElement('div');
+                        mensagem.className = 'notificacao-vazia';
+                        mensagem.textContent = 'Não foi possível carregar as atualizações.';
+                        var tentarNovamente = document.createElement('button');
+                        tentarNovamente.type = 'button';
+                        tentarNovamente.className = 'notificacao-tentar-novamente';
+                        tentarNovamente.textContent = 'Tentar novamente';
+                        tentarNovamente.addEventListener('click', carregarNotificacoes);
+                        painel.append(mensagem, tentarNovamente);
                     }
                 });
         }
 
         function toggleNotificacoes() {
             var painel = document.getElementById('painelNotificacoes');
-            if (!painel) return;
+            var botao = document.getElementById('btnNotificacoes');
+            if (!painel || !botao) return;
             var aberto = painel.style.display === 'block';
             painel.style.display = aberto ? 'none' : 'block';
+            botao.setAttribute('aria-expanded', String(!aberto));
             if (!aberto) carregarNotificacoes();
         }
 
@@ -3928,11 +3947,23 @@ TEMPLATE_HTML = r"""
             if (painel && botao && painel.style.display === 'block' &&
                 !painel.contains(event.target) && !botao.contains(event.target)) {
                 painel.style.display = 'none';
+                botao.setAttribute('aria-expanded', 'false');
             }
+        });
+        document.addEventListener('keydown', function(event) {
+            if (event.key !== 'Escape') return;
+            var painel = document.getElementById('painelNotificacoes');
+            var botao = document.getElementById('btnNotificacoes');
+            if (painel) painel.style.display = 'none';
+            if (botao) botao.setAttribute('aria-expanded', 'false');
         });
 
         // Primeira verificação rápida e depois a cada 5 minutos.
         document.addEventListener('DOMContentLoaded', function() {
+            var botaoNotificacoes = document.getElementById('btnNotificacoes');
+            if (botaoNotificacoes) {
+                botaoNotificacoes.addEventListener('click', toggleNotificacoes);
+            }
             carregarNotificacoes();
             window.setInterval(carregarNotificacoes, 300000);
 
@@ -4108,7 +4139,7 @@ TEMPLATE_HTML = r"""
                 <div class="topbar-title">{{ modulo_titulo }}</div>
             </div>
             <div class="topbar-right" style="display:flex;align-items:center;gap:8px;position:relative;">
-                <button type="button" id="btnNotificacoes" onclick="toggleNotificacoes()" title="Atualizações" aria-label="Atualizações">
+                <button type="button" id="btnNotificacoes" title="Atualizações" aria-label="Atualizações" aria-controls="painelNotificacoes" aria-expanded="false">
                     🔔 <span id="contadorNotificacoes" class="notificacao-badge" style="display:none;">0</span>
                 </button>
                 <button type="button" onclick="forcarAtualizacao()" title="Atualizar">↻</button>

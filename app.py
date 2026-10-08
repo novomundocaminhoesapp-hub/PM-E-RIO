@@ -7529,7 +7529,18 @@ def acessar_modulo(nome_modulo):
                 .pedido-doc-modelo{display:grid!important;grid-template-columns:minmax(180px,32%) minmax(0,1fr)!important;gap:10px;align-items:center;padding:8px;break-inside:avoid;page-break-inside:avoid}
                 .pedido-doc-modelo img{display:block!important;width:100%;height:145px;max-width:none;object-fit:contain}
                 .pedido-doc-modelo>div{min-width:0}
-                .pedido-doc h3,.pedido-doc-total,.pedido-doc-cabecalho,.pedido-doc-contato,.pedido-doc-validade{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+                .pedido-doc h3,
+                .pedido-doc-complemento b,
+                .pedido-doc-total{
+                  background-color:#1e4778!important;
+                  color:#fff!important;
+                  -webkit-print-color-adjust:exact!important;
+                  print-color-adjust:exact!important;
+                }
+                .pedido-doc-cabecalho,.pedido-doc-contato,.pedido-doc-validade{
+                  -webkit-print-color-adjust:exact!important;
+                  print-color-adjust:exact!important;
+                }
                 a{color:#0f172a;text-decoration:none}
               }
               @media(max-width:720px){.pedido-lista{padding:12px}}

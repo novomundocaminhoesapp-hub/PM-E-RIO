@@ -1145,15 +1145,23 @@ CABECALHOS_PEDIDOS = [
     "EMAIL_CLIENTE", "CIDADE", "UF", "MODELO", "SEGMENTO", "TIPO", "CATEGORIA",
     "QUANTIDADE", "VALOR_UNITARIO", "VALOR_TOTAL", "PLANO_MANUTENCAO",
     "RIO", "ANO_MODELO", "CABINE", "MOTOR", "TRANSMISSAO", "PBT",
-    "ENTRE_EIXOS", "COMBUSTIVEL", "INFORMACOES_COMPLEMENTARES", "GARANTIA",
+    "ENTRE_EIXOS", "CMT", "OBSERVACOES_CLIENTE", "OBSERVACOES_VEICULO",
+    "INFORMACOES_COMPLEMENTARES", "GARANTIA",
     "ASSISTENCIA", "CONDICOES_PM", "MODALIDADE_FATURAMENTO", "FATURANTE",
-    "CNPJ_FATURANTE", "PAGAMENTO", "DGA", "COD_FINAME", "PAC", "CLASSIFICACAO_FISCAL",
+    "CNPJ_FATURANTE", "PAGAMENTO", "COD_FINAME", "PAC", "CLASSIFICACAO_FISCAL",
     "LOCAL_ENTREGA", "PRAZO_ENTREGA", "DETALHES", "VALIDADE", "LINK_FICHA_TECNICA",
     "IMAGEM_MODELO_ID",
-    "NOME_ARQUIVO", "DRIVE_FILE_ID", "TECNOLOGIA", "SEGMENTO_FICHA",
-    "TECNO", "POTENCIA", "SISTEMA_INJECAO",
+    "DRIVE_FILE_ID", "TECNOLOGIA", "SEGMENTO_FICHA",
+    "TECNO", "POTENCIA",
 ]
 ABA_PEDIDOS_FEITOS = "Pedidos_feitos"
+COLUNAS_OBSOLETAS_PEDIDOS = {
+    "dga",
+    "sistema injecao",
+    "sistema de injecao",
+    "combustivel",
+    "nome arquivo",
+}
 ALIASES_CABECALHOS_PEDIDOS = {
     "DATA_PEDIDO": ("DATA",),
     "VENDEDOR": ("CONSULTOR",),
@@ -1181,7 +1189,44 @@ ALIASES_CABECALHOS_PEDIDOS = {
     "PRAZO_ENTREGA": ("PRAZO", "PRAZO DE ENTREGA"),
     "DETALHES": ("OBSERVACOES", "OBSERVACOES DO PEDIDO"),
     "VALIDADE": ("PROPOSTA VALIDA ATE",),
+    "OBSERVACOES_CLIENTE": (
+        "OBSERVACOES DO CLIENTE",
+        "OBSERVACAO CLIENTE",
+        "OBSERVACAO DO CLIENTE",
+    ),
+    "OBSERVACOES_VEICULO": (
+        "OBSERVACOES DO VEICULO",
+        "OBSERVACAO VEICULO",
+        "OBSERVACAO DO VEICULO",
+    ),
 }
+
+
+def remover_colunas_obsoletas_pedidos(aba_pedidos):
+    cabecalhos = aba_pedidos.row_values(1)
+    indices_obsoletos = [
+        indice
+        for indice, cabecalho in enumerate(cabecalhos)
+        if normalizar_chave_planilha(cabecalho) in COLUNAS_OBSOLETAS_PEDIDOS
+    ]
+    if not indices_obsoletos:
+        return
+
+    aba_pedidos.spreadsheet.batch_update({
+        "requests": [
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": aba_pedidos.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": indice,
+                        "endIndex": indice + 1,
+                    }
+                }
+            }
+            for indice in sorted(indices_obsoletos, reverse=True)
+        ]
+    })
 
 
 def obter_pasta_upload_pedidos(service):
@@ -1250,10 +1295,10 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     documento = SimpleDocTemplate(
         buffer,
         pagesize=A4,
-        rightMargin=8 * mm,
-        leftMargin=8 * mm,
-        topMargin=7 * mm,
-        bottomMargin=7 * mm,
+        rightMargin=20 * mm,
+        leftMargin=20 * mm,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
         title=f"Proposta {dados_pedido.get('ID_PEDIDO', '')}",
         author=str(dados_pedido.get("VENDEDOR", "")),
     )
@@ -1358,7 +1403,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
             f"<b>Proposta válida até {xml_escape(validade or '—')}</b>",
             validade_estilo,
         )]],
-        colWidths=[194 * mm],
+        colWidths=[170 * mm],
     )
     faixa_validade.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#eef3f8")),
@@ -1368,7 +1413,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     ]))
 
     def secao(rotulo):
-        tabela = Table([[paragrafo(rotulo, secao_estilo)]], colWidths=[194 * mm])
+        tabela = Table([[paragrafo(rotulo, secao_estilo)]], colWidths=[170 * mm])
         tabela.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), azul),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
@@ -1403,7 +1448,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
             linha = celulas[inicio:inicio + colunas]
             linha.extend([""] * (colunas - len(linha)))
             linhas.append(linha)
-        tabela = Table(linhas, colWidths=[194 * mm / colunas] * colunas, hAlign="LEFT")
+        tabela = Table(linhas, colWidths=[170 * mm / colunas] * colunas, hAlign="LEFT")
         tabela.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("LINEBELOW", (0, 0), (-1, -1), 0.35, colors.HexColor("#dbe3ed")),
@@ -1427,7 +1472,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
         ]
         tabela = Table(
             linhas,
-            colWidths=[25 * mm, 169 * mm],
+            colWidths=[25 * mm, 145 * mm],
             hAlign="LEFT",
         )
         tabela.setStyle(TableStyle([
@@ -1450,8 +1495,9 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     story = []
     logos_pdf = []
     for nome_logo, limite_largura, limite_altura in (
-        ("logo2.png", 90 * mm, 36 * mm),
-        ("VW_TRANS.png", 72 * mm, 30 * mm),
+        ("logo.png", 60 * mm, 24 * mm),
+        ("LOGO3.jpg", 28 * mm, 30 * mm),
+        ("VW_TRANS.png", 42 * mm, 26 * mm),
     ):
         caminho_logo = os.path.join(app.root_path, "static", nome_logo)
         leitor_logo = ImageReader(caminho_logo)
@@ -1467,8 +1513,8 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
             mask="auto",
         ))
     linha_logos = Table(
-        [[logos_pdf[0], "", logos_pdf[1]]],
-        colWidths=[82 * mm, 30 * mm, 82 * mm],
+        [[logos_pdf[0], "", logos_pdf[1], "", logos_pdf[2]]],
+        colWidths=[66 * mm, 8 * mm, 32 * mm, 8 * mm, 46 * mm],
         hAlign="LEFT",
     )
     linha_logos.setStyle(TableStyle([
@@ -1484,7 +1530,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
             [paragrafo("Caminhões e Ônibus · Proposta sujeita à confirmação das condições comerciais", menor)],
             [paragrafo_formatado(f"<b>Data:</b> {xml_escape(data_pedido)}", menor)],
         ]],
-        colWidths=[140 * mm, 54 * mm],
+        colWidths=[125 * mm, 45 * mm],
     )
     cabecalho.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -1502,6 +1548,13 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
         ("CIDADE", "Cidade"),
         ("UF", "Estado"),
     ], 3))
+    observacoes_cliente = grade_campos(
+        [("OBSERVACOES_CLIENTE", "Observações do cliente")],
+        colunas=1,
+        omitir_vazios=True,
+    )
+    if observacoes_cliente:
+        story.append(observacoes_cliente)
     story.extend(secao("VEÍCULO OFERTADO"))
 
     imagem_pdf = None
@@ -1514,7 +1567,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
             )
         leitor = ImageReader(io.BytesIO(imagem_bytes))
         largura, altura = leitor.getSize()
-        escala = min(32 * mm / largura, 25 * mm / altura)
+        escala = min(32 * mm / largura, 35 * mm / altura)
         imagem_pdf = PdfImage(
             io.BytesIO(imagem_bytes),
             width=largura * escala,
@@ -1545,7 +1598,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
                 menor,
             ),
         ]],
-        colWidths=[75 * mm, 75 * mm] if imagem_pdf else [93 * mm, 93 * mm],
+        colWidths=[60 * mm, 60 * mm] if imagem_pdf else [85 * mm, 85 * mm],
     )
     cartoes_modelo.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -1560,12 +1613,12 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     campos_tecnicos = [
         ("TECNO", "Tecnologia do motor"),
         ("PBT", "PBT"),
+        ("CMT", "CMT"),
         ("ENTRE_EIXOS", "Entre-eixos"),
         ("MOTOR", "Motor"),
         ("POTENCIA", "Potência"),
         ("TRANSMISSAO", "Transmissão"),
         ("SISTEMA_INJECAO", "Sistema de injeção"),
-        ("COMBUSTIVEL", "Combustível"),
     ]
     valores_tecnicos = [
         (chave, rotulo, str(dados_pedido.get(chave, "") or "").strip())
@@ -1573,7 +1626,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
         if str(dados_pedido.get(chave, "") or "").strip()
     ]
     if valores_tecnicos:
-        largura_detalhe = 150 if imagem_pdf else 186
+        largura_detalhe = 120 if imagem_pdf else 170
         larguras_tecnicas = [
             largura_detalhe * 0.18 * mm,
             largura_detalhe * 0.32 * mm,
@@ -1607,10 +1660,10 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     if imagem_pdf:
         bloco_modelo = Table(
             [[imagem_pdf, identificacao_modelo]],
-            colWidths=[36 * mm, 158 * mm],
+            colWidths=[42 * mm, 128 * mm],
         )
     else:
-        bloco_modelo = Table([[identificacao_modelo]], colWidths=[194 * mm])
+        bloco_modelo = Table([[identificacao_modelo]], colWidths=[170 * mm])
     bloco_modelo.setStyle(TableStyle([
         ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -1620,6 +1673,13 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]))
     story.append(bloco_modelo)
+    observacoes_veiculo = grade_campos(
+        [("OBSERVACOES_VEICULO", "Observações do veículo")],
+        colunas=1,
+        omitir_vazios=True,
+    )
+    if observacoes_veiculo:
+        story.append(observacoes_veiculo)
     story.append(Spacer(1, 2))
     story.extend(secao("PLANOS E INFORMAÇÕES COMPLEMENTARES"))
     campos_opcionais_complementares = [
@@ -1651,7 +1711,6 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
         ("FATURANTE", "Faturante"),
         ("CNPJ_FATURANTE", "CNPJ faturante"),
         ("PAGAMENTO", "Pagamento"),
-        ("DGA", "DGA"),
         ("COD_FINAME", "Código FINAME"),
         ("PAC", "PAC nº"),
         ("CLASSIFICACAO_FISCAL", "Classificação fiscal"),
@@ -1661,7 +1720,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     ], 3))
     total = Table(
         [[paragrafo("VALOR TOTAL", total_estilo), paragrafo(dinheiro(dados_pedido.get("VALOR_TOTAL")), total_estilo)]],
-        colWidths=[150 * mm, 44 * mm],
+        colWidths=[132 * mm, 38 * mm],
     )
     total.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), azul),
@@ -1703,7 +1762,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     )
     cliente_assinatura = Table(
         [[paragrafo_formatado(contato_cliente, assinatura_estilo)]],
-        colWidths=[194 * mm],
+        colWidths=[170 * mm],
         hAlign="CENTER",
     )
     cliente_assinatura.setStyle(TableStyle([
@@ -1714,7 +1773,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     ]))
     espaco_assinatura_cliente = Table(
         [[""]],
-        colWidths=[62 * mm, 70 * mm, 62 * mm],
+        colWidths=[51 * mm, 68 * mm, 51 * mm],
         rowHeights=[28],
     )
     espaco_assinatura_cliente.setStyle(TableStyle([
@@ -1730,7 +1789,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
             paragrafo_formatado(contato_superintendente, assinatura_estilo),
             paragrafo_formatado(contato_vendedor, assinatura_estilo),
         ]],
-        colWidths=[97 * mm] * 2,
+        colWidths=[85 * mm] * 2,
         hAlign="CENTER",
     )
     contatos.setStyle(TableStyle([
@@ -1760,7 +1819,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
                 menor,
             ),
         ]],
-        colWidths=[194 * mm / 3] * 3,
+        colWidths=[170 * mm / 3] * 3,
     )
     enderecos_unidades.setStyle(TableStyle([
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
@@ -1881,6 +1940,7 @@ def salvar_pedido_na_planilha(planilha, dados_pedido):
             cols=len(CABECALHOS_PEDIDOS),
         )
 
+    remover_colunas_obsoletas_pedidos(aba_pedidos)
     linhas = aba_pedidos.get_all_values()
     cabecalhos = linhas[0] if linhas and any(str(c).strip() for c in linhas[0]) else []
     if not cabecalhos:
@@ -1980,13 +2040,16 @@ def gerar_pdf_previa_proposta():
         "TECNOLOGIA": "tecnologia",
         "TECNO": "tecnologia_motor",
         "SEGMENTO_FICHA": "segmento_ficha",
+        "SISTEMA_INJECAO": "sistema_injecao",
         "MOTOR": "motor",
         "POTENCIA": "potencia",
         "TRANSMISSAO": "transmissao",
-        "SISTEMA_INJECAO": "sistema_injecao",
+        "CATEGORIA": "categoria",
         "PBT": "pbt",
         "ENTRE_EIXOS": "entre_eixos",
-        "COMBUSTIVEL": "combustivel",
+        "CMT": "cmt",
+        "OBSERVACOES_CLIENTE": "observacoes_cliente",
+        "OBSERVACOES_VEICULO": "observacoes_veiculo",
         "PLANO_MANUTENCAO": "plano_manutencao",
         "RIO": "rio",
         "INFORMACOES_COMPLEMENTARES": "informacoes_complementares",
@@ -1997,7 +2060,6 @@ def gerar_pdf_previa_proposta():
         "FATURANTE": "faturante",
         "CNPJ_FATURANTE": "cnpj_faturante",
         "PAGAMENTO": "pagamento",
-        "DGA": "dga",
         "COD_FINAME": "cod_finame",
         "PAC": "pac",
         "CLASSIFICACAO_FISCAL": "classificacao_fiscal",
@@ -2019,7 +2081,7 @@ def gerar_pdf_previa_proposta():
         "CELULAR_VENDEDOR": str(session.get("celular", "") or ""),
         "EMAIL_VENDEDOR": str(session.get("email_usuario", "") or ""),
         "TIPO": str(request.form.get("modelo_tipo", "") or ""),
-        "CATEGORIA": str(request.form.get("modelo_categoria", "") or ""),
+        "CATEGORIA": str(request.form.get("categoria", "") or "").strip(),
         "QUANTIDADE": int(quantidade),
         "VALOR_UNITARIO": valor_unitario,
         "VALOR_TOTAL": quantidade * valor_unitario,
@@ -2050,20 +2112,35 @@ def gerar_pdf_previa_proposta():
 def atualizar_pedido_na_planilha(planilha, dados_pedido, id_pedido):
     """Atualiza a linha de uma proposta existente sem alterar seu ID."""
     aba_pedidos = planilha.worksheet(ABA_PEDIDOS_FEITOS)
+    remover_colunas_obsoletas_pedidos(aba_pedidos)
     linhas = aba_pedidos.get_all_values()
     if not linhas:
         raise LookupError(f"A aba {ABA_PEDIDOS_FEITOS} não contém propostas.")
 
     cabecalhos = linhas[0]
-    coluna_imagem_modelo = normalizar_chave_planilha("IMAGEM_MODELO_ID")
-    if not any(
-        normalizar_chave_planilha(cabecalho) == coluna_imagem_modelo
-        for cabecalho in cabecalhos
-    ):
-        if aba_pedidos.col_count < len(cabecalhos) + 1:
-            aba_pedidos.add_cols(len(cabecalhos) + 1 - aba_pedidos.col_count)
-        aba_pedidos.update_cell(1, len(cabecalhos) + 1, "IMAGEM_MODELO_ID")
-        cabecalhos.append("IMAGEM_MODELO_ID")
+    indices = {
+        normalizar_chave_planilha(cabecalho): indice
+        for indice, cabecalho in enumerate(cabecalhos)
+        if str(cabecalho).strip()
+    }
+    colunas_necessarias = [
+        cabecalho
+        for cabecalho in CABECALHOS_PEDIDOS
+        if not any(
+            normalizar_chave_planilha(nome_alternativo) in indices
+            for nome_alternativo in (
+                cabecalho,
+                *ALIASES_CABECALHOS_PEDIDOS.get(cabecalho, ()),
+            )
+        )
+    ]
+    colunas_finais = len(cabecalhos) + len(colunas_necessarias)
+    if aba_pedidos.col_count < colunas_finais:
+        aba_pedidos.add_cols(colunas_finais - aba_pedidos.col_count)
+    for cabecalho in colunas_necessarias:
+        aba_pedidos.update_cell(1, len(cabecalhos) + 1, cabecalho)
+        cabecalhos.append(cabecalho)
+
     indices = {
         normalizar_chave_planilha(cabecalho): indice
         for indice, cabecalho in enumerate(cabecalhos)
@@ -6382,10 +6459,15 @@ def acessar_modulo(nome_modulo):
         email_vendedor = str(session.get("email_usuario", "") or "")
         try:
             planilha_pedidos = conectar_google_sheets()
+            try:
+                aba_pedidos = planilha_pedidos.worksheet(ABA_PEDIDOS_FEITOS)
+            except gspread.exceptions.WorksheetNotFound:
+                pass
+            else:
+                remover_colunas_obsoletas_pedidos(aba_pedidos)
             registros_modelos_pedido = obter_registros_com_cache(
                 planilha_pedidos,
                 "Modelos",
-                ttl=0,
                 falhar_em_erro=True,
             )
         except Exception as e:
@@ -6404,19 +6486,16 @@ def acessar_modulo(nome_modulo):
                 registros_opcoes_pedido = obter_registros_com_cache(
                     planilha_pedidos,
                     "Form_Pedido",
-                    ttl=0,
                     falhar_em_erro=True,
                 )
                 registros_pm_pedido = obter_registros_com_cache(
                     planilha_pedidos,
                     "PM",
-                    ttl=0,
                     falhar_em_erro=True,
                 )
                 registros_rio_pedido = obter_registros_com_cache(
                     planilha_pedidos,
                     "RIO",
-                    ttl=0,
                     falhar_em_erro=True,
                 )
             except Exception as e:
@@ -6506,6 +6585,7 @@ def acessar_modulo(nome_modulo):
                         valores_normalizados.add(valor_normalizado)
             return opcoes
 
+        opcoes_categoria_pedido = opcoes_coluna_form_pedido("CATEGORIA")
         opcoes_ano_modelo_pedido = opcoes_coluna_form_pedido(
             "FAB/MODELO",
             "ANO/MODELO",
@@ -6517,7 +6597,6 @@ def acessar_modulo(nome_modulo):
             "PRAZO DE ENTREGA",
             "PRAZO_ENTREGA",
         )
-        opcoes_dga_pedido = opcoes_coluna_form_pedido("DGA")
         opcoes_modalidade_faturamento_pedido = opcoes_coluna_form_pedido(
             "MODALIDADE FATURAMENTO",
             "MOD. FAT.",
@@ -6552,7 +6631,6 @@ def acessar_modulo(nome_modulo):
                     ("Pagamento", opcoes_pagamento_pedido),
                     ("Entrega", opcoes_entrega_pedido),
                     ("Prazo de entrega", opcoes_prazo_entrega_pedido),
-                    ("DGA", opcoes_dga_pedido),
                     ("Modalidade de faturamento", opcoes_modalidade_faturamento_pedido),
                     ("Faturamento", opcoes_faturante_pedido),
                 )
@@ -6561,7 +6639,7 @@ def acessar_modulo(nome_modulo):
             if opcoes_ausentes:
                 erro_pedido = (
                     "Cadastre opções para "
-                    f"{', '.join(opcoes_ausentes)} na aba Form_Pedido."
+                    f"{', '.join(opcoes_ausentes)} nas abas de origem correspondentes."
                 )
 
         modelos_pedido = {}
@@ -6634,6 +6712,10 @@ def acessar_modulo(nome_modulo):
                 "ano_modelo": obter_dado_modelo("FAB/MOD", "ANO/MODELO"),
                 "tecnologia": obter_dado_modelo("TECNOLOGIA"),
                 "tecnologia_motor": obter_dado_modelo("TECNO"),
+                "sistema_injecao": obter_dado_modelo(
+                    "SISTEMA DE INJECAO",
+                    "SISTEMA DE INJEÇÃO",
+                ),
                 "segmento_ficha": obter_dado_modelo("SEGMENTO"),
                 "pbt": obter_dado_modelo("PBT HOMOLOGADO (KG)", "PBT"),
                 "entre_eixos": obter_dado_modelo(
@@ -6650,11 +6732,7 @@ def acessar_modulo(nome_modulo):
                     "TRANSMISSÃO",
                     "TRANSMISAO",
                 ),
-                "sistema_injecao": obter_dado_modelo(
-                    "SISTEMA DE INJECAO",
-                    "SISTEMA DE INJEÇÃO",
-                ),
-                "combustivel": obter_dado_modelo("COMBUSTIVEL", "COMBUSTÍVEL"),
+                "cmt": obter_dado_modelo("CMT"),
                 "categoria": str(registro_modelo.get("CATEGORIA", "") or "").strip(),
                 "descricao": str(
                     registro_modelo.get("DESCRIÇÃO")
@@ -6682,13 +6760,14 @@ def acessar_modulo(nome_modulo):
 
         campos_pedido = (
             "data_pedido", "cliente", "documento_cliente", "telefone_cliente",
-            "email_cliente", "cidade", "uf", "modelo", "modelo_id", "quantidade",
+            "email_cliente", "cidade", "uf", "observacoes_cliente",
+            "modelo", "modelo_id", "categoria", "observacoes_veiculo", "quantidade",
             "valor_unitario", "plano_manutencao", "rio", "ano_modelo",
-            "tecnologia", "tecnologia_motor", "segmento_ficha",
+            "tecnologia", "tecnologia_motor", "sistema_injecao", "segmento_ficha",
             "segmento", "cabine", "motor", "transmissao", "pbt", "entre_eixos",
-            "potencia", "sistema_injecao", "combustivel",
+            "potencia", "cmt",
             "informacoes_complementares", "garantia", "assistencia",
-            "condicoes_pm", "modalidade_faturamento", "faturante", "dga",
+            "condicoes_pm", "modalidade_faturamento", "faturante",
             "cnpj_faturante", "pagamento", "cod_finame", "pac",
             "classificacao_fiscal", "local_entrega", "prazo_entrega",
             "detalhes", "validade",
@@ -6810,10 +6889,10 @@ def acessar_modulo(nome_modulo):
         opcoes_editaveis_pedido = (
             (opcoes_ano_modelo_pedido, "ano_modelo"),
             (opcoes_cabine_pedido, "cabine"),
+            (opcoes_categoria_pedido, "categoria"),
             (opcoes_pagamento_pedido, "pagamento"),
             (opcoes_entrega_pedido, "local_entrega"),
             (opcoes_prazo_entrega_pedido, "prazo_entrega"),
-            (opcoes_dga_pedido, "dga"),
             (opcoes_modalidade_faturamento_pedido, "modalidade_faturamento"),
             (opcoes_faturante_pedido, "faturante"),
             (opcoes_plano_pedido, "plano_manutencao"),
@@ -6855,8 +6934,7 @@ def acessar_modulo(nome_modulo):
                 "motor": dados_pedido["motor"],
                 "potencia": dados_pedido["potencia"],
                 "transmissao": dados_pedido["transmissao"],
-                "sistema_injecao": dados_pedido["sistema_injecao"],
-                "combustivel": dados_pedido["combustivel"],
+                "cmt": dados_pedido["cmt"],
                 "descricao": "",
                 "eficiencia": "",
                 "conforto": "",
@@ -6960,8 +7038,6 @@ def acessar_modulo(nome_modulo):
                 dados_pedido["prazo_entrega"]
                 and dados_pedido["prazo_entrega"]
                 not in dict(opcoes_prazo_entrega_pedido),
-                dados_pedido["dga"]
-                and dados_pedido["dga"] not in dict(opcoes_dga_pedido),
                 dados_pedido["modalidade_faturamento"]
                 and dados_pedido["modalidade_faturamento"]
                 not in dict(opcoes_modalidade_faturamento_pedido),
@@ -7000,10 +7076,12 @@ def acessar_modulo(nome_modulo):
                     "EMAIL_CLIENTE": dados_pedido["email_cliente"],
                     "CIDADE": dados_pedido["cidade"],
                     "UF": dados_pedido["uf"],
+                    "OBSERVACOES_CLIENTE": dados_pedido["observacoes_cliente"],
                     "MODELO": modelo_escolhido["modelo"],
                     "SEGMENTO": dados_pedido["segmento"],
                     "TIPO": modelo_escolhido["tipo"],
-                    "CATEGORIA": modelo_escolhido["categoria"],
+                    "CATEGORIA": dados_pedido["categoria"],
+                    "OBSERVACOES_VEICULO": dados_pedido["observacoes_veiculo"],
                     "QUANTIDADE": int(quantidade_pedido),
                     "VALOR_UNITARIO": valor_unitario_pedido,
                     "VALOR_TOTAL": valor_total_pedido,
@@ -7017,17 +7095,15 @@ def acessar_modulo(nome_modulo):
                     "MOTOR": dados_pedido["motor"],
                     "POTENCIA": dados_pedido["potencia"],
                     "TRANSMISSAO": dados_pedido["transmissao"],
-                    "SISTEMA_INJECAO": dados_pedido["sistema_injecao"],
                     "PBT": dados_pedido["pbt"],
                     "ENTRE_EIXOS": dados_pedido["entre_eixos"],
-                    "COMBUSTIVEL": dados_pedido["combustivel"],
+                    "CMT": dados_pedido["cmt"],
                     "INFORMACOES_COMPLEMENTARES": dados_pedido["informacoes_complementares"],
                     "GARANTIA": dados_pedido["garantia"],
                     "ASSISTENCIA": dados_pedido["assistencia"],
                     "CONDICOES_PM": dados_pedido["condicoes_pm"],
                     "MODALIDADE_FATURAMENTO": dados_pedido["modalidade_faturamento"],
                     "FATURANTE": dados_pedido["faturante"],
-                    "DGA": dados_pedido["dga"],
                     "CNPJ_FATURANTE": dados_pedido["cnpj_faturante"],
                     "PAGAMENTO": dados_pedido["pagamento"],
                     "COD_FINAME": dados_pedido["cod_finame"],
@@ -7142,11 +7218,22 @@ def acessar_modulo(nome_modulo):
             campo_pedido("email_cliente", "E-mail do cliente", "email"),
             campo_pedido("cidade", "Cidade"),
             campo_pedido("uf", "Estado", opcoes=opcoes_uf_pedido),
+            campo_pedido(
+                "observacoes_cliente",
+                "Observações do cliente",
+                "textarea",
+                largura=True,
+            ),
         ))
         campos_caminhao_html = "".join((
             campo_pedido("ano_modelo", "Ano / modelo", opcoes=opcoes_ano_modelo_pedido),
             campo_pedido("cabine", "Cabine", opcoes=opcoes_cabine_pedido),
         ))
+        campo_categoria_html = campo_pedido(
+            "categoria",
+            "Categoria",
+            opcoes=opcoes_categoria_pedido,
+        )
         campos_tecnicos_ocultos_html = "".join(
             f'<input type="hidden" id="{nome}" name="{nome}" '
             f'value="{html.escape(dados_pedido.get(nome, ""), quote=True)}" '
@@ -7155,13 +7242,13 @@ def acessar_modulo(nome_modulo):
                 "tecnologia",
                 "segmento_ficha",
                 "tecnologia_motor",
+                "sistema_injecao",
                 "motor",
                 "transmissao",
                 "pbt",
                 "entre_eixos",
                 "potencia",
-                "sistema_injecao",
-                "combustivel",
+                "cmt",
             )
         )
         campos_modelo_pdf_html = "".join(
@@ -7169,10 +7256,15 @@ def acessar_modulo(nome_modulo):
             f'value="{html.escape(valor, quote=True)}">'
             for nome, valor in (
                 ("modelo_tipo", ""),
-                ("modelo_categoria", ""),
                 ("link_ficha_tecnica", ""),
                 ("imagem_modelo_id", ""),
             )
+        )
+        campo_observacoes_veiculo_html = campo_pedido(
+            "observacoes_veiculo",
+            "Observações do veículo",
+            "textarea",
+            largura=True,
         )
         campos_condicoes_html = "".join((
             campo_pedido("plano_manutencao", "Plano de manutenção", opcoes=opcoes_plano_pedido),
@@ -7191,7 +7283,6 @@ def acessar_modulo(nome_modulo):
             campo_pedido("faturante", "Faturante", opcoes=opcoes_faturante_pedido),
             campo_pedido("cnpj_faturante", "CNPJ do faturante", readonly=True),
             campo_pedido("pagamento", "Pagamento", opcoes=opcoes_pagamento_pedido),
-            campo_pedido("dga", "DGA", opcoes=opcoes_dga_pedido),
             campo_pedido("cod_finame", "Código FINAME"),
             campo_pedido("pac", "PAC nº"),
             campo_pedido("classificacao_fiscal", "Classificação fiscal"),
@@ -7219,7 +7310,7 @@ def acessar_modulo(nome_modulo):
                 f'Proposta <b>{html.escape(pedido_salvo)}</b> {texto_salvo} na planilha '
                 f'<b>{ABA_PEDIDOS_FEITOS}</b>. '
                 f'<a href="{url_for("acessar_modulo", nome_modulo="pedidos", editar=pedido_salvo, imprimir="1")}">'
-                'Imprimir / salvar PDF</a>.'
+                'Visualizar impressão / salvar como PDF</a>.'
                 '</div>'
             )
         pedidos_feitos_html = ""
@@ -7251,7 +7342,7 @@ def acessar_modulo(nome_modulo):
                 acao_pdf = (
                     f'<a class="pedido-btn pedido-btn-secundario pedido-acao-lista" '
                     f'href="{url_for("acessar_modulo", nome_modulo="pedidos", editar=id_pedido_lista, imprimir="1")}">'
-                    'Imprimir / salvar PDF</a>'
+                    'Visualizar impressão / salvar como PDF</a>'
                     if id_pedido_lista else '<span style="color:#94a3b8">ID não registrado</span>'
                 )
                 acao_editar = (
@@ -7353,9 +7444,10 @@ def acessar_modulo(nome_modulo):
               .pedido-alerta-erro{background:#fff5f5;border:1px solid #feb2b2;color:#9b2c2c}
               .pedido-alerta-sucesso{background:#f0fff4;border:1px solid #9ae6b4;color:#276749}
               .pedido-doc{max-width:900px;margin:0 auto;background:#fff;border:1px solid #cbd5e1;padding:32px;color:#0f172a}
-              .pedido-doc-marcas{display:flex;justify-content:center;align-items:center;gap:48px;margin-bottom:5px}
-              .pedido-doc-marcas img{display:block;width:auto;height:auto;max-width:330px;max-height:126px;object-fit:contain}
-              .pedido-doc-marcas img:last-child{max-width:210px;max-height:100px}
+              .pedido-doc-marcas{display:flex;justify-content:center;align-items:center;gap:58px;margin-bottom:5px}
+              .pedido-doc-marcas img{display:block;width:auto;height:auto;max-width:297px;max-height:113.4px;object-fit:contain}
+              .pedido-doc-marcas img:first-child{max-width:237.6px;max-height:90.72px}
+              .pedido-doc-marcas img:last-child{max-width:189px;max-height:90px}
               .pedido-doc-cabecalho{display:flex;justify-content:space-between;gap:12px;align-items:center;border-bottom:2px solid #1e4778;padding-bottom:7px;margin-bottom:10px}
               .pedido-doc-subtitulo{font-size:11px;color:#64748b}
               .pedido-doc-cabecalho p{font-size:11px;color:#64748b;margin:5px 0 0}
@@ -7364,6 +7456,8 @@ def acessar_modulo(nome_modulo):
               .pedido-doc h3{background:#1e4778;color:white;padding:6px 8px;font-size:10px;margin:10px 0 5px}
               .pedido-doc-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 16px;font-size:11px}
               .pedido-doc-meta-vertical{grid-template-columns:minmax(0,1fr);gap:0}
+              .pedido-doc-meta-observacao{grid-template-columns:minmax(0,1fr);gap:0}
+              .pedido-doc-meta-observacao span{white-space:pre-wrap;overflow-wrap:anywhere}
               .pedido-doc-meta div{border-bottom:1px solid #e2e8f0;padding:4px 0;min-height:20px}
               .pedido-doc-meta b{color:#475569}
               .pedido-doc-complementares{width:100%;font-size:11px}
@@ -7393,12 +7487,17 @@ def acessar_modulo(nome_modulo):
               @media(max-width:480px){.pedido-modelo-foto img{height:190px}.pedido-doc-modelo img{height:170px}.pedido-modelo-identificacao{gap:6px}.pedido-modelo-identificacao-item{padding:7px}}
               @media(max-width:480px){.pedido-grid{grid-template-columns:1fr}.pedido-campo-largo{grid-column:auto}}
               @media print{
-                @page{size:A4 portrait;margin:5mm}
+                @page{size:A4 portrait;margin:20mm}
+                html,body{margin:0!important;padding:0!important}
                 body *{visibility:hidden!important}
                 #pedido-impressao,#pedido-impressao *{visibility:visible!important}
-                #pedido-impressao{position:absolute;left:0;right:0;top:0;width:100%;max-width:900px;box-sizing:border-box;margin:0 auto;padding:0;border:0;box-shadow:none}
+                #pedido-impressao{position:absolute;left:0;top:0;width:262mm;max-width:none;box-sizing:border-box;margin:0;padding:0;border:0;box-shadow:none}
+                .pedido-doc{width:262mm;max-width:none;box-sizing:border-box;margin:0;padding:0;border:0}
                 .pedido-editor,.pedido-acoes,.pedido-alerta{display:none!important}
-                #pedido-impressao{zoom:var(--pedido-print-zoom,1);transform-origin:top center}
+                #pedido-impressao{zoom:var(--pedido-print-zoom,.65);transform-origin:top left}
+                .pedido-doc-modelo{display:grid!important;grid-template-columns:minmax(180px,32%) minmax(0,1fr)!important;gap:10px;align-items:center;padding:8px;break-inside:avoid;page-break-inside:avoid}
+                .pedido-doc-modelo img{display:block!important;width:100%;height:145px;max-width:none;object-fit:contain}
+                .pedido-doc-modelo>div{min-width:0}
                 .pedido-doc h3,.pedido-doc-total,.pedido-doc-cabecalho,.pedido-doc-contato,.pedido-doc-validade{-webkit-print-color-adjust:exact;print-color-adjust:exact}
                 a{color:#0f172a;text-decoration:none}
               }
@@ -7445,6 +7544,7 @@ def acessar_modulo(nome_modulo):
                       <select id="modelo" name="modelo_id" required>
                         <option value="">Selecione primeiro o segmento...</option>
                       </select>
+                      {{ campo_categoria|safe }}
                       <a id="pedido-link-ficha" class="pedido-btn pedido-btn-secundario"
                          href="#" target="_blank" rel="noopener noreferrer"
                          style="display:none;margin-top:10px">Ficha Técnica</a>
@@ -7460,11 +7560,12 @@ def acessar_modulo(nome_modulo):
                         <div class="pedido-modelo-identificacao-item"><b>Ano / modelo</b><span data-pedido-preview="ano_modelo">—</span></div>
                         <div class="pedido-modelo-identificacao-item"><b>Cabine</b><span data-pedido-preview="cabine">—</span></div>
                         <div class="pedido-modelo-identificacao-item"><b>Tipo</b><span id="pedido-tipo-modelo">—</span></div>
-                        <div class="pedido-modelo-identificacao-item"><b>Categoria</b><span id="pedido-categoria-modelo">—</span></div>
+                          <div class="pedido-modelo-identificacao-item" data-pedido-categoria-preview><b>Categoria</b><span data-pedido-preview="categoria">—</span></div>
                       </div>
                       <div id="pedido-dados-tecnicos-editor"></div>
                     </div>
                   </div>
+                  <div class="pedido-grid">{{ campo_observacoes_veiculo|safe }}</div>
                 </section>
                 <section class="pedido-card">
                   <h3>3. Planos e informações do veículo</h3>
@@ -7481,13 +7582,14 @@ def acessar_modulo(nome_modulo):
                 <div class="pedido-acoes">
                   <button class="pedido-btn pedido-btn-primario" type="submit" {% if not modelos %}disabled{% endif %}>{% if pedido_edicao_id %}💾 Atualizar proposta{% else %}💾 Salvar proposta{% endif %}</button>
                   {% if pedido_edicao_id %}<a class="pedido-btn pedido-btn-secundario" href="{{ url_for('acessar_modulo', nome_modulo='pedidos', visao='feitos') }}">Cancelar edição</a>{% endif %}
-                  <button class="pedido-btn pedido-btn-secundario" type="button" onclick="imprimirProposta()">📄 Imprimir / salvar PDF</button>
+                  <button class="pedido-btn pedido-btn-secundario" type="button" onclick="imprimirProposta()">🖨️ Visualizar impressão</button>
                 </div>
               </form>
 
               <section class="pedido-doc" id="pedido-impressao">
                 <div class="pedido-doc-marcas">
-                  <img src="{{ url_for('static', filename='logo2.png') }}" alt="Novo Mundo">
+                  <img src="{{ url_for('static', filename='logo.png') }}" alt="Novo Mundo">
+                  <img src="{{ url_for('static', filename='LOGO3.jpg') }}" alt="40 anos">
                   <img src="{{ url_for('static', filename='VW_TRANS.png') }}" alt="Volkswagen Caminhões e Ônibus">
                 </div>
                 <header class="pedido-doc-cabecalho">
@@ -7503,6 +7605,9 @@ def acessar_modulo(nome_modulo):
                   <div><b>Cidade:</b> <span data-pedido-preview="cidade"></span></div>
                   <div><b>Estado:</b> <span data-pedido-preview="uf"></span></div>
                 </div>
+                <div class="pedido-doc-meta pedido-doc-meta-observacao">
+                  <div><b>Observações do cliente:</b> <span data-pedido-preview="observacoes_cliente"></span></div>
+                </div>
                 <h3>VEÍCULO OFERTADO</h3>
                 <div class="pedido-doc-modelo">
                   <img id="pedido-imagem-impressao" alt="Imagem do veículo">
@@ -7513,10 +7618,13 @@ def acessar_modulo(nome_modulo):
                       <div class="pedido-modelo-identificacao-item"><b>Ano / modelo</b><span data-pedido-preview="ano_modelo"></span></div>
                       <div class="pedido-modelo-identificacao-item"><b>Cabine</b><span data-pedido-preview="cabine"></span></div>
                       <div class="pedido-modelo-identificacao-item"><b>Tipo</b><span id="preview-tipo-modelo">—</span></div>
-                      <div class="pedido-modelo-identificacao-item"><b>Categoria</b><span id="preview-categoria-modelo">—</span></div>
+                      <div class="pedido-modelo-identificacao-item" data-pedido-categoria-preview><b>Categoria</b><span data-pedido-preview="categoria">—</span></div>
                     </div>
                     <div id="pedido-dados-tecnicos-impressao"></div>
                   </div>
+                </div>
+                <div class="pedido-doc-meta pedido-doc-meta-observacao">
+                  <div><b>Observações do veículo:</b> <span data-pedido-preview="observacoes_veiculo"></span></div>
                 </div>
                 <h3>PLANOS E INFORMAÇÕES COMPLEMENTARES</h3>
                 <div class="pedido-doc-meta" id="pedido-doc-opcoes-plano" style="display:none">
@@ -7537,7 +7645,6 @@ def acessar_modulo(nome_modulo):
                   <div><b>Faturante:</b> <span data-pedido-preview="faturante"></span></div>
                   <div><b>CNPJ faturante:</b> <span data-pedido-preview="cnpj_faturante"></span></div>
                   <div><b>Pagamento:</b> <span data-pedido-preview="pagamento"></span></div>
-                  <div><b>DGA:</b> <span data-pedido-preview="dga"></span></div>
                   <div><b>Código FINAME:</b> <span data-pedido-preview="cod_finame"></span></div>
                   <div><b>PAC nº:</b> <span data-pedido-preview="pac"></span></div>
                   <div><b>Classificação fiscal:</b> <span data-pedido-preview="classificacao_fiscal"></span></div>
@@ -7716,12 +7823,12 @@ def acessar_modulo(nome_modulo):
                 const camposTecnicosPedido=[
                   ['TECNOLOGIA DO MOTOR','tecnologia_motor'],
                   ['PBT','pbt'],
+                  ['CMT','cmt'],
                   ['ENTRE-EIXOS','entre_eixos'],
                   ['MOTOR','motor'],
                   ['POTÊNCIA','potencia'],
                   ['TRANSMISSÃO','transmissao'],
-                  ['SISTEMA DE INJEÇÃO','sistema_injecao'],
-                  ['COMBUSTÍVEL','combustivel']
+                  ['SISTEMA DE INJEÇÃO','sistema_injecao']
                 ];
                 function renderizarDadosTecnicos(container,modelo){
                   if(!container) return;
@@ -7821,7 +7928,6 @@ def acessar_modulo(nome_modulo):
                     campo('modelo_nome').value='';
                     campo('segmento_ficha').value='';
                     campo('modelo_tipo').value='';
-                    campo('modelo_categoria').value='';
                     campo('link_ficha_tecnica').value='';
                     campo('imagem_modelo_id').value='';
                     img.style.display='none'; imgPrint.style.display='none';
@@ -7829,28 +7935,25 @@ def acessar_modulo(nome_modulo):
                     document.getElementById('pedido-dados-tecnicos-editor').replaceChildren();
                     document.getElementById('pedido-dados-tecnicos-impressao').replaceChildren();
                     document.getElementById('pedido-tipo-modelo').textContent='—';
-                    document.getElementById('pedido-categoria-modelo').textContent='—';
                     document.getElementById('preview-tipo-modelo').textContent='—';
-                    document.getElementById('preview-categoria-modelo').textContent='—';
                     ficha.removeAttribute('href');
                     ficha.style.display='none';
                     sincronizarPreview();
                     return;
                   }
-                  const categoria=m.categoria || '';
                   const camposTecnicos={
                     ano_modelo:'ano_modelo',
                     tecnologia:'tecnologia',
                     tecnologia_motor:'tecnologia_motor',
+                    sistema_injecao:'sistema_injecao',
                     segmento_ficha:'segmento_ficha',
                     cabine:'cabine',
                     motor:'motor',
                     potencia:'potencia',
                     transmissao:'transmissao',
-                    sistema_injecao:'sistema_injecao',
                     pbt:'pbt',
                     entre_eixos:'entre_eixos',
-                    combustivel:'combustivel'
+                    cmt:'cmt'
                   };
                   const trocarModelo=modeloTecnicoAplicado && modeloTecnicoAplicado!==m.id;
                   Object.entries(camposTecnicos).forEach(([nome,chave])=>{
@@ -7860,7 +7963,6 @@ def acessar_modulo(nome_modulo):
                   modeloTecnicoAplicado=m.id;
                   campo('modelo_nome').value=m.modelo;
                   campo('modelo_tipo').value=m.tipo || '';
-                  campo('modelo_categoria').value=categoria;
                   campo('link_ficha_tecnica').value=m.link || '';
                   campo('imagem_modelo_id').value=m.imagem_id || '';
                   [img,imgPrint].forEach(el=>{
@@ -7869,9 +7971,7 @@ def acessar_modulo(nome_modulo):
                   });
                   document.getElementById('pedido-detalhes-modelo-titulo').textContent=m.modelo;
                   document.getElementById('pedido-tipo-modelo').textContent=m.tipo || '—';
-                  document.getElementById('pedido-categoria-modelo').textContent=categoria || '—';
                   document.getElementById('preview-tipo-modelo').textContent=m.tipo || '—';
-                  document.getElementById('preview-categoria-modelo').textContent=categoria || '—';
                   renderizarDadosTecnicos(
                     document.getElementById('pedido-dados-tecnicos-editor'),
                     m,
@@ -7902,6 +8002,14 @@ def acessar_modulo(nome_modulo):
                         if(opcional) opcional.style.display=el.value ? '' : 'none';
                       }
                     });
+                  });
+                  document.querySelectorAll('[data-pedido-categoria-preview]').forEach(item=>{
+                    const categoria=valorCampo('categoria')
+                      .normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toLocaleLowerCase('pt-BR');
+                    item.style.display=
+                      categoria && !['selecione','selecione...','selecione uma opcao'].includes(categoria)
+                        ? ''
+                        : 'none';
                   });
                   const grupoOpcoesPlano=document.getElementById('pedido-doc-opcoes-plano');
                   if(grupoOpcoesPlano){
@@ -7963,8 +8071,8 @@ def acessar_modulo(nome_modulo):
                 botoesSegmento.forEach(botao=>botao.addEventListener('click',()=>{
                   segmentoInput.value=botao.dataset.segmento;
                   ['ano_modelo','tecnologia','tecnologia_motor','segmento_ficha',
-                    'cabine','motor','potencia','transmissao','sistema_injecao',
-                    'pbt','entre_eixos','combustivel'].forEach(nome=>{
+                    'cabine','motor','potencia','transmissao',
+                    'pbt','entre_eixos','cmt'].forEach(nome=>{
                     const el=campo(nome);
                     if(el) el.value='';
                   });
@@ -7977,19 +8085,8 @@ def acessar_modulo(nome_modulo):
                   const formulario=document.getElementById('formPedido');
                   if(formulario && !formulario.reportValidity()) return;
                   if(!documentoImpressao) return;
-                  documentoImpressao.style.setProperty('--pedido-print-zoom','1');
-                  requestAnimationFrame(()=>{
-                    const pixelsPorMm=96/25.4;
-                    const larguraDisponivel=194*pixelsPorMm;
-                    const alturaDisponivel=281*pixelsPorMm;
-                    const escala=Math.min(
-                      1,
-                      larguraDisponivel/documentoImpressao.offsetWidth,
-                      alturaDisponivel/documentoImpressao.scrollHeight
-                    )*0.99;
-                    documentoImpressao.style.setProperty('--pedido-print-zoom',String(escala));
-                    requestAnimationFrame(()=>window.print());
-                  });
+                  documentoImpressao.style.setProperty('--pedido-print-zoom','.65');
+                  requestAnimationFrame(()=>window.print());
                 };
                 const documentoImpressao=document.getElementById('pedido-impressao');
                 window.addEventListener('afterprint',()=>{
@@ -8028,6 +8125,8 @@ def acessar_modulo(nome_modulo):
             ),
             campos_cliente=campos_cliente_html,
             campos_caminhao=campos_caminhao_html,
+            campo_categoria=campo_categoria_html,
+            campo_observacoes_veiculo=campo_observacoes_veiculo_html,
             campos_tecnicos_ocultos=campos_tecnicos_ocultos_html,
             campos_modelo_pdf=campos_modelo_pdf_html,
             campos_condicoes=campos_condicoes_html,
@@ -11051,7 +11150,6 @@ def acessar_modulo(nome_modulo):
             dados_modelos = obter_registros_com_cache(
                 planilha,
                 "Modelos",
-                ttl=0,
                 falhar_em_erro=True,
             )
             aliases_modelo = {
@@ -11195,6 +11293,7 @@ def acessar_modulo(nome_modulo):
                         linhas_dados_tecnicos = [
                             ("Tecnologia do motor", obter_dado_tecnico("TECNO")),
                             ("PBT", obter_dado_tecnico("PBT", "PBT HOMOLOGADO (KG)")),
+                            ("CMT", obter_dado_tecnico("CMT")),
                             (
                                 "Entre-eixos",
                                 obter_dado_tecnico(
@@ -11216,11 +11315,10 @@ def acessar_modulo(nome_modulo):
                             ),
                             (
                                 "Sistema de injeção",
-                                obter_dado_tecnico("SISTEMA DE INJECAO", "SISTEMA DE INJEÇÃO"),
-                            ),
-                            (
-                                "Combustível",
-                                obter_dado_tecnico("COMBUSTIVEL", "COMBUSTÍVEL"),
+                                obter_dado_tecnico(
+                                    "SISTEMA DE INJECAO",
+                                    "SISTEMA DE INJEÇÃO",
+                                ),
                             ),
                         ]
                         linhas_dados_tecnicos = [

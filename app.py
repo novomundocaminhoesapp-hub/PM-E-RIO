@@ -10622,10 +10622,13 @@ def acessar_modulo(nome_modulo):
 
                     texto_whatsapp = f"📦 *Produto:* 🔧 {prod}\n\n🎯 *Foco:* {foco}\n\n📝 *Descrição:* {descricao}\n\n💰 *Valor:* {valor}\n\n⚠️ *Nota:* Proposta válida para {validade_texto}.\n\n🎬 *Assista ao vídeo explicativo aqui:* {video}\n\n👤 *Contato:* {contato_texto}"
                     link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(str(texto_whatsapp))
+                    texto_whatsapp_video = f"🎬 *Vídeo explicativo — Telemetria RIO: {prod}*\n\n🔗 {video}\n\n👤 *Contato:* {contato_texto}"
+                    link_wpp_video = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(texto_whatsapp_video)
                     url_video_embed = converter_para_embed(video)
 
                     btn_ver_video = f'<button type="button" class="btn-acao btn-video" onclick="abrirVideoModal(\'{url_video_embed}\')">▶ Assistir Vídeo</button>' if video else ""
-                    btn_enviar_wpp = f'<a href="{link_wpp_compartilhar}" target="_blank" rel="noopener noreferrer" class="btn-acao btn-whatsapp">📤 Enviar WhatsApp</a>'
+                    btn_enviar_wpp_completo = f'<a href="{link_wpp_compartilhar}" target="_blank" rel="noopener noreferrer" class="btn-acao btn-whatsapp">📤 Informação completa</a>'
+                    btn_enviar_wpp_video = f'<a href="{link_wpp_video}" target="_blank" rel="noopener noreferrer" class="btn-acao btn-whatsapp">📤 Somente o vídeo</a>' if video else ""
 
                     conteudo = f"""
                     <div>
@@ -10657,7 +10660,8 @@ def acessar_modulo(nome_modulo):
                                 <div class="detalhe-label" style="margin-bottom: 6px;">Ações Rápidas</div>
                                 <div class="acoes-produto">
                                     {btn_ver_video}
-                                    {btn_enviar_wpp}
+                                    {btn_enviar_wpp_completo}
+                                    {btn_enviar_wpp_video}
                                 </div>
                             </div>
                         </div>
@@ -10735,10 +10739,13 @@ def acessar_modulo(nome_modulo):
 
                     texto_whatsapp = f"📦 *Plano de Manutenção:* 🔧 {prod}\n\n🎯 *Foco:* {foco}\n\n📝 *Descrição:* {descricao}\n\n🛡️ *Coberturas:* {coberturas}\n\n⚠️ *Nota:* Proposta válida para {validade_texto}.\n\n🎬 *Assista ao vídeo explicativo aqui:* {video}\n\n👤 *Contato:* {contato_texto}"
                     link_wpp_compartilhar = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(str(texto_whatsapp))
+                    texto_whatsapp_video = f"🎬 *Vídeo explicativo — Plano de Manutenção: {prod}*\n\n🔗 {video}\n\n👤 *Contato:* {contato_texto}"
+                    link_wpp_video = "https://api.whatsapp.com/send?text=" + urllib.parse.quote(texto_whatsapp_video)
                     url_video_embed = converter_para_embed(video)
 
                     btn_ver_video = f'<button type="button" class="btn-acao btn-video" onclick="abrirVideoModal(\'{url_video_embed}\')">▶ Assistir Vídeo</button>' if video else ""
-                    btn_enviar_wpp = f'<a href="{link_wpp_compartilhar}" target="_blank" rel="noopener noreferrer" class="btn-acao btn-whatsapp">📤 Enviar WhatsApp</a>'
+                    btn_enviar_wpp_completo = f'<a href="{link_wpp_compartilhar}" target="_blank" rel="noopener noreferrer" class="btn-acao btn-whatsapp">📤 Informação completa</a>'
+                    btn_enviar_wpp_video = f'<a href="{link_wpp_video}" target="_blank" rel="noopener noreferrer" class="btn-acao btn-whatsapp">📤 Somente o vídeo</a>' if video else ""
 
                     bloco_cobertura_html = ""
                     if coberturas:
@@ -10780,7 +10787,8 @@ def acessar_modulo(nome_modulo):
                                 <div class="detalhe-label" style="margin-bottom: 6px;">Ações Rápidas</div>
                                 <div class="acoes-produto">
                                     {btn_ver_video}
-                                    {btn_enviar_wpp}
+                                    {btn_enviar_wpp_completo}
+                                    {btn_enviar_wpp_video}
                                 </div>
                             </div>
                         </div>

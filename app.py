@@ -10,6 +10,7 @@ import hashlib
 import html
 import io
 import mimetypes
+import threading
 from google import genai
 
 from flask import Flask, abort, redirect, render_template_string, request, session, url_for, jsonify, send_file
@@ -54,6 +55,15 @@ NOMES_MODULOS = {
     "traton": "Simulador Traton"
 }
 
+MODULOS_ACESSO_LIVRE = frozenset({
+    "rio",
+    "pm",
+    "informes",
+    "fichatecnica",
+    "traton",
+    "argumentos",
+})
+
 escopos = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -94,9 +104,14 @@ def conectar_google_sheets():
 
 def conectar_google_drive():
     credenciais_oauth = os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
+    arquivo_oauth = os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS_FILE", "").strip()
     if credenciais_oauth:
         credenciais = OAuthCredentials.from_authorized_user_info(
             json.loads(credenciais_oauth), scopes=escopos
+        )
+    elif arquivo_oauth:
+        credenciais = OAuthCredentials.from_authorized_user_file(
+            arquivo_oauth, scopes=escopos
         )
     elif "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
         credenciais = Credentials.from_service_account_info(
@@ -129,6 +144,62 @@ def nomear_comprovante_venda(cliente, produto, chassis, nome_original):
     return f"{'_'.join(componentes)}_{time.time_ns()}{extensao}"
 
 
+def encontrar_comprovante_venda_drive(arquivos, cliente, produtos=(), chassis=""):
+    cliente_slug = secure_filename(str(cliente or "").strip())[:40].lower().strip("_")
+    if not cliente_slug:
+        return ""
+
+    produto_slugs = [
+        secure_filename(str(produto or "").strip()).lower().strip("_")
+        for produto in produtos
+        if str(produto or "").strip()
+    ]
+    chassis_slug = normalizar_chassi(chassis)
+    candidatos = []
+    extensoes_imagem = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+
+    for arquivo in arquivos:
+        nome = os.path.basename(str(arquivo.get("name", "") or ""))
+        mime = str(arquivo.get("mimeType", "") or "").lower()
+        extensao = os.path.splitext(nome)[1].lower()
+        if not (mime.startswith("image/") or extensao in extensoes_imagem):
+            continue
+
+        nome_slug = secure_filename(nome).lower()
+        if not nome_slug.startswith(f"{cliente_slug}_"):
+            continue
+
+        pontuacao = 0
+        nome_normalizado = normalizar_identidade_comercial(nome)
+        if chassis_slug and chassis_slug in nome_normalizado:
+            pontuacao += 100
+
+        produtos_encontrados = sum(
+            1
+            for produto_slug in produto_slugs
+            if produto_slug and normalizar_identidade_comercial(produto_slug) in nome_normalizado
+        )
+        if produto_slugs and not produtos_encontrados and not (chassis_slug and chassis_slug in nome_normalizado):
+            continue
+        pontuacao += produtos_encontrados * 10
+
+        file_id = str(arquivo.get("id", "") or "").strip()
+        link = str(arquivo.get("webViewLink", "") or "").strip()
+        if not link and file_id:
+            link = f"https://drive.google.com/file/d/{file_id}/view?usp=drivesdk"
+        if link:
+            candidatos.append((pontuacao, link))
+
+    if not candidatos:
+        return ""
+
+    maior_pontuacao = max(pontuacao for pontuacao, _ in candidatos)
+    melhores_links = {
+        link for pontuacao, link in candidatos if pontuacao == maior_pontuacao
+    }
+    return melhores_links.pop() if len(melhores_links) == 1 else ""
+
+
 def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_arquivo=None):
     """Envia comprovantes para a pasta de vendas no Drive."""
     try:
@@ -159,11 +230,12 @@ def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_a
         if (
             not pasta_upload.get("driveId")
             and not os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
+            and not os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS_FILE", "").strip()
         ):
             raise RuntimeError(
-                "Upload_Vendas está no Meu Drive. Contas de serviço não têm cota de armazenamento; "
-                "configure GOOGLE_DRIVE_OAUTH_CREDENTIALS com OAuth de um usuário Google "
-                "ou mova a pasta para uma Unidade compartilhada."
+                "Upload_Vendas está no Meu Drive, mas o app está conectado apenas "
+                "por conta de serviço, que não tem cota própria para novos arquivos. "
+                "Configure OAuth de usuário ou mova a pasta para uma Unidade compartilhada."
             )
 
         nome_original = secure_filename(os.path.basename(str(arquivo.filename or "comprovante"))) or "comprovante"
@@ -206,9 +278,10 @@ def url_comprovante_no_app(link):
     return f"/comprovante-drive/{file_id}" if file_id else ""
 
 
-def migrar_comprovantes_static(aba_vendas):
+def migrar_comprovantes_static(aba_vendas, linhas=None):
     """Migra para o Drive links locais cujos arquivos ainda existem no servidor."""
-    linhas = aba_vendas.get_all_values()
+    if linhas is None:
+        linhas = aba_vendas.get_all_values()
     if len(linhas) < 2:
         return 0
 
@@ -302,13 +375,17 @@ def servir_comprovante_drive(file_id):
 
 @app.route("/pedido-arquivo/<file_id>")
 def servir_arquivo_pedido(file_id):
-    if not session.get("logado") or not session.get("perm_pedidos"):
+    if not session.get("logado") or not usuario_pode_acessar_pedidos():
         abort(404)
 
     try:
         planilha = conectar_google_sheets()
         email_vendedor = str(session.get("email_usuario", "") or "")
-        pedidos = listar_pedidos_vendedor(planilha, email_vendedor)
+        pedidos = listar_pedidos_vendedor(
+            planilha,
+            email_vendedor,
+            incluir_todos=usuario_eh_gestao(session.get("perfil")),
+        )
         pedido = next(
             (
                 item for item in pedidos
@@ -349,6 +426,12 @@ CACHE_PLANILHAS = {
     "dados": {},
     "timestamps": {}
 }
+CACHE_LINHAS_PLANILHAS = {
+    "dados": {},
+    "timestamps": {},
+}
+CACHE_ABAS_PLANILHA = {}
+CACHE_PLANILHAS_LOCK = threading.RLock()
 TEMPO_CACHE_PLANILHA_SEGS = 600  # 10 minutos por aba
 CACHE_PLANILHA_CLIENTE = {"cliente": None, "timestamp": 0}
 TEMPO_CACHE_CLIENTE_SEGS = 300
@@ -545,8 +628,18 @@ def montar_linha_venda_pm(registro, cabecalhos):
         "chassis": "CHASSIS",
         "chassi": "CHASSIS",
         "anexo 1": "ANEXO 1",
+        "comprovante": "ANEXO 1",
+        "link comprovante": "ANEXO 1",
+        "link de compartilhamento": "ANEXO 1",
+        "link compartilhamento": "ANEXO 1",
         "anexo 2": "ANEXO 2",
         "anexo 3": "ANEXO 3",
+        "contato": "CONTATO DO CLIENTE",
+        "contato do cliente": "CONTATO DO CLIENTE",
+        "telefone": "TELEFONE",
+        "telefone do cliente": "TELEFONE",
+        "comentario": "COMENTÁRIOS",
+        "comentarios": "COMENTÁRIOS",
     }
     plano = str(
         registro.get("P. MANUTENÇÃO", "")
@@ -577,6 +670,9 @@ def montar_linha_venda_pm(registro, cabecalhos):
         "ANEXO 1": str(registro.get("ANEXO 1", "")).strip(),
         "ANEXO 2": str(registro.get("ANEXO 2", "")).strip(),
         "ANEXO 3": str(registro.get("ANEXO 3", "")).strip(),
+        "CONTATO DO CLIENTE": str(registro.get("CONTATO DO CLIENTE", "")).strip(),
+        "TELEFONE": str(registro.get("TELEFONE", "")).strip(),
+        "COMENTÁRIOS": str(registro.get("COMENTÁRIOS", "")).strip(),
     }
     return [
         valores.get(aliases.get(normalizar_chave_planilha(cabecalho), ""), "")
@@ -602,7 +698,90 @@ def normalizar_identidade_comercial(valor):
 
 
 def usuario_eh_gestao(perfil):
-    return str(perfil or "").strip().upper() in {"ADM", "DIRETOR", "GERENTE"}
+    perfil_normalizado = normalizar_chave_planilha(perfil).replace(" ", "").upper()
+    return perfil_normalizado in {
+        "ADM",
+        "DIRETOR",
+        "GERENTE",
+        "SUPERINTENDENTE",
+        "SUPERITENDENTE",
+    }
+
+
+@app.context_processor
+def disponibilizar_perfil_gestao():
+    return {
+        "perfil_eh_gestao": usuario_eh_gestao(session.get("perfil")),
+        "modulos_acesso_livre": MODULOS_ACESSO_LIVRE,
+    }
+
+
+def usuario_pode_acessar_pedidos():
+    return bool(session.get("perm_pedidos")) or usuario_eh_gestao(
+        session.get("perfil")
+    )
+
+
+def usuario_pode_acessar_modulo(nome_modulo):
+    if nome_modulo not in NOMES_MODULOS:
+        return False
+    if (
+        usuario_eh_gestao(session.get("perfil"))
+        or nome_modulo in MODULOS_ACESSO_LIVRE
+    ):
+        return True
+
+    permissoes_por_modulo = {
+        "valores": "perm_valores",
+        "negocios": "perm_negocios",
+        "visitas": "perm_visitas",
+        "pedidos": None,
+        "vendas": "perm_vendas",
+        "dashboard": "perm_dashboard",
+        "camp_vw_prev": "perm_camp_vw_prev",
+    }
+    if nome_modulo == "pedidos":
+        return usuario_pode_acessar_pedidos()
+    if nome_modulo == "dashboard":
+        perfil = normalizar_chave_planilha(session.get("perfil", "")).upper()
+        if "CONSULTOR" not in perfil:
+            return False
+    chave_permissao = permissoes_por_modulo.get(nome_modulo)
+    return bool(chave_permissao and session.get(chave_permissao, False))
+
+
+def filtrar_atualizacoes_por_acesso(atualizacoes):
+    permitidas = []
+    for atualizacao in atualizacoes:
+        caminho = urllib.parse.urlparse(
+            str(atualizacao.get("link", ""))
+        ).path
+        partes = caminho.strip("/").split("/")
+        if (
+            len(partes) == 2
+            and partes[0] == "modulo"
+            and usuario_pode_acessar_modulo(partes[1])
+        ):
+            permitidas.append(atualizacao)
+    return permitidas
+
+
+def pedido_esta_liberado(pedido):
+    return normalizar_chave_planilha(
+        pedido.get("STATUS_LIBERACAO", "")
+    ) == "liberado"
+
+
+def calcular_data_validade_proposta(data_proposta, validade_dias):
+    dias_permitidos = {"5", "10", "15", "20", "25", "30"}
+    dias = str(validade_dias or "").strip()
+    if dias not in dias_permitidos:
+        raise ValueError("Selecione uma validade entre 5 e 30 dias.")
+    try:
+        data_base = datetime.strptime(str(data_proposta).strip(), "%Y-%m-%d")
+    except ValueError as erro:
+        raise ValueError("Informe uma data de proposta válida.") from erro
+    return (data_base + timedelta(days=int(dias))).strftime("%Y-%m-%d")
 
 
 def registro_pertence_ao_usuario(registro, nome_usuario):
@@ -640,15 +819,24 @@ def garantir_colunas_venda_pm(aba_vendas):
         cabecalhos = [
             "CLIENTE", "P. MANUTENÇÃO", "RIO", "DATA DA VENDA", "MODELO",
             "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO",
-            "CHASSIS",
+            "CHASSIS", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS",
         ]
         aba_vendas.append_row(cabecalhos)
         return cabecalhos
 
-    colunas_existentes = {normalizar_chave_planilha(nome) for nome in cabecalhos}
+    colunas_existentes = {
+        chave_cabecalho_negocios_pm(nome) for nome in cabecalhos
+    }
     novas_colunas = [
-        nome for nome in ("CHASSIS",)
-        if normalizar_chave_planilha(nome) not in colunas_existentes
+        nome
+        for nome in (
+            "ANEXO 1",
+            "CHASSIS",
+            "CONTATO DO CLIENTE",
+            "TELEFONE",
+            "COMENTÁRIOS",
+        )
+        if chave_cabecalho_negocios_pm(nome) not in colunas_existentes
     ]
     if novas_colunas:
         colunas_necessarias = len(cabecalhos) + len(novas_colunas)
@@ -658,6 +846,87 @@ def garantir_colunas_venda_pm(aba_vendas):
             cabecalhos.append(nome)
             aba_vendas.update_cell(1, len(cabecalhos), nome)
     return cabecalhos
+
+
+ALIASES_CABECALHO_NEGOCIOS_PM = {
+    "chassi": "chassis",
+    "no do chassi": "chassis",
+    "numero do chassi": "chassis",
+    "plano manutencao": "plano de manutencao",
+    "p manutencao": "plano de manutencao",
+    "contato": "contato do cliente",
+    "telefone cliente": "telefone",
+    "telefone do cliente": "telefone",
+    "observacoes": "comentarios",
+    "observacoes gerais": "comentarios",
+    "comprovante": "anexo 1",
+    "link comprovante": "anexo 1",
+    "link de compartilhamento": "anexo 1",
+    "link compartilhamento": "anexo 1",
+}
+
+CABECALHOS_NEGOCIOS_PM = [
+    "TEMPERATURA",
+    "DATA",
+    "VENDEDOR",
+    "CLIENTE",
+    "MODELO",
+    "CHASSIS",
+    "PLANO DE MANUTENÇÃO",
+    "RIO",
+    "CONTATO DO CLIENTE",
+    "TELEFONE",
+    "COMENTÁRIOS",
+    "ANEXO 1",
+]
+
+
+def chave_cabecalho_negocios_pm(cabecalho):
+    chave = normalizar_chave_planilha(cabecalho)
+    return ALIASES_CABECALHO_NEGOCIOS_PM.get(chave, chave)
+
+
+def garantir_colunas_negocios_pm(aba_negocios):
+    cabecalhos = aba_negocios.row_values(1)
+    if not cabecalhos:
+        aba_negocios.append_row(CABECALHOS_NEGOCIOS_PM)
+        return list(CABECALHOS_NEGOCIOS_PM)
+
+    chaves_existentes = {
+        chave_cabecalho_negocios_pm(cabecalho) for cabecalho in cabecalhos
+    }
+    novas_colunas = [
+        cabecalho
+        for cabecalho in CABECALHOS_NEGOCIOS_PM
+        if chave_cabecalho_negocios_pm(cabecalho) not in chaves_existentes
+    ]
+    if novas_colunas:
+        quantidade_colunas_necessarias = len(cabecalhos) + len(novas_colunas)
+        if quantidade_colunas_necessarias > aba_negocios.col_count:
+            aba_negocios.add_cols(
+                quantidade_colunas_necessarias - aba_negocios.col_count
+            )
+        for cabecalho in novas_colunas:
+            cabecalhos.append(cabecalho)
+            aba_negocios.update_cell(1, len(cabecalhos), cabecalho)
+    return cabecalhos
+
+
+def montar_linha_negocio_pm(registro, cabecalhos):
+    valores = {
+        chave_cabecalho_negocios_pm(chave): str(valor or "").strip()
+        for chave, valor in registro.items()
+    }
+    produto = valores.get("produto", "")
+    if produto and not valores.get("plano de manutencao") and not valores.get("rio"):
+        partes_produto = produto.split(" / ", 1)
+        valores["plano de manutencao"] = partes_produto[0].strip()
+        if len(partes_produto) > 1:
+            valores["rio"] = partes_produto[1].strip()
+    return [
+        valores.get(chave_cabecalho_negocios_pm(cabecalho), "")
+        for cabecalho in cabecalhos
+    ]
 
 
 def obter_numero_contrato(registro):
@@ -1078,33 +1347,70 @@ def carregar_dados_login():
 def obter_registros_com_cache(planilha, nome_aba, ttl=None, falhar_em_erro=False):
     """Lê uma aba com cache independente por aba."""
     global CACHE_PLANILHAS
-    agora = time.time()
-    ttl = TEMPO_CACHE_ABAS.get(nome_aba, TEMPO_CACHE_PLANILHA_SEGS) if ttl is None else ttl
-    timestamp = CACHE_PLANILHAS["timestamps"].get(nome_aba, 0)
+    with CACHE_PLANILHAS_LOCK:
+        agora = time.time()
+        ttl = TEMPO_CACHE_ABAS.get(nome_aba, TEMPO_CACHE_PLANILHA_SEGS) if ttl is None else ttl
+        timestamp = CACHE_PLANILHAS["timestamps"].get(nome_aba, 0)
 
-    if (nome_aba not in CACHE_PLANILHAS["dados"]) or (agora - timestamp > ttl):
-        inicio_leitura = time.perf_counter()
-        try:
-            aba = planilha.worksheet(nome_aba)
-            registros = obter_registros_seguros(aba)
-            CACHE_PLANILHAS["dados"][nome_aba] = registros
-            CACHE_PLANILHAS["timestamps"][nome_aba] = agora
-            duracao_ms = (time.perf_counter() - inicio_leitura) * 1000
-            print(f"Cache Sheets miss: aba={nome_aba} linhas={len(registros)} duracao_ms={duracao_ms:.0f}")
-        except Exception as e:
-            duracao_ms = (time.perf_counter() - inicio_leitura) * 1000
-            print(f"Erro ao carregar aba {nome_aba} duracao_ms={duracao_ms:.0f}: {e}")
-            if falhar_em_erro:
-                raise
-            return []
-    return CACHE_PLANILHAS["dados"].get(nome_aba, [])
+        if (nome_aba not in CACHE_PLANILHAS["dados"]) or (agora - timestamp > ttl):
+            inicio_leitura = time.perf_counter()
+            try:
+                aba = planilha.worksheet(nome_aba)
+                registros = obter_registros_seguros(aba)
+                CACHE_PLANILHAS["dados"][nome_aba] = registros
+                CACHE_PLANILHAS["timestamps"][nome_aba] = agora
+                duracao_ms = (time.perf_counter() - inicio_leitura) * 1000
+                print(f"Cache Sheets miss: aba={nome_aba} linhas={len(registros)} duracao_ms={duracao_ms:.0f}")
+            except Exception as e:
+                duracao_ms = (time.perf_counter() - inicio_leitura) * 1000
+                print(f"Erro ao carregar aba {nome_aba} duracao_ms={duracao_ms:.0f}: {e}")
+                if falhar_em_erro:
+                    raise
+                return []
+        return CACHE_PLANILHAS["dados"].get(nome_aba, [])
+
+
+def linhas_aba_em_cache(nome_aba, ttl=None):
+    ttl = TEMPO_CACHE_ABAS.get(nome_aba, TEMPO_CACHE_PLANILHA_SEGS) if ttl is None else ttl
+    with CACHE_PLANILHAS_LOCK:
+        timestamp = CACHE_LINHAS_PLANILHAS["timestamps"].get(nome_aba, 0)
+        return (
+            nome_aba in CACHE_LINHAS_PLANILHAS["dados"]
+            and time.time() - timestamp <= ttl
+        )
+
+
+def obter_aba_com_cache(planilha, nome_aba):
+    chave = (str(planilha.id), nome_aba)
+    with CACHE_PLANILHAS_LOCK:
+        if chave not in CACHE_ABAS_PLANILHA:
+            CACHE_ABAS_PLANILHA[chave] = planilha.worksheet(nome_aba)
+        return CACHE_ABAS_PLANILHA[chave]
+
+
+def obter_linhas_com_cache(aba, nome_aba, ttl=None):
+    """Retorna as linhas de uma aba reutilizando a leitura recente do Sheets."""
+    ttl = TEMPO_CACHE_ABAS.get(nome_aba, TEMPO_CACHE_PLANILHA_SEGS) if ttl is None else ttl
+    with CACHE_PLANILHAS_LOCK:
+        timestamp = CACHE_LINHAS_PLANILHAS["timestamps"].get(nome_aba, 0)
+        if (
+            nome_aba not in CACHE_LINHAS_PLANILHAS["dados"]
+            or time.time() - timestamp > ttl
+        ):
+            linhas = aba.get_all_values()
+            CACHE_LINHAS_PLANILHAS["dados"][nome_aba] = linhas
+            CACHE_LINHAS_PLANILHAS["timestamps"][nome_aba] = time.time()
+        return CACHE_LINHAS_PLANILHAS["dados"][nome_aba]
 
 
 def invalidar_cache_ab_as(*nomes_abas):
     global CACHE_LOGIN_DADOS
-    for nome_aba in nomes_abas:
-        CACHE_PLANILHAS["dados"].pop(nome_aba, None)
-        CACHE_PLANILHAS["timestamps"].pop(nome_aba, None)
+    with CACHE_PLANILHAS_LOCK:
+        for nome_aba in nomes_abas:
+            CACHE_PLANILHAS["dados"].pop(nome_aba, None)
+            CACHE_PLANILHAS["timestamps"].pop(nome_aba, None)
+            CACHE_LINHAS_PLANILHAS["dados"].pop(nome_aba, None)
+            CACHE_LINHAS_PLANILHAS["timestamps"].pop(nome_aba, None)
     CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
     if nomes_abas:
         CACHE_IA["contexto_sistema"] = ""
@@ -1153,6 +1459,8 @@ CABECALHOS_PEDIDOS = [
     "IMAGEM_MODELO_ID",
     "DRIVE_FILE_ID", "TECNOLOGIA", "SEGMENTO_FICHA",
     "TECNO", "POTENCIA",
+    "STATUS_LIBERACAO", "LIBERADO_POR", "DATA_LIBERACAO",
+    "VALIDADE_DIAS",
 ]
 ABA_PEDIDOS_FEITOS = "Pedidos_feitos"
 COLUNAS_OBSOLETAS_PEDIDOS = {
@@ -1426,6 +1734,8 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
     def grade_campos(campos, colunas=2, omitir_vazios=False):
         def valor_campo(chave):
             valor = obter_valor_pedido(chave)
+            if chave == "VALIDADE_DIAS" and valor:
+                return f"{valor} dias"
             if chave == "VALIDADE" and valor:
                 try:
                     return datetime.strptime(valor, "%Y-%m-%d").strftime("%d/%m/%Y")
@@ -1716,7 +2026,7 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
         ("CLASSIFICACAO_FISCAL", "Classificação fiscal"),
         ("LOCAL_ENTREGA", "Entrega"),
         ("PRAZO_ENTREGA", "Prazo de entrega"),
-        ("VALIDADE", "Validade da proposta"),
+        ("VALIDADE_DIAS", "Validade da proposta"),
     ], 3))
     total = Table(
         [[paragrafo("VALOR TOTAL", total_estilo), paragrafo(dinheiro(dados_pedido.get("VALOR_TOTAL")), total_estilo)]],
@@ -1872,7 +2182,7 @@ def subir_pdf_pedido_drive(pdf_bytes, nome_arquivo):
     return enviado
 
 
-def listar_pedidos_vendedor(planilha, email_vendedor):
+def listar_pedidos_vendedor(planilha, email_vendedor, incluir_todos=False):
     try:
         aba_pedidos = planilha.worksheet(ABA_PEDIDOS_FEITOS)
     except gspread.exceptions.WorksheetNotFound:
@@ -1880,7 +2190,7 @@ def listar_pedidos_vendedor(planilha, email_vendedor):
 
     registros = obter_registros_seguros(aba_pedidos)
     email_norm = str(email_vendedor or "").strip().casefold()
-    if not email_norm:
+    if not email_norm and not incluir_todos:
         return []
     pedidos = []
     for registro in registros:
@@ -1899,26 +2209,33 @@ def listar_pedidos_vendedor(planilha, email_vendedor):
                 if str(valor or "").strip():
                     registro[cabecalho] = valor
                     break
-        if str(registro.get("EMAIL_VENDEDOR", "")).strip().casefold() == email_norm:
+        if incluir_todos or (
+            email_norm
+            and str(registro.get("EMAIL_VENDEDOR", "")).strip().casefold() == email_norm
+        ):
             pedidos.append(registro)
     return list(reversed(pedidos))
 
 
 @app.route("/proposta-pdf/<pedido_id>")
 def gerar_pdf_proposta(pedido_id):
-    if not session.get("logado") or not session.get("perm_pedidos"):
+    if not session.get("logado") or not usuario_pode_acessar_pedidos():
         abort(404)
 
     planilha = conectar_google_sheets()
     email_vendedor = str(session.get("email_usuario", "") or "")
     pedido = next(
         (
-            item for item in listar_pedidos_vendedor(planilha, email_vendedor)
+            item for item in listar_pedidos_vendedor(
+                planilha,
+                email_vendedor,
+                incluir_todos=usuario_eh_gestao(session.get("perfil")),
+            )
             if str(item.get("ID_PEDIDO", "")).strip() == pedido_id
         ),
         None,
     )
-    if pedido is None:
+    if pedido is None or not pedido_esta_liberado(pedido):
         abort(404)
 
     return redirect(url_for(
@@ -1998,103 +2315,35 @@ def salvar_pedido_na_planilha(planilha, dados_pedido):
 
 @app.route("/proposta-pdf-preview", methods=["POST"])
 def gerar_pdf_previa_proposta():
-    if not session.get("logado") or not session.get("perm_pedidos"):
+    if not session.get("logado") or not usuario_pode_acessar_pedidos():
         abort(404)
 
-    valor_unitario_texto = re.sub(
-        r"(?i)^\s*R\$\s*",
-        "",
-        str(request.form.get("valor_unitario", "") or ""),
-    ).replace(" ", "")
-    if "," in valor_unitario_texto:
-        valor_unitario_texto = (
-            valor_unitario_texto.replace(".", "").replace(",", ".")
-        )
-    elif re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", valor_unitario_texto):
-        valor_unitario_texto = valor_unitario_texto.replace(".", "")
+    pedido_id = str(request.form.get("id_pedido", "") or "").strip()
+    if not pedido_id:
+        return "Informe o ID de uma proposta salva e liberada.", 400
 
-    quantidade = converter_numero(request.form.get("quantidade"))
-    valor_unitario = converter_numero(valor_unitario_texto)
-    if (
-        not request.form.get("cliente", "").strip()
-        or quantidade is None
-        or quantidade <= 0
-        or not quantidade.is_integer()
-        or valor_unitario is None
-        or valor_unitario <= 0
-    ):
-        return "Informe cliente, quantidade inteira e valor unitário válidos.", 400
-
-    nomes_campos = {
-        "DATA_PEDIDO": "data_pedido",
-        "CLIENTE": "cliente",
-        "DOCUMENTO_CLIENTE": "documento_cliente",
-        "TELEFONE_CLIENTE": "telefone_cliente",
-        "EMAIL_CLIENTE": "email_cliente",
-        "CIDADE": "cidade",
-        "UF": "uf",
-        "MODELO": "modelo",
-        "SEGMENTO": "segmento",
-        "ANO_MODELO": "ano_modelo",
-        "CABINE": "cabine",
-        "TECNOLOGIA": "tecnologia",
-        "TECNO": "tecnologia_motor",
-        "SEGMENTO_FICHA": "segmento_ficha",
-        "SISTEMA_INJECAO": "sistema_injecao",
-        "MOTOR": "motor",
-        "POTENCIA": "potencia",
-        "TRANSMISSAO": "transmissao",
-        "CATEGORIA": "categoria",
-        "PBT": "pbt",
-        "ENTRE_EIXOS": "entre_eixos",
-        "CMT": "cmt",
-        "OBSERVACOES_CLIENTE": "observacoes_cliente",
-        "OBSERVACOES_VEICULO": "observacoes_veiculo",
-        "PLANO_MANUTENCAO": "plano_manutencao",
-        "RIO": "rio",
-        "INFORMACOES_COMPLEMENTARES": "informacoes_complementares",
-        "GARANTIA": "garantia",
-        "ASSISTENCIA": "assistencia",
-        "CONDICOES_PM": "condicoes_pm",
-        "MODALIDADE_FATURAMENTO": "modalidade_faturamento",
-        "FATURANTE": "faturante",
-        "CNPJ_FATURANTE": "cnpj_faturante",
-        "PAGAMENTO": "pagamento",
-        "COD_FINAME": "cod_finame",
-        "PAC": "pac",
-        "CLASSIFICACAO_FISCAL": "classificacao_fiscal",
-        "LOCAL_ENTREGA": "local_entrega",
-        "PRAZO_ENTREGA": "prazo_entrega",
-        "VALIDADE": "validade",
-        "DETALHES": "detalhes",
-    }
-    dados_pedido = {
-        chave: str(request.form.get(campo, "") or "").strip()
-        for chave, campo in nomes_campos.items()
-    }
-    dados_pedido.update({
-        "ID_PEDIDO": str(
-            request.form.get("id_pedido_edicao", "") or "NOVA PROPOSTA"
+    planilha = conectar_google_sheets()
+    pedido = next(
+        (
+            item for item in listar_pedidos_vendedor(
+                planilha,
+                session.get("email_usuario", ""),
+                incluir_todos=usuario_eh_gestao(session.get("perfil")),
+            )
+            if str(item.get("ID_PEDIDO", "")).strip() == pedido_id
         ),
-        "VENDEDOR": str(session.get("nome", "") or ""),
-        "TELEFONE_VENDEDOR": str(session.get("telefone", "") or ""),
-        "CELULAR_VENDEDOR": str(session.get("celular", "") or ""),
-        "EMAIL_VENDEDOR": str(session.get("email_usuario", "") or ""),
-        "TIPO": str(request.form.get("modelo_tipo", "") or ""),
-        "CATEGORIA": str(request.form.get("categoria", "") or "").strip(),
-        "QUANTIDADE": int(quantidade),
-        "VALOR_UNITARIO": valor_unitario,
-        "VALOR_TOTAL": quantidade * valor_unitario,
-        "LINK_FICHA_TECNICA": str(
-            request.form.get("link_ficha_tecnica", "") or ""
-        ),
-    })
+        None,
+    )
+    if pedido is None:
+        abort(404)
+    if not pedido_esta_liberado(pedido):
+        abort(403)
 
     try:
         pdf = gerar_pdf_pedido(
-            dados_pedido,
+            pedido,
             {},
-            str(request.form.get("imagem_modelo_id", "") or ""),
+            str(pedido.get("IMAGEM_MODELO_ID", "") or ""),
         )
     except Exception:
         traceback.print_exc()
@@ -2104,7 +2353,7 @@ def gerar_pdf_previa_proposta():
         io.BytesIO(pdf),
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=nome_arquivo_pedido(dados_pedido),
+        download_name=nome_arquivo_pedido(pedido),
         max_age=0,
     )
 
@@ -2187,6 +2436,54 @@ def atualizar_pedido_na_planilha(planilha, dados_pedido, id_pedido):
         [linha],
         value_input_option="RAW",
     )
+
+
+@app.route("/proposta/<pedido_id>/liberar", methods=["POST"])
+def liberar_proposta(pedido_id):
+    if not session.get("logado") or not usuario_eh_gestao(session.get("perfil")):
+        abort(403)
+
+    try:
+        planilha = conectar_google_sheets()
+        pedido = next(
+            (
+                item for item in listar_pedidos_vendedor(
+                    planilha,
+                    session.get("email_usuario", ""),
+                    incluir_todos=True,
+                )
+                if str(item.get("ID_PEDIDO", "")).strip() == pedido_id
+            ),
+            None,
+        )
+        if pedido is None:
+            abort(404)
+        if not pedido_esta_liberado(pedido):
+            atualizar_pedido_na_planilha(
+                planilha,
+                {
+                    "STATUS_LIBERACAO": "LIBERADO",
+                    "LIBERADO_POR": str(session.get("nome", "") or ""),
+                    "DATA_LIBERACAO": datetime.now().isoformat(timespec="seconds"),
+                },
+                pedido_id,
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        traceback.print_exc()
+        return redirect(url_for(
+            "acessar_modulo",
+            nome_modulo="pedidos",
+            visao="feitos",
+            erro_liberacao="Não foi possível liberar a proposta. Tente novamente.",
+        ))
+
+    return redirect(url_for(
+        "acessar_modulo",
+        nome_modulo="pedidos",
+        visao="feitos",
+    ))
 
 
 def obter_linhas_abas_em_lote(planilha, nomes_abas, worksheets=None):
@@ -2363,8 +2660,40 @@ def importar_relatorios_drive_vendas():
             or arquivo.get("mimeType") == "application/vnd.google-apps.spreadsheet"
         ]
 
-        if not arquivos_planilha:
-            return "Nenhum arquivo novo para importar."
+        query_uploads = (
+            "name = 'Upload_Vendas' and "
+            "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        )
+        uploads_res = service.files().list(
+            q=query_uploads,
+            fields="files(id, name)",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        pastas_uploads = uploads_res.get("files", [])
+        if len(pastas_uploads) != 1:
+            return (
+                "A pasta Upload_Vendas não foi encontrada de forma única; "
+                "a importação foi interrompida para evitar vínculos incorretos."
+            )
+
+        pasta_uploads_id = pastas_uploads[0]["id"]
+        arquivos_comprovantes = []
+        page_token_uploads = None
+        while True:
+            uploads_arquivos_res = service.files().list(
+                q=f"'{pasta_uploads_id}' in parents and trashed = false",
+                fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                pageSize=1000,
+                pageToken=page_token_uploads,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            arquivos_comprovantes.extend(uploads_arquivos_res.get("files", []))
+            page_token_uploads = uploads_arquivos_res.get("nextPageToken")
+            if not page_token_uploads:
+                break
 
         # ============================================================
         # ABA NEGOCIOS_PM
@@ -2372,34 +2701,110 @@ def importar_relatorios_drive_vendas():
         try:
             aba_negocios = planilha.worksheet("Negocios_PM")
         except gspread.exceptions.WorksheetNotFound:
-            aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=11)
-            aba_negocios.append_row([
-                "TEMPERATURA",
-                "DATA",
-                "VENDEDOR",
-                "CLIENTE",
-                "MODELO",
-                "CHASSIS",
-                "PLANO DE MANUTENÇÃO",
-                "RIO",
-                "CONTATO DO CLIENTE",
-                "TELEFONE",
-                "COMENTÁRIOS"
-            ])
+            aba_negocios = planilha.add_worksheet(
+                title="Negocios_PM",
+                rows=1000,
+                cols=len(CABECALHOS_NEGOCIOS_PM),
+            )
+            aba_negocios.append_row(CABECALHOS_NEGOCIOS_PM)
 
-        # Exige um cabeçalho de chassi para nunca importar sem conferir duplicidade.
         registros_existentes = aba_negocios.get_all_values()
         if not registros_existentes:
             return "A aba Negocios_PM está sem cabeçalho; importação interrompida para evitar duplicidade de chassi."
 
+        cabecalhos_negocios_originais = garantir_colunas_negocios_pm(aba_negocios)
+        registros_existentes[0] = cabecalhos_negocios_originais
+
+        def preencher_anexos_pendentes(aba, usar_alias_negocio=False):
+            linhas_planilha = aba.get_all_values()
+            if not linhas_planilha:
+                return 0
+
+            cabecalhos = linhas_planilha[0]
+            normalizar_cabecalho = (
+                chave_cabecalho_negocios_pm
+                if usar_alias_negocio
+                else normalizar_chave_planilha
+            )
+            chaves_cabecalho = [
+                normalizar_cabecalho(cabecalho) for cabecalho in cabecalhos
+            ]
+            indice_anexo = next(
+                (
+                    indice
+                    for indice, chave in enumerate(chaves_cabecalho)
+                    if chave == "anexo 1"
+                ),
+                None,
+            )
+            if indice_anexo is None:
+                return 0
+
+            campos_por_chave = {
+                chave: indice for indice, chave in enumerate(chaves_cabecalho)
+            }
+
+            def valor_registro(linha, *chaves):
+                for chave in chaves:
+                    indice = campos_por_chave.get(chave)
+                    if indice is not None and indice < len(linha):
+                        valor = str(linha[indice] or "").strip()
+                        if valor:
+                            return valor
+                return ""
+
+            atualizados = 0
+            for numero_linha, linha in enumerate(linhas_planilha[1:], start=2):
+                if indice_anexo < len(linha) and str(linha[indice_anexo]).strip():
+                    continue
+
+                cliente_existente = valor_registro(linha, "cliente")
+                plano_existente = valor_registro(
+                    linha, "plano de manutencao", "p manutencao", "plano"
+                )
+                rio_existente = valor_registro(linha, "rio", "telemetria rio")
+                produto_existente = valor_registro(linha, "produto")
+                chassis_existente = valor_registro(linha, "chassis", "chassi")
+                link_existente = encontrar_comprovante_venda_drive(
+                    arquivos_comprovantes,
+                    cliente_existente,
+                    (plano_existente, rio_existente, produto_existente),
+                    chassis_existente,
+                )
+                if link_existente:
+                    aba.update_cell(numero_linha, indice_anexo + 1, link_existente)
+                    atualizados += 1
+            return atualizados
+
+        anexos_atualizados = preencher_anexos_pendentes(
+            aba_negocios,
+            usar_alias_negocio=True,
+        )
+        try:
+            aba_vendas_existentes = planilha.worksheet("Vendas_PM")
+        except gspread.exceptions.WorksheetNotFound:
+            aba_vendas_existentes = None
+        if aba_vendas_existentes is not None:
+            garantir_colunas_venda_pm(aba_vendas_existentes)
+            anexos_atualizados += preencher_anexos_pendentes(
+                aba_vendas_existentes,
+                usar_alias_negocio=True,
+            )
+
+        if anexos_atualizados:
+            invalidar_cache_ab_as("Negocios_PM")
+            invalidar_cache_ab_as("Vendas_PM")
+        if not arquivos_planilha and not anexos_atualizados:
+            return "Nenhum arquivo novo para importar."
+
         cabecalhos_negocios = [
-            normalizar_chave_planilha(cabecalho)
+            chave_cabecalho_negocios_pm(cabecalho)
             for cabecalho in registros_existentes[0]
         ]
         indice_chassi = next(
             (
                 indice for indice, cabecalho in enumerate(cabecalhos_negocios)
-                if cabecalho in {"chassi", "chassis"}
+                if chave_cabecalho_negocios_pm(cabecalho) == "chassis"
                 or "chassi" in cabecalho
             ),
             None,
@@ -2417,9 +2822,13 @@ def importar_relatorios_drive_vendas():
             if chassis_existente:
                 chaves_cadastradas.add(f"CHASSIS:{chassis_existente}")
             else:
+                registro_existente = {
+                    cabecalho: r[indice] if indice < len(r) else ""
+                    for indice, cabecalho in enumerate(cabecalhos_negocios)
+                }
                 valores_legados = [
-                    r[indice] if indice < len(r) else ""
-                    for indice in (1, 2, 3, 4)
+                    registro_existente.get(cabecalho, "")
+                    for cabecalho in ("data", "vendedor", "cliente", "modelo")
                 ]
                 chave_legada = "_".join(
                     normalizar_chave_planilha(valor) for valor in valores_legados
@@ -2536,6 +2945,8 @@ def importar_relatorios_drive_vendas():
         arquivos_concluidos = 0
         erros_importacao = []
         avisos_modelos = []
+        comprovantes_pendentes = 0
+        exemplos_sem_comprovante = []
         modelos_cadastrados = set(mapa_modelos.values())
         if not modelos_cadastrados:
             avisos_modelos.append(
@@ -2622,8 +3033,59 @@ def importar_relatorios_drive_vendas():
                 vendedor_bruto = obter_valor_relatorio(row, "VENDEDOR")
                 vendedor = identificar_vendedor(vendedor_bruto) if vendedor_bruto is not None else ""
                 modelo = identificar_modelo(modelo_bruto)
-                chassis_bruto = obter_valor_relatorio(row, "CHASSIS", "CHASSI")
+                chassis_bruto = obter_valor_relatorio(
+                    row, "CHASSIS", "CHASSI", "Nº DO CHASSI", "NUMERO DO CHASSI"
+                )
                 chassis = str(chassis_bruto).strip() if chassis_bruto is not None else ""
+                temperatura_bruta = obter_valor_relatorio(row, "TEMPERATURA")
+                plano_bruto = obter_valor_relatorio(
+                    row,
+                    "PLANO DE MANUTENÇÃO",
+                    "PLANO DE MANUTENCAO",
+                    "P. MANUTENÇÃO",
+                    "P. MANUTENCAO",
+                    "PLANO",
+                )
+                produto_bruto = obter_valor_relatorio(row, "PRODUTO")
+                rio_bruto = obter_valor_relatorio(row, "RIO", "TELEMETRIA RIO")
+                contato_bruto = obter_valor_relatorio(
+                    row, "CONTATO DO CLIENTE", "CONTATO"
+                )
+                telefone_bruto = obter_valor_relatorio(
+                    row, "TELEFONE", "TELEFONE DO CLIENTE", "CELULAR"
+                )
+                comentarios_brutos = obter_valor_relatorio(
+                    row, "COMENTÁRIOS", "COMENTARIOS", "OBSERVAÇÕES", "OBSERVACOES"
+                )
+                anexo_bruto = obter_valor_relatorio(
+                    row,
+                    "ANEXO 1",
+                    "COMPROVANTE",
+                    "LINK COMPROVANTE",
+                    "LINK DE COMPARTILHAMENTO",
+                    "LINK COMPARTILHAMENTO",
+                )
+                anexo_id_drive = extrair_id_arquivo_drive(anexo_bruto)
+                anexo_1 = (
+                    f"https://drive.google.com/file/d/{anexo_id_drive}/view?usp=drivesdk"
+                    if anexo_id_drive
+                    else ""
+                )
+                produto_texto = str(produto_bruto).strip() if produto_bruto is not None else ""
+                plano_texto = str(plano_bruto).strip() if plano_bruto is not None else ""
+                rio_texto = str(rio_bruto).strip() if rio_bruto is not None else ""
+                if produto_texto and (not plano_texto or not rio_texto):
+                    partes_produto = produto_texto.split(" / ", 1)
+                    plano_texto = plano_texto or partes_produto[0].strip()
+                    if len(partes_produto) > 1:
+                        rio_texto = rio_texto or partes_produto[1].strip()
+                if not anexo_1:
+                    anexo_1 = encontrar_comprovante_venda_drive(
+                        arquivos_comprovantes,
+                        cliente,
+                        (plano_texto, rio_texto, produto_texto),
+                        chassis,
+                    )
                 if modelo not in modelos_cadastrados:
                     chassis_conferencia = chassis or "sem chassi"
                     modelos_nao_cadastrados.append(
@@ -2642,15 +3104,38 @@ def importar_relatorios_drive_vendas():
                     duplicados += 1
                     continue
 
+                if not anexo_1:
+                    comprovantes_pendentes += 1
+                    if len(exemplos_sem_comprovante) < 5:
+                        exemplos_sem_comprovante.append(
+                            f"{cliente} | {modelo or modelo_bruto} | chassi: {chassis or 'não informado'}"
+                        )
+
                 chaves_arquivo.add(chave_unica)
-                linhas_arquivo.append([
-                    "Frio",
-                    data_venda,
-                    vendedor,
-                    cliente,
-                    modelo,
-                    chassis,
-                ])
+                valores_importados = {
+                    "TEMPERATURA": str(temperatura_bruta).strip()
+                    if temperatura_bruta is not None else "Frio",
+                    "DATA": data_venda,
+                    "VENDEDOR": vendedor,
+                    "CLIENTE": cliente,
+                    "MODELO": modelo or str(modelo_bruto).strip(),
+                    "CHASSIS": chassis,
+                    "PLANO DE MANUTENÇÃO": plano_texto,
+                    "PRODUTO": produto_texto,
+                    "RIO": rio_texto,
+                    "CONTATO DO CLIENTE": str(contato_bruto).strip()
+                    if contato_bruto is not None else "",
+                    "TELEFONE": str(telefone_bruto).strip()
+                    if telefone_bruto is not None else "",
+                    "COMENTÁRIOS": str(comentarios_brutos).strip()
+                    if comentarios_brutos is not None else "",
+                    "ANEXO 1": anexo_1,
+                }
+                linhas_arquivo.append(
+                    montar_linha_negocio_pm(
+                        valores_importados, cabecalhos_negocios_originais
+                    )
+                )
 
             if registros_invalidos:
                 erros_importacao.append(
@@ -2699,10 +3184,26 @@ def importar_relatorios_drive_vendas():
             f"Sincronização concluída! {importados_count} novos registros importados "
             f"em {arquivos_concluidos} arquivo(s); {duplicados_count} chassi(s)/registro(s) duplicado(s) ignorado(s)."
         )
+        if anexos_atualizados:
+            resumo += (
+                f" {anexos_atualizados} comprovante(s) associado(s) "
+                "a registros existentes."
+            )
         if erros_importacao:
             resumo += " Pendências: " + "; ".join(erros_importacao)
         if avisos_modelos:
             resumo += " Conferência manual: " + "; ".join(avisos_modelos)
+        if comprovantes_pendentes:
+            aviso_comprovantes = (
+                f"{comprovantes_pendentes} registro(s) sem comprovante correspondente"
+            )
+            if exemplos_sem_comprovante:
+                aviso_comprovantes += " (" + "; ".join(exemplos_sem_comprovante) + ")"
+            if avisos_modelos:
+                resumo += "; "
+            else:
+                resumo += " Conferência manual: "
+            resumo += aviso_comprovantes
         return resumo
 
     except Exception as e:
@@ -3344,6 +3845,49 @@ TEMPLATE_HTML = r"""
             #secaoRelatorioPDF.relatorio-vendas #tabelaVendas td {
                 padding: 5px 4px !important;
                 vertical-align: middle !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissoes-resumo,
+            #secaoRelatorioPDF.relatorio-vendas .comissao-apm {
+                box-shadow: none !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissoes-resumo {
+                margin-top: 8px !important;
+                padding: 8px !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissao-regiao {
+                break-inside: avoid;
+                page-break-inside: avoid;
+                margin-bottom: 7px !important;
+                padding: 7px !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissao-tabela-wrap {
+                overflow: visible !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissao-tabela {
+                width: 100% !important;
+                min-width: 0 !important;
+                table-layout: fixed;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissao-tabela th,
+            #secaoRelatorioPDF.relatorio-vendas .comissao-tabela td {
+                padding: 4px !important;
+                overflow-wrap: anywhere;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissao-tabela tr {
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissao-apm {
+                margin-top: 8px !important;
+                padding: 0 8px 8px !important;
+            }
+            #secaoRelatorioPDF.relatorio-vendas .comissao-apm-cabecalho {
+                margin: 0 -8px 6px !important;
+                padding: 7px 8px !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
             }
             
             .img-comprovacao {
@@ -4163,70 +4707,70 @@ TEMPLATE_HTML = r"""
             </div>
 
             <ul class="drawer-menu">
-                {% if session.get('perm_rio') %}
+                {% if session.get('perm_rio') or perfil_eh_gestao or 'rio' in modulos_acesso_livre %}
                 <li class="drawer-item {% if modulo_ativo == 'rio' %}active{% endif %}">
                     <a href="/modulo/rio" onclick="closeDrawer()"><span class="drawer-icon">📡</span> Telemetria RIO</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_pm') %}
+                {% if session.get('perm_pm') or perfil_eh_gestao or 'pm' in modulos_acesso_livre %}
                 <li class="drawer-item {% if modulo_ativo == 'pm' %}active{% endif %}">
                     <a href="/modulo/pm" onclick="closeDrawer()"><span class="drawer-icon">🛠</span> Plano de Manutenção</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_valores') %}
+                {% if session.get('perm_valores') or perfil_eh_gestao %}
                 <li class="drawer-item {% if modulo_ativo == 'valores' %}active{% endif %}">
                     <a href="/modulo/valores" onclick="closeDrawer()"><span class="drawer-icon">💲</span> Tabela de Valores</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_informes') %}
+                {% if session.get('perm_informes') or perfil_eh_gestao or 'informes' in modulos_acesso_livre %}
                 <li class="drawer-item {% if modulo_ativo == 'informes' %}active{% endif %}">
                     <a href="/modulo/informes" onclick="closeDrawer()"><span class="drawer-icon">📢</span> Informes e Circulares</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_fichatecnica') %}
+                {% if session.get('perm_fichatecnica') or perfil_eh_gestao or 'fichatecnica' in modulos_acesso_livre %}
                 <li class="drawer-item {% if modulo_ativo == 'fichatecnica' %}active{% endif %}">
                     <a href="/modulo/fichatecnica" onclick="closeDrawer()"><span class="drawer-icon">📋</span> Ficha Técnica</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_pedidos') %}
+                {% if session.get('perm_pedidos') or perfil_eh_gestao %}
                 <li class="drawer-item {% if modulo_ativo == 'pedidos' %}active{% endif %}">
                     <a href="/modulo/pedidos" onclick="closeDrawer()"><span class="drawer-icon">🧾</span> Propostas a Clientes</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_argumentos') %}
+                {% if session.get('perm_argumentos') or perfil_eh_gestao or 'argumentos' in modulos_acesso_livre %}
                 <li class="drawer-item {% if modulo_ativo == 'argumentos' %}active{% endif %}" style="border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; margin-bottom: 4px;">
                     <a href="/modulo/argumentos" onclick="closeDrawer()"><span class="drawer-icon">💡</span> Argumentos de Venda</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_negocios') %}
+                {% if session.get('perm_negocios') or perfil_eh_gestao %}
                 <li class="drawer-item {% if modulo_ativo == 'negocios' %}active{% endif %}">
                     <a href="/modulo/negocios?sincronizar=1" onclick="closeDrawer()"><span class="drawer-icon">🤝</span> Negócios em Andamento</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_visitas') %}
+                {% if session.get('perm_visitas') or perfil_eh_gestao %}
                 <li class="drawer-item {% if modulo_ativo == 'visitas' %}active{% endif %}">
                     <a href="/modulo/visitas" onclick="closeDrawer()"><span class="drawer-icon">📍</span> Visitas e Acompanhamento</a>
                 </li>
                 {% endif %}
-                {% if session.get('perm_vendas') %}
+                {% if session.get('perm_vendas') or perfil_eh_gestao %}
                 <li class="drawer-item {% if modulo_ativo == 'vendas' %}active{% endif %}">
                     <a href="/modulo/vendas" onclick="closeDrawer()"><span class="drawer-icon">💰</span> Vendas Fechadas</a>
                 </li>
                 {% endif %}
                 
-                {% if session.get('perm_dashboard') %}
+                {% if session.get('perm_dashboard') or perfil_eh_gestao %}
                 <li class="drawer-item {% if modulo_ativo == 'dashboard' %}active{% endif %}">
                     <a href="/modulo/dashboard" onclick="closeDrawer()"><span class="drawer-icon">📊</span> Dashboard</a>
                 </li>
                 {% endif %}
 
-                {% if session.get('perm_camp_vw_prev') %}
+                {% if session.get('perm_camp_vw_prev') or perfil_eh_gestao %}
                 <li class="drawer-item {% if modulo_ativo == 'camp_vw_prev' %}active{% endif %}">
                     <a href="/modulo/camp_vw_prev" onclick="closeDrawer()"><span class="drawer-icon">🚛</span> Campanha VW PREV</a>
                 </li>
                 {% endif %}
 
-                {% if session.get('perm_traton') %}
+                {% if session.get('perm_traton') or perfil_eh_gestao or 'traton' in modulos_acesso_livre %}
                 <li class="drawer-item {% if modulo_ativo == 'traton' %}active{% endif %}">
                     <a href="/modulo/traton" onclick="closeDrawer()" style="display: flex; justify-content: center; align-items: center; padding: 12px 10px;">
                         <img src="{{ url_for('static', filename='traton.jpg') }}?v=2" alt="Traton" style="max-height: 24px; width: auto; object-fit: contain;">
@@ -4349,6 +4893,8 @@ def login():
                     user_norm_keys = {normalize_key(k): str(v).strip().upper() for k, v in usuario_encontrado.items()}
 
                     def tem_permissao(chaves_alvo):
+                        if usuario_eh_gestao(session.get("perfil")):
+                            return True
                         for chave in chaves_alvo:
                             chaves_possiveis = [chave] + [f"{chave}_{i}" for i in range(1, 10)]
                             for c in chaves_possiveis:
@@ -4357,14 +4903,16 @@ def login():
                                     return True
                         return False
 
-                    session["perm_rio"] = tem_permissao(["TELEMETRIA RIO", "RIO"])
-                    session["perm_pm"] = tem_permissao(["PLANO DE MANUTENCAO", "PLANO DE MANUTENÇAO", "PM"])
+                    session["perm_rio"] = True
+                    session["perm_pm"] = True
                     session["perm_valores"] = tem_permissao(["TABELAS DE VALORES", "TABELA DE VALORES", "VALORES"])
-                    session["perm_informes"] = tem_permissao(["INFORME E CIRCULARES", "INFORME E CIRCULAR", "INFORMES"])
-                    session["perm_fichatecnica"] = tem_permissao(["FICHA TECNICA", "FICHATECNICA"])
-                    session["perm_argumentos"] = tem_permissao(["ARGUMENTOS DE VENDA", "ARGUMENTOS"])
+                    session["perm_informes"] = True
+                    session["perm_fichatecnica"] = True
+                    session["perm_argumentos"] = True
                     session["perm_visitas"] = tem_permissao(["VISITAS"])
-                    session["perm_pedidos"] = tem_permissao([
+                    session["perm_pedidos"] = usuario_eh_gestao(
+                        session.get("perfil")
+                    ) or tem_permissao([
                         "PEDIDOS_FEITOS",
                         "PEDIDOS FEITOS",
                         "FORMULARIO_PEDIDO",
@@ -4372,7 +4920,7 @@ def login():
                     ])
                     session["perm_camp_vw_prev"] = tem_permissao(["CAMPANHAS", "CAMPANHA", "CAMPANHA VW PREV", "CAMP", "PREV"])
                     session["perm_dashboard"] = tem_permissao(["DASHBORD", "DASHBOARD", "DASH"])
-                    session["perm_traton"] = tem_permissao(["TRATON", "SIMULADOR TRATON"])
+                    session["perm_traton"] = True
                     session["perm_negocios"] = tem_permissao(["NEGOCIOS EM ANDAMENTO", "NEGOCIOS"])
                     
                     val_vendas = False
@@ -4383,34 +4931,34 @@ def login():
                                 break
                     session["perm_vendas"] = val_vendas or tem_permissao(["VENDAS"])
 
-                    session["perm_traton"] = tem_permissao(["TRATON", "SIMULADOR", "SIMULADOR TRATON"])
+                    session["perm_traton"] = True
                     session.pop("historico_ia", None)
                     
                     registrar_log_acesso(usuario_encontrado.get("NOME"), "Login efetuado via Flask")
 
                     modulos_permitidos_pos_login = [
-                        (modulo, session.get(permissao, False))
-                        for modulo, permissao in (
-                            ("dashboard", "perm_dashboard"),
-                            ("rio", "perm_rio"),
-                            ("pm", "perm_pm"),
-                            ("valores", "perm_valores"),
-                            ("informes", "perm_informes"),
-                            ("fichatecnica", "perm_fichatecnica"),
-                            ("argumentos", "perm_argumentos"),
-                            ("negocios", "perm_negocios"),
-                            ("visitas", "perm_visitas"),
-                            ("pedidos", "perm_pedidos"),
-                            ("vendas", "perm_vendas"),
-                            ("camp_vw_prev", "perm_camp_vw_prev"),
-                            ("traton", "perm_traton"),
+                        modulo
+                        for modulo in (
+                            "dashboard",
+                            "rio",
+                            "pm",
+                            "valores",
+                            "informes",
+                            "fichatecnica",
+                            "argumentos",
+                            "negocios",
+                            "visitas",
+                            "pedidos",
+                            "vendas",
+                            "camp_vw_prev",
+                            "traton",
                         )
-                        if session.get(permissao, False)
+                        if usuario_pode_acessar_modulo(modulo)
                     ]
                     if modulos_permitidos_pos_login:
                         return redirect(url_for(
                             "acessar_modulo",
-                            nome_modulo=modulos_permitidos_pos_login[0][0],
+                            nome_modulo=modulos_permitidos_pos_login[0],
                         ))
 
                     session.clear()
@@ -4499,23 +5047,7 @@ def acessar_modulo(nome_modulo):
     if not session.get("logado"):
         return redirect(url_for("login"))
 
-    permissoes_map = {
-        "rio": session.get("perm_rio", False),
-        "pm": session.get("perm_pm", False),
-        "valores": session.get("perm_valores", False),
-        "informes": session.get("perm_informes", False),
-        "fichatecnica": session.get("perm_fichatecnica", False),
-        "argumentos": session.get("perm_argumentos", False),
-        "negocios": session.get("perm_negocios", False),
-        "visitas": session.get("perm_visitas", False),
-        "pedidos": session.get("perm_pedidos", False),
-        "vendas": session.get("perm_vendas", False),
-        "dashboard": session.get("perm_dashboard", False),
-        "camp_vw_prev": session.get("perm_camp_vw_prev", False),
-        "traton": session.get("perm_traton", False)
-    }
-
-    if not permissoes_map.get(nome_modulo, False):
+    if not usuario_pode_acessar_modulo(nome_modulo):
         return render_template_string(
             TEMPLATE_HTML,
             conteudo_modulo='<div style="padding: 20px; color: #c53030; background: #fff5f5; border-radius: 8px; border: 1px solid #feb2b2;"><h3>Acesso Negado</h3><p>Você não possui permissão para acessar este módulo.</p></div>',
@@ -4560,7 +5092,7 @@ def acessar_modulo(nome_modulo):
 
             perfil_usuario = str(session.get("perfil", "")).strip().upper()
             usuario_logado = str(session.get("nome", "")).strip().upper()
-            is_adm = perfil_usuario in ["ADM", "DIRETOR", "GERENTE"]
+            is_adm = usuario_eh_gestao(perfil_usuario)
 
             def chave_campanha(valor):
                 valor = unicodedata.normalize("NFKD", str(valor or ""))
@@ -5268,7 +5800,7 @@ def acessar_modulo(nome_modulo):
         try:
             # ============================================================
             # DASHBOARD 2 NÍVEIS
-            #   1) ADM / DIRETOR / GERENTE -> visão consolidada + filtro por consultor
+            #   1) Gestão -> visão consolidada + filtro por consultor
             #   2) CONSULTOR               -> somente os próprios registros
             #
             # Fonte dos dados:
@@ -5282,8 +5814,7 @@ def acessar_modulo(nome_modulo):
             perfil_usuario = str(session.get("perfil", "")).strip().upper()
             usuario_logado = str(session.get("nome", "")).strip()
             usuario_logado_norm = usuario_logado.upper()
-            perfis_gestao = {"ADM", "DIRETOR", "GERENTE"}
-            is_gestao = perfil_usuario in perfis_gestao
+            is_gestao = usuario_eh_gestao(perfil_usuario)
 
             def norm(v):
                 txt = str(v if v is not None else "").strip()
@@ -5399,10 +5930,21 @@ def acessar_modulo(nome_modulo):
             filtro_produto = request.args.get("produto", "").strip()
             filtro_uf = request.args.get("uf", "").strip().upper()
 
+            # Consultores não podem ampliar o próprio escopo via query string.
+            if not is_gestao:
+                filtro_consultor = usuario_logado
+
             anos = set()
+
+            def passa_pessoa(vendedor):
+                if filtro_consultor and norm(filtro_consultor) != "TODOS":
+                    return norm(vendedor) == norm(filtro_consultor)
+                return True
 
             def coletar_anos(registros):
                 for r in registros:
+                    if not passa_pessoa(r.get("VENDEDOR", "")):
+                        continue
                     dt = parse_data(r.get("DATA DA VENDA") or r.get("DATA"))
                     if dt:
                         anos.add(str(dt.year))
@@ -5413,10 +5955,6 @@ def acessar_modulo(nome_modulo):
             ano_atual = str(datetime.now().year)
             if not filtro_ano:
                 filtro_ano = ano_atual if ano_atual in anos else (max(anos) if anos else ano_atual)
-
-            # Consultor não pode escapar do próprio escopo.
-            if not is_gestao:
-                filtro_consultor = usuario_logado
 
             def passa_data(dt):
                 if not dt:
@@ -5430,11 +5968,6 @@ def acessar_modulo(nome_modulo):
                         return False
                     if filtro_mes.isdigit() and dt.month != int(filtro_mes):
                         return False
-                return True
-
-            def passa_pessoa(vendedor):
-                if filtro_consultor and norm(filtro_consultor) != "TODOS":
-                    return norm(vendedor) == norm(filtro_consultor)
                 return True
 
             def passa_uf(vendedor):
@@ -6056,7 +6589,7 @@ def acessar_modulo(nome_modulo):
             # Tabela de preços: separa visualmente PREV, MAX e PLUS.
             linhas_top3_planos = ""
             ultimo_plano = None
-            for p_plano in top3_planos:
+            for p_plano in top3_planos if is_gestao else []:
                 plano_atual = str(p_plano.get("plano", "")).strip().upper()
                 if ultimo_plano is not None and plano_atual != ultimo_plano:
                     linhas_top3_planos += "<tr class=\"plano-separador\"><td colspan=\"7\"></td></tr>"
@@ -6080,6 +6613,33 @@ def acessar_modulo(nome_modulo):
                 ultimo_plano = plano_atual
             if not linhas_top3_planos:
                 linhas_top3_planos = '<tr><td colspan="7" class="empty">Nenhum preço mensal disponível na aba PM_Precos.</td></tr>'
+
+            quadro_top3_planos = ""
+            if is_gestao:
+                quadro_top3_planos = f"""
+                <div class="dash-table-card card-planos-manutencao" style="margin-bottom:14px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <h3 style="margin:0;">💰 Melhor preço para plano de manutenção</h3>
+                        <span class="dash-note" style="margin:0;">3 modelos com menor preço mensal em PREV · MAX · PLUS</span>
+                    </div>
+                    <div class="dash-table-scroll" style="margin-top:10px;">
+                        <table class="dash-table dash-table-precos">
+                            <thead>
+                                <tr>
+                                    <th>Plano</th>
+                                    <th>Modelo</th>
+                                    <th>Valor mensal</th>
+                                    <th>Contrato</th>
+                                    <th>KM / Horas</th>
+                                    <th>Grupo de manutenção</th>
+                                    <th>Intervalo de revisão</th>
+                                </tr>
+                            </thead>
+                            <tbody>{linhas_top3_planos}</tbody>
+                        </table>
+                    </div>
+                </div>
+                """
 
             linhas_campanha_vw = ""
             ultimo_plano_campanha = None
@@ -6117,7 +6677,7 @@ def acessar_modulo(nome_modulo):
                 ultimo_plano_campanha = plano_atual
 
             quadro_campanha_vw = ""
-            if linhas_campanha_vw:
+            if is_gestao and linhas_campanha_vw:
                 quadro_campanha_vw = f"""
                 <div class="dash-table-card" style="margin-bottom:14px">
                     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
@@ -6312,30 +6872,7 @@ def acessar_modulo(nome_modulo):
 
                 {quadro_campanha_vw}
 
-                <div class="dash-table-card card-planos-manutencao" style="margin-bottom:14px">
-                    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
-                        <h3 style="margin:0;">💰 Melhor preço para plano de manutenção</h3>
-                        <span class="dash-note" style="margin:0;">3 modelos com menor preço mensal em PREV · MAX · PLUS</span>
-                    </div>
-                    <div class="dash-table-scroll" style="margin-top:10px;">
-                        <table class="dash-table dash-table-precos">
-                            <thead>
-                                <tr>
-                                    <th>Plano</th>
-                                    <th>Modelo</th>
-                                    <th>Valor mensal</th>
-                                    <th>Contrato</th>
-                                    <th>KM / Horas</th>
-                                    <th>Grupo de manutenção</th>
-                                    <th>Intervalo de revisão</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {linhas_top3_planos}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
+                {quadro_top3_planos}
 
                 <div class="dash-card" style="margin-bottom:14px">
                     <h3>🔎 Distribuição rápida do pipeline</h3>
@@ -6473,6 +7010,9 @@ def acessar_modulo(nome_modulo):
     elif nome_modulo == "pedidos":
         erro_pedido = ""
         erro_lista_pedidos = ""
+        erro_liberacao = str(request.args.get("erro_liberacao", "") or "").strip()
+        usuario_gestao_pedidos = usuario_eh_gestao(session.get("perfil"))
+        visualizar_todos_pedidos = usuario_gestao_pedidos
         pedido_edicao_id = str(
             request.form.get("id_pedido_edicao", "")
             if request.method == "POST"
@@ -6658,7 +7198,6 @@ def acessar_modulo(nome_modulo):
                 rotulo
                 for rotulo, opcoes in (
                     ("FAB/MODELO", opcoes_ano_modelo_pedido),
-                    ("CABINE", opcoes_cabine_pedido),
                     ("Pagamento", opcoes_pagamento_pedido),
                     ("Entrega", opcoes_entrega_pedido),
                     ("Prazo de entrega", opcoes_prazo_entrega_pedido),
@@ -6801,10 +7340,12 @@ def acessar_modulo(nome_modulo):
             "condicoes_pm", "modalidade_faturamento", "faturante",
             "cnpj_faturante", "pagamento", "cod_finame", "pac",
             "classificacao_fiscal", "local_entrega", "prazo_entrega",
-            "detalhes", "validade",
+            "detalhes", "validade", "validade_dias",
             "imagem_modelo_id",
         )
         pedido_edicao = None
+        pedido_somente_leitura = False
+        pedido_liberado = False
         if pedido_edicao_id and not erro_pedido:
             try:
                 pedido_edicao = next(
@@ -6813,6 +7354,7 @@ def acessar_modulo(nome_modulo):
                         for pedido in listar_pedidos_vendedor(
                             planilha_pedidos,
                             email_vendedor,
+                            incluir_todos=visualizar_todos_pedidos,
                         )
                         if str(pedido.get("ID_PEDIDO", "")).strip()
                         == pedido_edicao_id
@@ -6823,7 +7365,16 @@ def acessar_modulo(nome_modulo):
                     erro_pedido = (
                         "A proposta não foi encontrada ou não pertence ao seu usuário."
                     )
-                elif request.method != "POST":
+                else:
+                    pedido_eh_do_usuario = (
+                        str(pedido_edicao.get("EMAIL_VENDEDOR", "")).strip().casefold()
+                        == email_vendedor.strip().casefold()
+                    )
+                    pedido_somente_leitura = not pedido_eh_do_usuario
+                    pedido_liberado = pedido_esta_liberado(pedido_edicao)
+                    if request.method == "POST" and pedido_somente_leitura:
+                        abort(403)
+                if pedido_edicao and request.method != "POST":
                     indices_pedido = {
                         normalizar_chave_planilha(chave): valor
                         for chave, valor in pedido_edicao.items()
@@ -6869,6 +7420,8 @@ def acessar_modulo(nome_modulo):
                                     except ValueError:
                                         continue
             except Exception as e:
+                if isinstance(e, HTTPException):
+                    raise
                 traceback.print_exc()
                 erro_pedido = (
                     "Não foi possível carregar a proposta para edição. "
@@ -6879,15 +7432,17 @@ def acessar_modulo(nome_modulo):
             for campo in campos_pedido
         }
         agora_pedido = datetime.now()
-        proximo_mes_pedido = (
-            datetime(agora_pedido.year + 1, 1, 1)
-            if agora_pedido.month == 12
-            else datetime(agora_pedido.year, agora_pedido.month + 1, 1)
-        )
-        if not pedido_edicao_id or not dados_pedido["validade"]:
-            dados_pedido["validade"] = (
-                proximo_mes_pedido - timedelta(days=1)
-            ).strftime("%Y-%m-%d")
+        opcoes_validade_dias_pedido = [
+            (str(dias), f"{dias} dias")
+            for dias in (5, 10, 15, 20, 25, 30)
+        ]
+        if dados_pedido["validade_dias"] not in {
+            valor for valor, _ in opcoes_validade_dias_pedido
+        }:
+            if request.method == "POST":
+                erro_pedido = "Selecione uma validade entre 5 e 30 dias."
+            else:
+                dados_pedido["validade_dias"] = "30"
         if request.method != "POST" and not pedido_edicao_id:
             dados_pedido["garantia"] = dados_pedido["garantia"] or (
                 "Os veículos são garantidos pelo fabricante contra eventuais defeitos "
@@ -6911,6 +7466,16 @@ def acessar_modulo(nome_modulo):
             dados_pedido["data_pedido"] or datetime.now().strftime("%Y-%m-%d")
         )
         dados_pedido["quantidade"] = dados_pedido["quantidade"] or "1"
+        try:
+            dados_pedido["validade"] = calcular_data_validade_proposta(
+                dados_pedido["data_pedido"],
+                dados_pedido["validade_dias"],
+            )
+        except ValueError as erro:
+            if request.method == "POST":
+                erro_pedido = str(erro)
+            else:
+                dados_pedido["validade"] = ""
         opcoes_uf_pedido = [
             ("PE", "PE"), ("AL", "AL"), ("PB", "PB"), ("RN", "RN"),
             ("CE", "CE"), ("BA", "BA"), ("SE", "SE"), ("PI", "PI"),
@@ -7055,8 +7620,6 @@ def acessar_modulo(nome_modulo):
                 erro_pedido = "O modelo selecionado não pertence ao segmento escolhido."
             elif not dados_pedido["ano_modelo"]:
                 erro_pedido = "Selecione o ano/modelo do veículo."
-            elif not dados_pedido["cabine"]:
-                erro_pedido = "Selecione a cabine do veículo."
             elif any((
                 dados_pedido["ano_modelo"]
                 and dados_pedido["ano_modelo"] not in dict(opcoes_ano_modelo_pedido),
@@ -7144,8 +7707,12 @@ def acessar_modulo(nome_modulo):
                     "PRAZO_ENTREGA": dados_pedido["prazo_entrega"],
                     "DETALHES": dados_pedido["detalhes"],
                     "VALIDADE": dados_pedido["validade"],
+                    "VALIDADE_DIAS": dados_pedido["validade_dias"],
                     "LINK_FICHA_TECNICA": modelo_escolhido["link"],
                     "IMAGEM_MODELO_ID": modelo_escolhido["imagem_id"],
+                    "STATUS_LIBERACAO": "AGUARDANDO LIBERACAO",
+                    "LIBERADO_POR": "",
+                    "DATA_LIBERACAO": "",
                 }
                 try:
                     if pedido_edicao_id:
@@ -7188,10 +7755,10 @@ def acessar_modulo(nome_modulo):
                 "cliente",
                 "documento_cliente",
                 "telefone_cliente",
+                "validade_dias",
                 "quantidade",
                 "valor_unitario",
                 "ano_modelo",
-                "cabine",
             }
             classe_rotulo = " class=\"obrigatorio\"" if obrigatorio else ""
             if opcoes is not None:
@@ -7205,13 +7772,15 @@ def acessar_modulo(nome_modulo):
                 controle = (
                     f'<select id="{nome_html}" name="{nome_html}"'
                     f' data-pedido-campo="{nome_html}"'
-                    f'{" required" if obrigatorio else ""}>'
+                    f'{" required" if obrigatorio else ""}'
+                    f'{" disabled" if pedido_somente_leitura else ""}>'
                     f'{"".join(opcoes_html)}</select>'
                 )
             elif tipo == "textarea":
                 controle = (
                     f'<textarea id="{nome_html}" name="{nome_html}" rows="3"'
-                    f' data-pedido-campo="{nome_html}">'
+                    f' data-pedido-campo="{nome_html}"'
+                    f'{" readonly" if pedido_somente_leitura else ""}>'
                     f'{html.escape(valor)}</textarea>'
                 )
             else:
@@ -7229,6 +7798,8 @@ def acessar_modulo(nome_modulo):
                 if nome == "email_cliente":
                     extra += ' autocomplete="email" autocapitalize="none" maxlength="254"'
                 if readonly:
+                    extra += " readonly"
+                if pedido_somente_leitura:
                     extra += " readonly"
                 valor_html = html.escape(valor, quote=True)
                 controle = (
@@ -7325,10 +7896,9 @@ def acessar_modulo(nome_modulo):
             ),
             campo_pedido("detalhes", "Detalhes / observações", "textarea", largura=True),
             campo_pedido(
-                "validade",
-                "Proposta válida até",
-                "date",
-                readonly=True,
+                "validade_dias",
+                "Validade da proposta",
+                opcoes=opcoes_validade_dias_pedido,
             ),
         ))
 
@@ -7339,9 +7909,7 @@ def acessar_modulo(nome_modulo):
             aviso_salvo = (
                 '<div class="pedido-alerta pedido-alerta-sucesso">'
                 f'Proposta <b>{html.escape(pedido_salvo)}</b> {texto_salvo} na planilha '
-                f'<b>{ABA_PEDIDOS_FEITOS}</b>. '
-                f'<a href="{url_for("acessar_modulo", nome_modulo="pedidos", editar=pedido_salvo, imprimir="1")}">'
-                'Visualizar impressão / salvar como PDF</a>.'
+                f'<b>{ABA_PEDIDOS_FEITOS}</b> e aguarda liberação para impressão.'
                 '</div>'
             )
         pedidos_feitos_html = ""
@@ -7350,6 +7918,7 @@ def acessar_modulo(nome_modulo):
                 pedidos_feitos = listar_pedidos_vendedor(
                     planilha_pedidos,
                     email_vendedor,
+                    incluir_todos=visualizar_todos_pedidos,
                 )
             except Exception as e:
                 traceback.print_exc()
@@ -7365,45 +7934,68 @@ def acessar_modulo(nome_modulo):
                 cliente_lista = str(pedido_feito.get("CLIENTE", "")).strip()
                 cnpj_lista = str(pedido_feito.get("DOCUMENTO_CLIENTE", "")).strip()
                 modelo_lista = str(pedido_feito.get("MODELO", "")).strip()
+                vendedor_lista = str(pedido_feito.get("VENDEDOR", "")).strip()
+                liberado = pedido_esta_liberado(pedido_feito)
                 valor_lista = converter_numero(pedido_feito.get("VALOR_TOTAL"))
                 valor_lista_txt = (
                     f"R$ {valor_lista:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
                     if valor_lista is not None else "—"
                 )
                 acao_pdf = (
-                    f'<a class="pedido-btn pedido-btn-secundario pedido-acao-lista" '
+                    f'<a class="pedido-btn pedido-btn-secundario pedido-acao-lista pedido-acao-impressao" '
                     f'href="{url_for("acessar_modulo", nome_modulo="pedidos", editar=id_pedido_lista, imprimir="1")}">'
-                    'Visualizar impressão / salvar como PDF</a>'
-                    if id_pedido_lista else '<span style="color:#94a3b8">ID não registrado</span>'
+                    'Visualizar impressão</a>'
+                    if id_pedido_lista and liberado else ""
                 )
+                status_liberacao = (
+                    '<span class="pedido-status pedido-status-liberado">🟢 Liberada</span>'
+                    if liberado
+                    else '<span class="pedido-status pedido-status-pendente">🔴 Aguardando liberação</span>'
+                )
+                if usuario_gestao_pedidos and not liberado and id_pedido_lista:
+                    acao_liberacao = (
+                        f'<form method="post" action="{url_for("liberar_proposta", pedido_id=id_pedido_lista)}">'
+                        '<button class="pedido-btn pedido-btn-liberar" type="submit">'
+                        '🔴 Liberar impressão</button></form>'
+                    )
+                else:
+                    acao_liberacao = ""
                 acao_editar = (
                     f'<a class="pedido-btn pedido-btn-secundario pedido-acao-lista" '
                     f'href="{url_for("acessar_modulo", nome_modulo="pedidos", editar=id_pedido_lista)}">'
-                    'Editar / Abrir</a>'
+                    f'{"Visualizar" if usuario_gestao_pedidos and str(pedido_feito.get("EMAIL_VENDEDOR", "")).strip().casefold() != email_vendedor.strip().casefold() else "Editar / Abrir"}</a>'
                     if id_pedido_lista else ""
                 )
                 linhas_pedidos_feitos.append(
                     "<tr>"
                     f"<td>{html.escape(data_lista)}</td>"
                     f"<td><b>{html.escape(id_pedido_lista)}</b></td>"
+                    f"<td>{html.escape(vendedor_lista or '—')}</td>"
                     f"<td>{html.escape(cliente_lista)}</td>"
                     f"<td>{html.escape(cnpj_lista or '—')}</td>"
                     f"<td>{html.escape(modelo_lista)}</td>"
                     f"<td class='pedido-valor'>{html.escape(valor_lista_txt)}</td>"
-                    f"<td><div class='pedido-acoes-lista'>{acao_editar}{acao_pdf}</div></td>"
+                    f"<td>{status_liberacao}</td>"
+                    f"<td><div class='pedido-acoes-lista'>{acao_liberacao}{acao_editar}{acao_pdf}</div></td>"
                     "</tr>"
                 )
             tabela_pedidos_feitos = (
                 "".join(linhas_pedidos_feitos)
-                or '<tr><td colspan="7" class="pedido-sem-registro">Você ainda não salvou pedidos.</td></tr>'
+                or '<tr><td colspan="9" class="pedido-sem-registro">Não há propostas cadastradas.</td></tr>'
+            )
+            titulo_lista_pedidos = (
+                "Propostas de todos os consultores"
+                if usuario_gestao_pedidos
+                else f"Propostas feitas por {html.escape(vendedor_pedido)}"
             )
             pedidos_feitos_html = f"""
             <section class="pedido-card pedido-lista">
-              <h3>Propostas feitas por {html.escape(vendedor_pedido)}</h3>
+              <h3>{titulo_lista_pedidos}</h3>
+              {f'<div class="pedido-alerta pedido-alerta-erro">{html.escape(erro_liberacao)}</div>' if erro_liberacao else ''}
               {f'<div class="pedido-alerta pedido-alerta-erro">{erro_lista_pedidos}</div>' if erro_lista_pedidos else ''}
               <div class="pedido-tabela-scroll">
                 <table>
-                  <thead><tr><th>Data</th><th>ID da proposta</th><th>Cliente</th><th>CPF / CNPJ</th><th>Modelo</th><th>Valor total</th><th>Ações</th></tr></thead>
+                  <thead><tr><th>Data</th><th>ID da proposta</th><th>Consultor</th><th>Cliente</th><th>CPF / CNPJ</th><th>Modelo</th><th>Valor total</th><th>Liberação</th><th>Ações</th></tr></thead>
                   <tbody>{tabela_pedidos_feitos}</tbody>
                 </table>
               </div>
@@ -7413,6 +8005,25 @@ def acessar_modulo(nome_modulo):
             f'<div class="pedido-alerta pedido-alerta-erro">{erro_pedido}</div>'
             if erro_pedido else ""
         )
+        aviso_status_pedido = ""
+        if pedido_edicao:
+            if pedido_liberado:
+                liberado_por = html.escape(
+                    str(pedido_edicao.get("LIBERADO_POR", "") or "Gestão")
+                )
+                aviso_status_pedido = (
+                    '<div class="pedido-alerta pedido-alerta-sucesso">'
+                    f'🟢 Impressão liberada por {liberado_por}.'
+                    '</div>'
+                )
+            else:
+                aviso_status_pedido = (
+                    '<div class="pedido-alerta pedido-alerta-pendente">'
+                    '🔴 Aguardando liberação de ADM, gerente, diretor ou superintendente. '
+                    'Qualquer alteração na proposta exigirá nova liberação.'
+                    '</div>'
+                )
+        pode_imprimir = bool(pedido_edicao and pedido_liberado)
         modelos_json = json.dumps(
             list(modelos_pedido.values()),
             ensure_ascii=False,
@@ -7469,11 +8080,17 @@ def acessar_modulo(nome_modulo):
               .pedido-lista td{padding:9px 10px;border-bottom:1px solid #e2e8f0;color:#334155}
               .pedido-acoes-lista{display:flex;align-items:center;gap:6px;flex-wrap:nowrap}
               .pedido-acao-lista{padding:6px 8px;font-size:10px;line-height:1.2;white-space:nowrap}
+              .pedido-acao-impressao{padding:5px 7px;font-size:9px}
               .pedido-lista .pedido-valor{font-weight:800;white-space:nowrap}
               .pedido-sem-registro{text-align:center;padding:24px!important;color:#64748b!important}
               .pedido-alerta{padding:12px 14px;border-radius:8px;margin:0 0 14px;font-size:13px}
               .pedido-alerta-erro{background:#fff5f5;border:1px solid #feb2b2;color:#9b2c2c}
               .pedido-alerta-sucesso{background:#f0fff4;border:1px solid #9ae6b4;color:#276749}
+              .pedido-status{display:inline-block;font-size:12px;font-weight:750;white-space:nowrap}
+              .pedido-status-liberado{color:#15803d}
+              .pedido-status-pendente{color:#b91c1c}
+              .pedido-btn-liberar{background:#fff1f2;color:#b91c1c;border:1px solid #fda4af}
+              .pedido-alerta-pendente{background:#fff7ed;color:#9a3412;border:1px solid #fdba74}
               .pedido-doc{max-width:900px;margin:0 auto;background:#fff;border:1px solid #cbd5e1;padding:32px;color:#0f172a}
               .pedido-doc-marcas{display:flex;justify-content:center;align-items:center;gap:58px;margin-bottom:5px}
               .pedido-doc-marcas img{display:block;width:auto;height:auto;max-width:297px;max-height:113.4px;object-fit:contain}
@@ -7517,6 +8134,7 @@ def acessar_modulo(nome_modulo):
               .pedido-doc-meta-vertical{grid-template-columns:minmax(0,1fr);gap:0}
               @media(max-width:480px){.pedido-modelo-foto img{height:190px}.pedido-doc-modelo img{height:170px}.pedido-modelo-identificacao{gap:6px}.pedido-modelo-identificacao-item{padding:7px}}
               @media(max-width:480px){.pedido-grid{grid-template-columns:1fr}.pedido-campo-largo{grid-column:auto}}
+              {% if pode_imprimir %}
               @media print{
                 @page{size:A4 portrait;margin:20mm}
                 html,body{margin:0!important;padding:0!important}
@@ -7543,18 +8161,21 @@ def acessar_modulo(nome_modulo):
                 }
                 a{color:#0f172a;text-decoration:none}
               }
+              {% else %}
+              @media print{html,body{margin:0!important;padding:0!important}body *{display:none!important}}
+              {% endif %}
               @media(max-width:720px){.pedido-lista{padding:12px}}
             </style>
             <div class="pedido-wrap">
               <div class="pedido-topo">
                 <div><h2>Propostas a Clientes</h2>
-                  <p>Preencha os dados, confira a proposta e imprima ou compartilhe pelo WhatsApp.</p></div>
+                  <p>Preencha os dados e envie para liberação. A impressão fica disponível após aprovação da gestão.</p></div>
               </div>
               <nav class="pedido-nav">
                 <a class="pedido-btn {% if not mostrar_feitos %}pedido-btn-primario{% else %}pedido-btn-secundario{% endif %}" href="{{ url_for('acessar_modulo', nome_modulo='pedidos') }}">Nova proposta</a>
                 <a class="pedido-btn {% if mostrar_feitos %}pedido-btn-primario{% else %}pedido-btn-secundario{% endif %}" href="{{ url_for('acessar_modulo', nome_modulo='pedidos', visao='feitos') }}">Propostas feitas</a>
               </nav>
-              {{ aviso_salvo|safe }}{{ alerta_erro|safe }}
+              {{ aviso_salvo|safe }}{{ alerta_erro|safe }}{{ aviso_status_pedido|safe }}
               {% if mostrar_feitos %}
                 {{ pedidos_feitos_html|safe }}
               {% else %}
@@ -7563,6 +8184,7 @@ def acessar_modulo(nome_modulo):
               {% endif %}
               <form method="POST" class="pedido-editor" id="formPedido">
                 <input type="hidden" name="id_pedido_edicao" value="{{ pedido_edicao_id }}">
+                <input type="hidden" id="validade" name="validade" value="{{ dados_pedido['validade'] }}" data-pedido-campo="validade">
                 {{ campos_tecnicos_ocultos|safe }}
                 {{ campos_modelo_pdf|safe }}
                 <section class="pedido-card">
@@ -7622,9 +8244,11 @@ def acessar_modulo(nome_modulo):
                   <p style="font-size:11px;color:#64748b;margin:10px 0 0">O valor total da proposta é calculado automaticamente pela quantidade e pelo valor unitário.</p>
                 </section>
                 <div class="pedido-acoes">
-                  <button class="pedido-btn pedido-btn-primario" type="submit" {% if not modelos %}disabled{% endif %}>{% if pedido_edicao_id %}💾 Atualizar proposta{% else %}💾 Salvar proposta{% endif %}</button>
-                  {% if pedido_edicao_id %}<a class="pedido-btn pedido-btn-secundario" href="{{ url_for('acessar_modulo', nome_modulo='pedidos', visao='feitos') }}">Cancelar edição</a>{% endif %}
-                  <button class="pedido-btn pedido-btn-secundario" type="button" onclick="imprimirProposta()">🖨️ Visualizar impressão</button>
+                  {% if not pedido_somente_leitura %}
+                    <button class="pedido-btn pedido-btn-primario" type="submit" {% if not modelos %}disabled{% endif %}>{% if pedido_edicao_id %}💾 Atualizar proposta{% else %}💾 Salvar proposta{% endif %}</button>
+                    {% if pedido_edicao_id %}<a class="pedido-btn pedido-btn-secundario" href="{{ url_for('acessar_modulo', nome_modulo='pedidos', visao='feitos') }}">Cancelar edição</a>{% endif %}
+                  {% endif %}
+                  {% if pode_imprimir %}<button class="pedido-btn pedido-btn-secundario" type="button" onclick="imprimirProposta()">🖨️ Visualizar impressão</button>{% endif %}
                 </div>
               </form>
 
@@ -7692,7 +8316,7 @@ def acessar_modulo(nome_modulo):
                   <div><b>Classificação fiscal:</b> <span data-pedido-preview="classificacao_fiscal"></span></div>
                   <div><b>Entrega:</b> <span data-pedido-preview="local_entrega"></span></div>
                   <div><b>Prazo de entrega:</b> <span data-pedido-preview="prazo_entrega"></span></div>
-                  <div><b>Validade da proposta:</b> <span data-pedido-preview="validade"></span></div>
+                  <div><b>Validade da proposta:</b> <span data-pedido-preview="validade_dias"></span></div>
                 </div>
                 <div class="pedido-doc-total"><span>VALOR TOTAL</span><span id="preview-valor-total">R$ 0,00</span></div>
                 <div class="pedido-doc-observacoes" style="margin-top:7px"><b>Detalhes:</b><br><span data-pedido-preview="detalhes"></span></div>
@@ -7827,6 +8451,20 @@ def acessar_modulo(nome_modulo):
                   if(!valor) return '—';
                   const partes=valor.split('-');
                   return partes.length===3 ? partes[2]+'/'+partes[1]+'/'+partes[0] : valor;
+                }
+                function atualizarValidade(){
+                  const dataProposta=campo('data_pedido');
+                  const diasValidade=campo('validade_dias');
+                  const validade=campo('validade');
+                  if(!dataProposta || !diasValidade || !validade || !dataProposta.value || !diasValidade.value) return;
+                  const data=new Date(dataProposta.value+'T00:00:00');
+                  data.setDate(data.getDate()+Number(diasValidade.value));
+                  validade.value=[
+                    data.getFullYear(),
+                    String(data.getMonth()+1).padStart(2,'0'),
+                    String(data.getDate()).padStart(2,'0')
+                  ].join('-');
+                  sincronizarPreview();
                 }
                 function parseNumeroBR(valor){
                   let texto=String(valor || '').trim()
@@ -8107,8 +8745,13 @@ def acessar_modulo(nome_modulo):
                   if(valorUnitarioInput.value.trim()) formatarValorUnitario();
                 }
                 if(formularioPedido){
-                  formularioPedido.addEventListener('submit',formatarValorUnitario);
+                  formularioPedido.addEventListener('submit',()=>{
+                    formatarValorUnitario();
+                    atualizarValidade();
+                  });
                 }
+                campo('data_pedido').addEventListener('change',atualizarValidade);
+                campo('validade_dias').addEventListener('change',atualizarValidade);
                 modeloSelect.addEventListener('change',atualizarModelo);
                 botoesSegmento.forEach(botao=>botao.addEventListener('click',()=>{
                   segmentoInput.value=botao.dataset.segmento;
@@ -8138,6 +8781,7 @@ def acessar_modulo(nome_modulo):
                 });
                 atualizarOpcoesModelos();
                 atualizarModelo();
+                atualizarValidade();
                 sincronizarPreview();
                 if({{ imprimir_ao_abrir|tojson }}){
                   window.addEventListener('load',()=>window.setTimeout(()=>window.imprimirProposta(),350),{once:true});
@@ -8162,9 +8806,10 @@ def acessar_modulo(nome_modulo):
             email_vendedor=email_vendedor,
             pedido_salvo=pedido_salvo,
             pedido_edicao_id=pedido_edicao_id,
-            imprimir_ao_abrir=bool(
-                pedido_edicao_id and request.args.get("imprimir") == "1"
-            ),
+            imprimir_ao_abrir=bool(pode_imprimir and request.args.get("imprimir") == "1"),
+            pode_imprimir=pode_imprimir,
+            pedido_somente_leitura=pedido_somente_leitura,
+            aviso_status_pedido=aviso_status_pedido,
             campos_cliente=campos_cliente_html,
             campos_caminhao=campos_caminhao_html,
             campo_categoria=campo_categoria_html,
@@ -8190,8 +8835,13 @@ def acessar_modulo(nome_modulo):
             try:
                 aba_negocios = planilha.worksheet("Negocios_PM")
             except gspread.exceptions.WorksheetNotFound:
-                aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=10)
-                aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS"])
+                aba_negocios = planilha.add_worksheet(
+                    title="Negocios_PM",
+                    rows=1000,
+                    cols=len(CABECALHOS_NEGOCIOS_PM),
+                )
+                aba_negocios.append_row(CABECALHOS_NEGOCIOS_PM)
+            garantir_colunas_negocios_pm(aba_negocios)
 
             usuario_logado = str(session.get("nome", "")).strip().upper()
             linhas_brutas = aba_negocios.get_all_values()
@@ -9042,7 +9692,7 @@ def acessar_modulo(nome_modulo):
             is_gestao_vendas = usuario_eh_gestao(session.get("perfil"))
             usuario_vendas = str(session.get("nome", "")).strip()
             try:
-                aba_vendas = planilha.worksheet("Vendas_PM")
+                aba_vendas = obter_aba_com_cache(planilha, "Vendas_PM")
             except gspread.exceptions.WorksheetNotFound:
                 aba_vendas = planilha.add_worksheet(title="Vendas_PM", rows=1000, cols=11)
                 aba_vendas.append_row([
@@ -9050,15 +9700,33 @@ def acessar_modulo(nome_modulo):
                     "QUANTIDADE", "VENDEDOR", "ANEXO 1", "ANEXO 2", "Nº DO CONTRATO",
                     "CHASSIS"
                 ])
+                CACHE_ABAS_PLANILHA[(str(planilha.id), "Vendas_PM")] = aba_vendas
 
-            garantir_colunas_venda_pm(aba_vendas)
-            if is_gestao_vendas:
-                migrar_comprovantes_static(aba_vendas)
+            tempo_cache_vendas = 30
+            if not linhas_aba_em_cache("Vendas_PM", ttl=tempo_cache_vendas):
+                garantir_colunas_venda_pm(aba_vendas)
+            linhas_vendas_brutas = obter_linhas_com_cache(
+                aba_vendas,
+                "Vendas_PM",
+                ttl=tempo_cache_vendas,
+            )
+            if is_gestao_vendas and migrar_comprovantes_static(
+                aba_vendas,
+                linhas_vendas_brutas,
+            ):
+                linhas_vendas_brutas = obter_linhas_com_cache(
+                    aba_vendas,
+                    "Vendas_PM",
+                    ttl=tempo_cache_vendas,
+                )
 
             mapa_vendedor_estado = {}
+            regs_u = []
             try:
-                aba_usuarios_l = planilha.worksheet("Usuarios")
-                regs_u = obter_registros_seguros(aba_usuarios_l)
+                aba_usuarios_l = obter_aba_com_cache(planilha, "Usuarios")
+                regs_u = registros_de_linhas_planilha(
+                    obter_linhas_com_cache(aba_usuarios_l, "Usuarios", ttl=60)
+                )
                 for u in regs_u:
                     n_u = str(u.get("NOME", "")).strip()
                     perfil_u = str(u.get("PERFIL", "")).strip().upper()
@@ -9077,8 +9745,10 @@ def acessar_modulo(nome_modulo):
             mapa_modelo_familia = {}
             lista_modelos = []
             try:
-                aba_mod_pesquisa = planilha.worksheet("Modelos")
-                regs_mod = obter_registros_seguros(aba_mod_pesquisa)
+                aba_mod_pesquisa = obter_aba_com_cache(planilha, "Modelos")
+                regs_mod = registros_de_linhas_planilha(
+                    obter_linhas_com_cache(aba_mod_pesquisa, "Modelos", ttl=60)
+                )
                 for rm in regs_mod:
                     valores_modelo = list(rm.values())
                     modelo_nome = str(
@@ -9136,9 +9806,13 @@ def acessar_modulo(nome_modulo):
             )
 
             try:
-                aba_neg_sync = planilha.worksheet("Negocios_PM")
-                regs_neg = obter_registros_seguros(aba_neg_sync)
-                regs_vendas_atuais = obter_registros_seguros(aba_vendas)
+                aba_neg_sync = obter_aba_com_cache(planilha, "Negocios_PM")
+                regs_neg = registros_de_linhas_planilha(
+                    obter_linhas_com_cache(aba_neg_sync, "Negocios_PM", ttl=30)
+                )
+                regs_vendas_atuais = registros_de_linhas_planilha(
+                    linhas_vendas_brutas
+                )
                 chaves_vendas = {chave_venda_pm(registro) for registro in regs_vendas_atuais}
 
                 # A partir daqui, qualquer registro que ainda esteja em
@@ -9165,8 +9839,7 @@ def acessar_modulo(nome_modulo):
                 print(f"Aviso sync retroativa: {e_sync_retroativa}")
 
             # Busca dinâmica de Vendedores (Apenas quem tem CONSULTOR no perfil)
-            aba_usuarios = planilha.worksheet("Usuarios")
-            registros_usuarios = obter_registros_seguros(aba_usuarios)
+            registros_usuarios = regs_u
             lista_consultores = []
             for u in registros_usuarios:
                 perfil_u = str(u.get("PERFIL", "")).strip().upper()
@@ -9245,6 +9918,7 @@ def acessar_modulo(nome_modulo):
                     placa_venda_existente = ""
                     
                     anexo_1_url = ""
+                    falha_upload_comprovante = False
                     if index_edicao:
                         try:
                             linha_atual = aba_vendas.row_values(int(index_edicao))
@@ -9268,20 +9942,43 @@ def acessar_modulo(nome_modulo):
 
                     if "anexo_1" in request.files:
                         file_obj = request.files["anexo_1"]
-                        if file_obj and file_obj.filename:
-                            nome_arquivo = nomear_comprovante_venda(
-                                cliente_v,
-                                produto_v,
-                                chassis_v,
-                                file_obj.filename,
-                            )
-                            anexo_1_url = subir_comprovante_google_drive(
-                                file_obj,
-                                permitir_fallback_local=False,
-                                nome_arquivo=nome_arquivo,
-                            )
+                        if (
+                            file_obj
+                            and file_obj.filename
+                            and cliente_v
+                            and (plano_v or rio_v or produto_legado)
+                        ):
+                            try:
+                                nome_arquivo = nomear_comprovante_venda(
+                                    cliente_v,
+                                    produto_v,
+                                    chassis_v,
+                                    file_obj.filename,
+                                )
+                                anexo_1_url = subir_comprovante_google_drive(
+                                    file_obj,
+                                    permitir_fallback_local=False,
+                                    nome_arquivo=nome_arquivo,
+                                )
+                            except Exception as erro_upload:
+                                print(f"Erro ao enviar comprovante para Upload_Vendas: {erro_upload}")
+                                falha_upload_comprovante = True
+                                erro_upload_texto = str(erro_upload).lower()
+                                if "storagequota" in erro_upload_texto or "storage quota" in erro_upload_texto or "quota" in erro_upload_texto:
+                                    erro_msg = (
+                                        "O Google Drive recusou o upload por limite de armazenamento. "
+                                        "A venda não foi gravada; configure a autenticação OAuth da conta "
+                                        "proprietária ou use uma Unidade compartilhada para Upload_Vendas."
+                                    )
+                                else:
+                                    erro_msg = (
+                                        "Não foi possível enviar o comprovante para Upload_Vendas. "
+                                        "A venda não foi gravada; confira se a conta conectada ao Drive "
+                                        "tem acesso de editor à pasta e tente novamente."
+                                        f"<br>Detalhe técnico: {html.escape(str(erro_upload)[:400])}"
+                                    )
 
-                    if cliente_v and (plano_v or rio_v or produto_legado):
+                    if not falha_upload_comprovante and cliente_v and (plano_v or rio_v or produto_legado):
                         cabecalhos_venda = aba_vendas.row_values(1)
                         dados_venda_linha = montar_linha_venda_pm({
                             "CLIENTE": cliente_v,
@@ -9307,10 +10004,14 @@ def acessar_modulo(nome_modulo):
                             aba_vendas.append_row(dados_venda_linha)
                             invalidar_cache_ab_as("Vendas_PM")
                             sucesso_msg = "Venda registrada com sucesso!"
-                    else:
+                    elif not falha_upload_comprovante:
                         erro_msg = "Informe o cliente e ao menos um produto (Plano de Manutenção ou RIO)."
 
-            linhas_vendas_brutas = aba_vendas.get_all_values()
+            linhas_vendas_brutas = obter_linhas_com_cache(
+                aba_vendas,
+                "Vendas_PM",
+                ttl=tempo_cache_vendas,
+            )
             
             # Captura de Filtros padronizados
             busca_cliente = request.args.get("busca", "").strip().lower()
@@ -9547,66 +10248,144 @@ def acessar_modulo(nome_modulo):
             for sigla_est, dados_est in comissoes_por_estado.items():
                 if dados_est["vendedores"]:
                     nome_est_completo = "Pernambuco (PE)" if sigla_est == "PE" else "Alagoas (AL)"
-                    detalhes_vendedores_html = ""
+                    linhas_vendedores_html = ""
                     for v_nome, d_v in dados_est["vendedores"].items():
                         tot_v = d_v["pm_total"] + d_v["rio_total"]
-                        detalhes_vendedores_html += f"""
-                        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px; margin-bottom: 8px;">
-                            <div style="font-weight: 700; color: #002244; font-size: 13px; margin-bottom: 4px;">Consultor(a): {v_nome}</div>
-                            <div style="font-size: 12px; color: #4a5568; display: flex; justify-content: space-between;">
-                                <span>Planos de Manutenção ({d_v['pm_qtd']} un. × R$ {formata_br(COMISSAO_VENDEDOR_PM)}):</span>
-                                <b>R$ {formata_br(d_v['pm_total'])}</b>
-                            </div>
-                            <div style="font-size: 12px; color: #4a5568; display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                <span>Telemetria RIO ({d_v['rio_qtd']} un. × R$ {formata_br(COMISSAO_VENDEDOR_RIO)}):</span>
-                                <b>R$ {formata_br(d_v['rio_total'])}</b>
-                            </div>
-                            <div style="font-size: 13px; color: #2f855a; font-weight: 700; border-top: 1px dashed #cbd5e0; padding-top: 4px; display: flex; justify-content: space-between;">
-                                <span>Total Vendedor:</span>
-                                <span>R$ {formata_br(tot_v)}</span>
-                            </div>
-                        </div>
+                        linhas_vendedores_html += f"""
+                        <tr>
+                            <th scope="row">{html.escape(str(v_nome))}</th>
+                            <td><span>{d_v['pm_qtd']} un.</span><strong>R$ {formata_br(d_v['pm_total'])}</strong></td>
+                            <td><span>{d_v['rio_qtd']} un.</span><strong>R$ {formata_br(d_v['rio_total'])}</strong></td>
+                            <td class="comissao-tabela-total"><strong>R$ {formata_br(tot_v)}</strong></td>
+                        </tr>
                         """
                     
                     bloco_comissoes_html += f"""
-                    <div style="margin-bottom: 16px; background: #f8fafc; border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px;">
-                        <h4 style="font-size: 14px; color: #002244; border-bottom: 2px solid #002244; padding-bottom: 4px; margin-bottom: 10px; text-transform: uppercase;">📍 Loja / Região: {nome_est_completo}</h4>
-                        {detalhes_vendedores_html}
-                        <div style="text-align: right; font-size: 14px; font-weight: 700; color: #002244; margin-top: 8px; border-top: 1px solid #cbd5e0; padding-top: 6px;">
-                            Total Região {sigla_est}: R$ {formata_br(dados_est['total_geral'])}
+                    <section class="comissao-regiao">
+                        <h4 class="comissao-regiao-titulo">Loja / Região <span>{nome_est_completo}</span></h4>
+                        <div class="comissao-tabela-wrap">
+                            <table class="comissao-tabela">
+                                <thead><tr>
+                                    <th scope="col">Consultor</th>
+                                    <th scope="col">Plano de Manutenção<small>Comissão: R$ {formata_br(COMISSAO_VENDEDOR_PM)} / un.</small></th>
+                                    <th scope="col">Telemetria RIO<small>Comissão: R$ {formata_br(COMISSAO_VENDEDOR_RIO)} / un.</small></th>
+                                    <th scope="col">Total</th>
+                                </tr></thead>
+                                <tbody>{linhas_vendedores_html}</tbody>
+                            </table>
                         </div>
-                    </div>
+                        <div class="comissao-regiao-total">
+                            <span>Total Região {sigla_est}</span>
+                            <strong>R$ {formata_br(dados_est['total_geral'])}</strong>
+                        </div>
+                    </section>
                     """
 
             if not bloco_comissoes_html:
-                bloco_comissoes_html = '<p style="color: #718096; font-size: 13px; text-align: center;">Nenhuma comissão registrada para o período.</p>'
+                bloco_comissoes_html = '<p class="comissao-vazia">Nenhuma comissão registrada para o período.</p>'
 
             comissao_minha_pm = total_qtd_pm_geral * COMISSAO_APM_PM
             comissao_minha_rio = total_qtd_rio_geral * COMISSAO_APM_RIO
             comissao_minha_total = comissao_minha_pm + comissao_minha_rio
 
             bloco_minha_comissao = f"""
-            <div style="background: #eef2f7; border: 1px solid #cbd5e0; border-radius: 8px; padding: 16px; margin-top: 20px; border-left: 5px solid #2f855a;">
-                <h3 style="font-size: 15px; color: #002244; margin-bottom: 12px; border-bottom: 2px solid #cbd5e0; padding-bottom: 6px;">🎯 Resumo da Sua Comissão (APM - Apoio ao Plano de Manutenção)</h3>
-                <div style="font-weight: 700; color: #002244; font-size: 13px; margin-bottom: 8px;">Logado como: {nome_usuario_logado} (Vendedor APM)</div>
-                <div style="font-size: 13px; color: #4a5568; display: flex; justify-content: space-between; margin-bottom: 4px;">
-                    <span>Planos de Manutenção ({total_qtd_pm_geral} un. × R$ {formata_br(COMISSAO_APM_PM)}):</span>
-                    <b>R$ {formata_br(comissao_minha_pm)}</b>
+            <section class="comissao-apm">
+                <div class="comissao-apm-cabecalho">
+                    <div>
+                        <h3>Resumo da sua comissão</h3>
+                        <p>Apoio ao Plano de Manutenção (APM)</p>
+                    </div>
+                    <span class="comissao-apm-usuario">{nome_usuario_logado}</span>
                 </div>
-                <div style="font-size: 13px; color: #4a5568; display: flex; justify-content: space-between; margin-bottom: 8px;">
-                    <span>Telemetria RIO ({total_qtd_rio_geral} un. × R$ {formata_br(COMISSAO_APM_RIO)}):</span>
-                    <b>R$ {formata_br(comissao_minha_rio)}</b>
+                <div class="comissao-tabela-wrap">
+                    <table class="comissao-tabela">
+                        <thead><tr>
+                            <th scope="col">Beneficiário</th>
+                            <th scope="col">Plano de Manutenção<small>Comissão APM: R$ {formata_br(COMISSAO_APM_PM)} / un.</small></th>
+                            <th scope="col">Telemetria RIO<small>Comissão APM: R$ {formata_br(COMISSAO_APM_RIO)} / un.</small></th>
+                            <th scope="col">Total</th>
+                        </tr></thead>
+                        <tbody><tr>
+                            <th scope="row">APM</th>
+                            <td><span>{total_qtd_pm_geral} un.</span><strong>R$ {formata_br(comissao_minha_pm)}</strong></td>
+                            <td><span>{total_qtd_rio_geral} un.</span><strong>R$ {formata_br(comissao_minha_rio)}</strong></td>
+                            <td class="comissao-tabela-total"><strong>R$ {formata_br(comissao_minha_total)}</strong></td>
+                        </tr></tbody>
+                    </table>
                 </div>
-                <div style="font-size: 15px; color: #2f855a; font-weight: 700; border-top: 1px dashed #cbd5e0; padding-top: 8px; display: flex; justify-content: space-between;">
-                    <span>Sua Comissão Total (Todas as Vendas):</span>
-                    <span>R$ {formata_br(comissao_minha_total)}</span>
-                </div>
-            </div>
+            </section>
             """
             
             json_dashboard_data = json.dumps(dados_dashboard)
 
             conteudo = f"""
+            <style>
+                .comissoes-resumo{{color:#243b53}}
+                .comissoes-resumo .comissoes-resumo-titulo{{
+                    color:#002244;font-size:15px;margin:0 0 12px;padding-bottom:9px;
+                    border-bottom:2px solid #2b6cb0
+                }}
+                .comissao-regiao{{
+                    background:#f2f7fc;border:1px solid #c7d9eb;border-radius:10px;
+                    padding:14px;margin:0 0 12px
+                }}
+                .comissao-regiao-titulo{{
+                    display:flex;justify-content:space-between;align-items:center;gap:8px;
+                    color:#fff;background:#002244;border-radius:6px;padding:9px 12px;
+                    margin:0 0 10px;font-size:12px;text-transform:uppercase
+                }}
+                .comissao-regiao-titulo span{{color:#fff;font-weight:600}}
+                .comissao-tabela-wrap{{width:100%;overflow-x:auto;background:#fff;border-radius:6px}}
+                .comissao-tabela{{width:100%;border-collapse:collapse;min-width:620px;color:#243b53;font-size:11px}}
+                .comissao-tabela th,.comissao-tabela td{{
+                    padding:9px 10px;text-align:left;border-bottom:1px solid #e5edf5
+                }}
+                .comissao-tabela thead th{{
+                    background:#e7f0fa;color:#002244;font-size:10px;text-transform:uppercase;vertical-align:bottom
+                }}
+                .comissao-tabela thead small{{
+                    display:block;margin-top:3px;color:#52677d;font-size:9px;font-weight:600;text-transform:none
+                }}
+                .comissao-tabela tbody th{{color:#002244;font-size:11px;font-weight:700;white-space:nowrap}}
+                .comissao-tabela td span,.comissao-tabela td strong{{display:block}}
+                .comissao-tabela td span{{color:#52677d;font-size:10px;margin-bottom:2px}}
+                .comissao-tabela td strong{{color:#243b53;white-space:nowrap;font-variant-numeric:tabular-nums}}
+                .comissao-tabela .comissao-tabela-total{{
+                    background:#f2f7fc;color:#002244;font-weight:800
+                }}
+                .comissao-tabela-total strong,.comissao-regiao-total strong{{
+                    color:#002244;font-variant-numeric:tabular-nums
+                }}
+                .comissao-regiao-total{{
+                    display:flex;justify-content:space-between;align-items:center;gap:10px;
+                    margin-top:10px;padding:10px 12px;background:#dceafa;border-radius:6px;
+                    color:#002244;font-size:13px;font-weight:800
+                }}
+                .comissao-apm{{
+                    margin-top:14px;padding:0 16px 14px;background:#fff;
+                    border:1px solid #b8cce0;border-radius:10px;box-shadow:0 3px 12px rgba(0,34,68,.08)
+                }}
+                .comissao-apm-cabecalho{{
+                    display:flex;justify-content:space-between;align-items:center;gap:12px;
+                    margin:0 -16px 10px;padding:12px 16px;background:#002244;
+                    border-radius:9px 9px 0 0;color:#fff
+                }}
+                .comissao-apm-cabecalho h3{{margin:0;font-size:14px;color:#fff}}
+                .comissao-apm-cabecalho p{{margin:3px 0 0;color:#dceafa;font-size:11px}}
+                .comissao-apm-usuario{{
+                    padding:6px 9px;border:1px solid #7898b8;border-radius:20px;
+                    color:#fff;font-size:11px;font-weight:700
+                }}
+                .comissao-vazia{{color:#52677d;font-size:13px;text-align:center;padding:10px}}
+                @media(max-width:520px){{
+                    .comissao-regiao,.comissao-apm{{padding:10px}}
+                    .comissao-apm-cabecalho{{margin:-10px -10px 9px;padding:10px;align-items:flex-start}}
+                    .comissao-apm-usuario{{max-width:45%;text-align:center}}
+                    .comissao-regiao-total{{font-size:12px}}
+                    .comissao-tabela{{font-size:10px}}
+                    .comissao-tabela th,.comissao-tabela td{{padding:8px}}
+                }}
+            </style>
             <div>
                 <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 14px; font-size: 17px;">Controle de Vendas Fechadas e Comissões</h2>
                 
@@ -9759,8 +10538,8 @@ def acessar_modulo(nome_modulo):
                         </table>
                     </div>
 
-                    <div style="background: #f1f5f9; border: 1px solid #cbd5e0; border-radius: 8px; padding: 16px; margin-top: 20px;">
-                        <h3 style="font-size: 15px; color: #002244; margin-bottom: 12px; border-bottom: 2px solid #002244; padding-bottom: 6px;">Resumo Detalhado de Comissões por Região (PE / AL)</h3>
+                    <div class="comissoes-resumo" style="background: #f8fbff; border: 1px solid #c7d9eb; border-radius: 10px; padding: 16px; margin-top: 20px;">
+                        <h3 class="comissoes-resumo-titulo">Resumo detalhado de comissões por região (PE / AL)</h3>
                         {bloco_comissoes_html}
                     </div>
 
@@ -10050,7 +10829,21 @@ def acessar_modulo(nome_modulo):
         except HTTPException:
             raise
         except Exception as e:
-            conteudo = f'<div style="color: #c53030; background: #fff5f5; padding: 15px; border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar Vendas:</b> {e}</div>'
+            erro_texto = str(e)
+            if "429" in erro_texto or "RATE_LIMIT_EXCEEDED" in erro_texto:
+                mensagem_erro = (
+                    "O Google Sheets atingiu o limite de leituras da API "
+                    "(60 por minuto por usuário). Aguarde cerca de um minuto "
+                    "e atualize a página; as leituras repetidas agora são "
+                    "reutilizadas em cache."
+                )
+            else:
+                mensagem_erro = erro_texto
+            conteudo = (
+                '<div style="color: #c53030; background: #fff5f5; padding: 15px; '
+                'border-radius: 8px; border: 1px solid #feb2b2;"><b>Erro ao carregar Vendas:</b> '
+                f'{html.escape(mensagem_erro)}</div>'
+            )
 
     elif nome_modulo == "negocios":
         try:
@@ -10072,7 +10865,8 @@ def acessar_modulo(nome_modulo):
                 aba_negocios = planilha.worksheet("Negocios_PM")
             except gspread.exceptions.WorksheetNotFound:
                 aba_negocios = planilha.add_worksheet(title="Negocios_PM", rows=1000, cols=11)
-                aba_negocios.append_row(["TEMPERATURA", "DATA", "VENDEDOR", "CLIENTE", "MODELO", "CHASSIS", "PLANO DE MANUTENÇÃO", "RIO", "CONTATO DO CLIENTE", "TELEFONE", "COMENTÁRIOS"])
+                aba_negocios.append_row(CABECALHOS_NEGOCIOS_PM)
+            cabecalhos_negocios_pm = garantir_colunas_negocios_pm(aba_negocios)
             
             msg_sync = session.pop("msg_sync_negocios", None)
             aviso_sync = None
@@ -10196,12 +10990,44 @@ def acessar_modulo(nome_modulo):
                     contato = request.form.get("contato", "").strip()
                     telefone = request.form.get("telefone", "").strip()
                     comentarios = request.form.get("comentarios", "").strip()
+                    anexo_1_negocio = ""
+                    if index_edicao:
+                        linha_negocio_existente = aba_negocios.row_values(int(index_edicao))
+                        indice_anexo = next(
+                            (
+                                indice
+                                for indice, cabecalho in enumerate(cabecalhos_negocios_pm)
+                                if chave_cabecalho_negocios_pm(cabecalho) == "anexo 1"
+                            ),
+                            None,
+                        )
+                        if indice_anexo is not None and indice_anexo < len(linha_negocio_existente):
+                            anexo_1_negocio = linha_negocio_existente[indice_anexo]
 
                     if cliente and vendedor_form:
-                        dados_linha = [temperatura, data_neg, vendedor_form, cliente, modelo, chassis, plano_manutencao, rio_val, contato, telefone, comentarios]
+                        dados_linha = montar_linha_negocio_pm({
+                            "TEMPERATURA": temperatura,
+                            "DATA": data_neg,
+                            "VENDEDOR": vendedor_form,
+                            "CLIENTE": cliente,
+                            "MODELO": modelo,
+                            "CHASSIS": chassis,
+                            "PLANO DE MANUTENÇÃO": plano_manutencao,
+                            "RIO": rio_val,
+                            "CONTATO DO CLIENTE": contato,
+                            "TELEFONE": telefone,
+                            "COMENTÁRIOS": comentarios,
+                            "ANEXO 1": anexo_1_negocio,
+                        }, cabecalhos_negocios_pm)
+                        ultima_coluna_negocios = chr(
+                            ord("A") + len(cabecalhos_negocios_pm) - 1
+                        )
                         if index_edicao:
                             idx_int = int(index_edicao)
-                            aba_negocios.update(f"A{idx_int}:K{idx_int}", [dados_linha])  # <--- ATUALIZADO PARA K
+                            aba_negocios.update(
+                                f"A{idx_int}:{ultima_coluna_negocios}{idx_int}",
+                                [dados_linha],
+                            )
                             invalidar_cache_ab_as("Negocios_PM")
                             sucesso_msg = "Negócio atualizado com sucesso!"
                         else:
@@ -10232,6 +11058,10 @@ def acessar_modulo(nome_modulo):
                                     "PLANO DE MANUTENÇÃO": plano_manutencao,
                                     "RIO": rio_val,
                                     "VENDEDOR": vendedor_form,
+                                    "CONTATO DO CLIENTE": contato,
+                                    "TELEFONE": telefone,
+                                    "COMENTÁRIOS": comentarios,
+                                    "ANEXO 1": anexo_1_negocio,
                                 }
 
                                 # Importante: não existe mais etapa/botão "Vender".
@@ -11830,7 +12660,9 @@ def api_atualizacoes():
         CACHE_ATUALIZACOES_ABAS["timestamp"]
         and agora - CACHE_ATUALIZACOES_ABAS["timestamp"] < 300
     ):
-        final_cache = CACHE_ATUALIZACOES_ABAS["atualizacoes"][:limite]
+        final_cache = filtrar_atualizacoes_por_acesso(
+            CACHE_ATUALIZACOES_ABAS["atualizacoes"]
+        )[:limite]
         return jsonify({"atualizacoes": final_cache, "nao_lidas": len(final_cache)})
 
     atualizacoes = []
@@ -11923,7 +12755,9 @@ def api_atualizacoes():
     except Exception as e:
         print(f"API atualizações: erro ao verificar as abas: {e}")
         if CACHE_ATUALIZACOES_ABAS["timestamp"]:
-            final_cache = CACHE_ATUALIZACOES_ABAS["atualizacoes"][:limite]
+            final_cache = filtrar_atualizacoes_por_acesso(
+                CACHE_ATUALIZACOES_ABAS["atualizacoes"]
+            )[:limite]
             return jsonify({"atualizacoes": final_cache, "nao_lidas": len(final_cache)})
         return jsonify({
             "atualizacoes": [],
@@ -11946,7 +12780,9 @@ def api_atualizacoes():
     atualizacoes.sort(key=chave_atualizacao, reverse=True)
     CACHE_ATUALIZACOES_ABAS["atualizacoes"] = atualizacoes[:30]
     CACHE_ATUALIZACOES_ABAS["timestamp"] = time.time()
-    final = CACHE_ATUALIZACOES_ABAS["atualizacoes"][:limite]
+    final = filtrar_atualizacoes_por_acesso(
+        CACHE_ATUALIZACOES_ABAS["atualizacoes"]
+    )[:limite]
     return jsonify({"atualizacoes": final, "nao_lidas": len(final)})
 
 

@@ -102,17 +102,29 @@ def conectar_google_sheets():
     return planilha
 
 
-def conectar_google_drive():
+def obter_credenciais_oauth_drive():
     credenciais_oauth = os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
     arquivo_oauth = os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS_FILE", "").strip()
     if credenciais_oauth:
-        credenciais = OAuthCredentials.from_authorized_user_info(
+        return OAuthCredentials.from_authorized_user_info(
             json.loads(credenciais_oauth), scopes=escopos
         )
-    elif arquivo_oauth:
-        credenciais = OAuthCredentials.from_authorized_user_file(
+    if arquivo_oauth:
+        return OAuthCredentials.from_authorized_user_file(
             arquivo_oauth, scopes=escopos
         )
+    arquivo_oauth_local = os.path.join(app.root_path, "oauth_render.json")
+    if os.path.isfile(arquivo_oauth_local):
+        return OAuthCredentials.from_authorized_user_file(
+            arquivo_oauth_local, scopes=escopos
+        )
+    return None
+
+
+def conectar_google_drive(credenciais_oauth=None):
+    credenciais_oauth = credenciais_oauth or obter_credenciais_oauth_drive()
+    if credenciais_oauth is not None:
+        credenciais = credenciais_oauth
     elif "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
         credenciais = Credentials.from_service_account_info(
             json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=escopos
@@ -203,7 +215,8 @@ def encontrar_comprovante_venda_drive(arquivos, cliente, produtos=(), chassis=""
 def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_arquivo=None):
     """Envia comprovantes para a pasta de vendas no Drive."""
     try:
-        service = conectar_google_drive()
+        credenciais_oauth = obter_credenciais_oauth_drive()
+        service = conectar_google_drive(credenciais_oauth)
         folder_id = os.environ.get("GOOGLE_DRIVE_UPLOAD_VENDAS_FOLDER_ID", "").strip()
         if not folder_id:
             resposta = service.files().list(
@@ -229,8 +242,7 @@ def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_a
             raise RuntimeError("O ID configurado para Upload_Vendas não é uma pasta do Google Drive.")
         if (
             not pasta_upload.get("driveId")
-            and not os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
-            and not os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS_FILE", "").strip()
+            and credenciais_oauth is None
         ):
             raise RuntimeError(
                 "Upload_Vendas está no Meu Drive, mas o app está conectado apenas "
@@ -370,7 +382,7 @@ def servir_comprovante_drive(file_id):
         )
     except Exception as erro:
         print(f"Erro ao carregar comprovante do Drive {file_id}: {erro}")
-        abort(404)
+        abort(502, description="Não foi possível carregar o arquivo privado do Google Drive.")
 
 
 @app.route("/pedido-arquivo/<file_id>")
@@ -1567,7 +1579,7 @@ def obter_pasta_upload_pedidos(service):
 
     if (
         not pasta.get("driveId")
-        and not os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
+        and obter_credenciais_oauth_drive() is None
     ):
         raise RuntimeError(
             "Upload_Pedidos está no Meu Drive. Configure GOOGLE_DRIVE_OAUTH_CREDENTIALS "
@@ -9866,6 +9878,7 @@ def acessar_modulo(nome_modulo):
 
             sucesso_msg = None
             erro_msg = None
+            aviso_msg = None
 
             if request.method == "POST" and "acao_form" in request.form:
                 acao_form = request.form.get("acao_form", "").strip()
@@ -9918,7 +9931,8 @@ def acessar_modulo(nome_modulo):
                     placa_venda_existente = ""
                     
                     anexo_1_url = ""
-                    falha_upload_comprovante = False
+                    falha_leitura_venda = False
+                    aviso_upload_comprovante = ""
                     if index_edicao:
                         try:
                             linha_atual = aba_vendas.row_values(int(index_edicao))
@@ -9937,10 +9951,15 @@ def acessar_modulo(nome_modulo):
                             )
                             if idx_placa is not None and len(linha_atual) > idx_placa:
                                 placa_venda_existente = linha_atual[idx_placa]
-                        except Exception:
-                            pass
+                        except Exception as erro_leitura:
+                            print(f"Erro ao ler a venda da linha {index_edicao}: {erro_leitura}")
+                            falha_leitura_venda = True
+                            erro_msg = (
+                                "Não foi possível recuperar os dados atuais da venda. "
+                                "A edição não foi gravada para evitar perder o Anexo 1 existente."
+                            )
 
-                    if "anexo_1" in request.files:
+                    if not falha_leitura_venda and "anexo_1" in request.files:
                         file_obj = request.files["anexo_1"]
                         if (
                             file_obj
@@ -9962,23 +9981,26 @@ def acessar_modulo(nome_modulo):
                                 )
                             except Exception as erro_upload:
                                 print(f"Erro ao enviar comprovante para Upload_Vendas: {erro_upload}")
-                                falha_upload_comprovante = True
                                 erro_upload_texto = str(erro_upload).lower()
-                                if "storagequota" in erro_upload_texto or "storage quota" in erro_upload_texto or "quota" in erro_upload_texto:
-                                    erro_msg = (
-                                        "O Google Drive recusou o upload por limite de armazenamento. "
-                                        "A venda não foi gravada; configure a autenticação OAuth da conta "
-                                        "proprietária ou use uma Unidade compartilhada para Upload_Vendas."
+                                if "invalid_grant" in erro_upload_texto or "token has been expired or revoked" in erro_upload_texto:
+                                    aviso_upload_comprovante = (
+                                        "O comprovante não foi enviado porque a autenticação OAuth do "
+                                        "Google Drive expirou ou foi revogada. Reconecte a conta do Drive."
+                                    )
+                                elif "storagequota" in erro_upload_texto or "storage quota" in erro_upload_texto or "quota" in erro_upload_texto:
+                                    aviso_upload_comprovante = (
+                                        "O comprovante não foi enviado por limite de armazenamento do "
+                                        "Google Drive; configure a autenticação OAuth da conta proprietária "
+                                        "ou use uma Unidade compartilhada para Upload_Vendas."
                                     )
                                 else:
-                                    erro_msg = (
-                                        "Não foi possível enviar o comprovante para Upload_Vendas. "
-                                        "A venda não foi gravada; confira se a conta conectada ao Drive "
-                                        "tem acesso de editor à pasta e tente novamente."
+                                    aviso_upload_comprovante = (
+                                        "O comprovante não foi enviado para Upload_Vendas. Confira se a "
+                                        "conta conectada ao Drive tem acesso de editor à pasta."
                                         f"<br>Detalhe técnico: {html.escape(str(erro_upload)[:400])}"
                                     )
 
-                    if not falha_upload_comprovante and cliente_v and (plano_v or rio_v or produto_legado):
+                    if not falha_leitura_venda and cliente_v and (plano_v or rio_v or produto_legado):
                         cabecalhos_venda = aba_vendas.row_values(1)
                         dados_venda_linha = montar_linha_venda_pm({
                             "CLIENTE": cliente_v,
@@ -10004,7 +10026,15 @@ def acessar_modulo(nome_modulo):
                             aba_vendas.append_row(dados_venda_linha)
                             invalidar_cache_ab_as("Vendas_PM")
                             sucesso_msg = "Venda registrada com sucesso!"
-                    elif not falha_upload_comprovante:
+                        if aviso_upload_comprovante:
+                            detalhe_anexo = (
+                                "O Anexo 1 existente foi mantido."
+                                if index_edicao
+                                else "A venda foi registrada sem Anexo 1."
+                            )
+                            aviso_msg = f"{sucesso_msg} {aviso_upload_comprovante} {detalhe_anexo}"
+                            sucesso_msg = None
+                    elif not falha_leitura_venda:
                         erro_msg = "Informe o cliente e ao menos um produto (Plano de Manutenção ou RIO)."
 
             linhas_vendas_brutas = obter_linhas_com_cache(
@@ -10190,15 +10220,29 @@ def acessar_modulo(nome_modulo):
 
                 link_anexo_1 = reg.get('ANEXO 1', '')
                 url_anexo_atual = url_comprovante_no_app(link_anexo_1) if link_anexo_1 else ""
+                id_anexo_drive = extrair_id_arquivo_drive(link_anexo_1)
+                link_drive_anexo = (
+                    f"https://drive.google.com/file/d/{id_anexo_drive}/view?usp=drivesdk"
+                    if id_anexo_drive
+                    else ""
+                )
+                url_para_abrir_anexo = link_drive_anexo or url_anexo_atual
                 anexos_html = ""
                 if link_anexo_1:
                     if url_anexo_atual:
                         url_segura = html.escape(url_anexo_atual, quote=True)
+                        link_drive_seguro = html.escape(link_drive_anexo, quote=True)
                         anexos_html = f'''
-                        <div onclick="abrirImagemModal('{url_segura}')" title="Clique para ampliar" style="display: inline-block; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
-                            <img src="{url_segura}" alt="Anexo 1" class="img-comprovacao">
+                        <div onclick="if(this.querySelector('img').naturalWidth) abrirImagemModal(this.querySelector('img').src)" title="Clique para ampliar" style="display: inline-block; cursor: pointer; background: #fff; padding: 4px; border: 1px solid #cbd5e0; border-radius: 4px;">
+                            <img src="{url_segura}" alt="Anexo 1" class="img-comprovacao" onerror="this.style.display='none';this.nextElementSibling.style.display='inline';">
+                            <span style="display:none; color:#a33; font-size:11px;">Pré-visualização indisponível</span>
                         </div>
                         '''
+                        if link_drive_anexo:
+                            anexos_html += (
+                                f'<br><a href="{link_drive_seguro}" target="_blank" '
+                                'rel="noopener noreferrer" style="font-size:11px;">Abrir no Google Drive</a>'
+                            )
                     else:
                         anexos_html = '<span style="color:#a33;">Comprovante indisponível; reenvie o arquivo.</span>'
 
@@ -10206,7 +10250,8 @@ def acessar_modulo(nome_modulo):
                     json.dumps(str(valor or ""), ensure_ascii=False)
                     for valor in (
                         cli, contrato_reg, plano_reg, rio_reg, dt_v, mod, qtd_str,
-                        vend, chassis_reg, link_anexo_1, url_anexo_atual,
+                        vend, chassis_reg, link_anexo_1, url_para_abrir_anexo,
+                        url_anexo_atual,
                     )
                 )
                 argumentos_edicao = html.escape(argumentos_edicao, quote=True)
@@ -10390,6 +10435,7 @@ def acessar_modulo(nome_modulo):
                 <h2 style="color: #002244; border-bottom: 2px solid #edf2f7; padding-bottom: 8px; margin-bottom: 14px; font-size: 17px;">Controle de Vendas Fechadas e Comissões</h2>
                 
                 {f'<div class="sucesso">{sucesso_msg}</div>' if sucesso_msg else ''}
+                {f'<div style="background:#fffaf0; color:#9c4221; padding:12px; border-radius:6px; font-size:13px; margin-bottom:15px; border:1px solid #fbd38d; line-height:1.4; font-weight:500;">{aviso_msg}</div>' if aviso_msg else ''}
                 {f'<div class="error">{erro_msg}</div>' if erro_msg else ''}
 
                 <!-- Botões de Ação Externa (Gerar PDF e Ver Gráficos) -->
@@ -10462,18 +10508,21 @@ def acessar_modulo(nome_modulo):
                                 </div>
                             </div>
 
-                            <div style="margin-bottom: 10px;">
-                                <label>Chassi</label>
-                                <input type="text" name="chassis" placeholder="Chassi do veículo">
-                            </div>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 10px;">
+                                <div>
+                                    <label>Chassi</label>
+                                    <input type="text" name="chassis" placeholder="Chassi do veículo">
+                                </div>
 
-                            <div style="margin-bottom: 10px;">
-                                <label>Anexo 1 (Comprovação / Imagem)</label>
-                                <input type="file" name="anexo_1" accept="image/*" capture="environment">
-                                <div id="comprovanteAtual" role="status" style="display:none; margin-top:8px; padding:9px 10px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; color:#1e3a5f; font-size:12px;">
-                                    <span id="comprovanteAtualNome"></span>
-                                    <a id="comprovanteAtualLink" href="#" target="_blank" rel="noopener noreferrer" style="display:none; margin-left:8px; color:#0056b3; font-weight:700;">Abrir comprovante</a>
-                                    <div id="comprovanteAtualInstrucao" style="margin-top:3px;"></div>
+                                <div>
+                                    <label>Anexo 1 (Comprovação / Imagem)</label>
+                                    <input type="file" name="anexo_1" accept="image/*" capture="environment">
+                                    <div id="comprovanteAtual" role="status" style="display:none; margin-top:8px; padding:9px 10px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; color:#1e3a5f; font-size:12px;">
+                                        <span id="comprovanteAtualNome"></span>
+                                        <a id="comprovanteAtualLink" href="#" target="_blank" rel="noopener noreferrer" style="display:none; margin-left:8px; color:#0056b3; font-weight:700;">Abrir comprovante</a>
+                                        <div id="comprovanteAtualInstrucao" style="margin-top:3px;"></div>
+                                        <img id="comprovanteAtualImagem" alt="Pré-visualização do Anexo 1" style="display:none; max-width:100%; max-height:220px; margin-top:8px; border:1px solid #cbd5e0; border-radius:4px; object-fit:contain;">
+                                    </div>
                                 </div>
                             </div>
 
@@ -10596,7 +10645,7 @@ def acessar_modulo(nome_modulo):
                     }}
                 }}
 
-                function carregarVendaParaEdicao(idx, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor, chassis, anexoAtual, urlAnexoAtual) {{
+                function carregarVendaParaEdicao(idx, cliente, contrato, plano, rio, dataVenda, modelo, quantidade, vendedor, chassis, anexoAtual, urlAnexoAtual, urlPreviewAnexo) {{
                     var container = document.getElementById('containerFormularioVenda');
                     container.style.display = 'block';
                     document.getElementById('iconeSanfonaVenda').innerHTML = '▼';
@@ -10615,19 +10664,22 @@ def acessar_modulo(nome_modulo):
                     document.querySelector('[name="quantidade"]').value = quantidade;
                     selecionarOpcaoVenda('vendedor', vendedor);
                     document.querySelector('[name="chassis"]').value = chassis;
-                    mostrarComprovanteAtual(anexoAtual, urlAnexoAtual);
+                    mostrarComprovanteAtual(anexoAtual, urlAnexoAtual, urlPreviewAnexo);
 
                     window.scrollTo({{ top: 0, behavior: 'smooth' }});
                 }}
 
-                function mostrarComprovanteAtual(caminho, url) {{
+                function mostrarComprovanteAtual(caminho, url, urlPreview) {{
                     var painel = document.getElementById('comprovanteAtual');
                     var nome = document.getElementById('comprovanteAtualNome');
                     var link = document.getElementById('comprovanteAtualLink');
                     var instrucao = document.getElementById('comprovanteAtualInstrucao');
+                    var imagem = document.getElementById('comprovanteAtualImagem');
                     var caminhoAtual = String(caminho || '').trim();
 
                     painel.style.display = caminhoAtual ? 'block' : 'none';
+                    imagem.style.display = 'none';
+                    imagem.removeAttribute('src');
                     if (!caminhoAtual) return;
 
                     var nomeArquivo = caminhoAtual.split('/').pop().split(/[?#]/)[0];
@@ -10640,6 +10692,14 @@ def acessar_modulo(nome_modulo):
                         link.removeAttribute('href');
                         link.style.display = 'none';
                         instrucao.textContent = 'O caminho está cadastrado, mas o arquivo não está disponível no app.';
+                    }}
+                    imagem.onerror = function() {{
+                        imagem.style.display = 'none';
+                        instrucao.textContent = 'Pré-visualização indisponível. Abra o arquivo no Google Drive ou reconecte a conta do app.';
+                    }};
+                    if (urlPreview) {{
+                        imagem.style.display = 'block';
+                        imagem.src = urlPreview;
                     }}
                 }}
 

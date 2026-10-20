@@ -29,6 +29,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import Image as PdfImage, KeepInFrame, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from reportlab.lib.utils import ImageReader
 import gspread
+from openpyxl import load_workbook
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "troque-esta-chave-em-producao")
@@ -454,6 +455,7 @@ TEMPO_CACHE_ABAS = {
 }
 CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
 TEMPO_CACHE_DRIVE_SEGS = 600
+CACHE_TABELA_FINAME = {"registros": None, "timestamp": 0}
 CACHE_ATUALIZACOES_ABAS = {
     "hashes": {},
     "eventos": [],
@@ -707,6 +709,55 @@ def normalizar_identidade_comercial(valor):
     texto = unicodedata.normalize("NFKD", str(valor or ""))
     texto = "".join(caractere for caractere in texto if not unicodedata.combining(caractere))
     return re.sub(r"[^A-Z0-9]", "", texto.upper())
+
+
+def segmento_por_tipo_modelo(tipo):
+    tipo_normalizado = normalizar_chave_planilha(tipo).replace(" ", "")
+    if "onibus" in tipo_normalizado or "bus" in tipo_normalizado:
+        return "Ônibus"
+    if "caminh" in tipo_normalizado or "truck" in tipo_normalizado:
+        return "Caminhão"
+    return ""
+
+
+def localizar_modelo_salvo(modelos, nome_modelo, categoria, tipo):
+    nome_normalizado = normalizar_identidade_comercial(nome_modelo)
+    if not nome_normalizado:
+        return None
+    candidatos = [
+        item
+        for item in modelos
+        if normalizar_identidade_comercial(item["modelo"]) == nome_normalizado
+        and item["segmento_modelo"] in {"Caminhão", "Ônibus"}
+    ]
+    if not candidatos:
+        return None
+
+    categoria_normalizada = normalizar_identidade_comercial(categoria)
+    if categoria_normalizada:
+        candidatos_categoria = [
+            item
+            for item in candidatos
+            if normalizar_identidade_comercial(item["categoria"])
+            == categoria_normalizada
+        ]
+        if candidatos_categoria:
+            candidatos = candidatos_categoria
+
+    segmento_tipo = segmento_por_tipo_modelo(tipo)
+    if segmento_tipo:
+        candidatos_tipo = [
+            item
+            for item in candidatos
+            if item["segmento_modelo"] == segmento_tipo
+        ]
+        if candidatos_tipo:
+            candidatos = candidatos_tipo
+
+    return next(
+        (item for item in candidatos if item["modelo"] == str(nome_modelo).strip()),
+        candidatos[0],
+    )
 
 
 def usuario_eh_gestao(perfil):
@@ -1606,6 +1657,367 @@ def baixar_arquivo_drive(file_id, service=None):
     while not concluido:
         _, concluido = downloader.next_chunk()
     return conteudo.getvalue(), metadados.get("mimeType", "application/octet-stream")
+
+
+def identificar_modelo_cabine_finame(modelo):
+    chave = normalizar_chave_planilha(modelo)
+    chave = re.sub(r"(?<=\d)hd\b", " hd", chave)
+    correspondencia = re.search(
+        r"\b(?:cab(?:ine)?\s+)?(estendida|estendido|leito)\b",
+        chave,
+    )
+    cabine = ""
+    if correspondencia:
+        cabine = (
+            "estendida"
+            if correspondencia.group(1) in {"estendida", "estendido"}
+            else "leito"
+        )
+        chave = (
+            chave[:correspondencia.start()]
+            + chave[correspondencia.end():]
+        )
+    chave = re.sub(
+        r"\b(?:meteor|ctm|volksbus)\b|\beuro\s*6\b|\beuro6\b",
+        "",
+        chave,
+    )
+    variante_hd = bool(re.search(r"\bhd\b", chave))
+    chave = re.sub(r"\bhd\b", "", chave)
+    chave = re.sub(r"\s+", " ", chave).strip()
+    if variante_hd:
+        chave = f"{chave} hd".strip()
+    return chave, cabine
+
+
+def normalizar_cabine_finame(cabine):
+    chave = normalizar_chave_planilha(cabine)
+    if re.search(r"\b(estendida|estendido)\b", chave):
+        return "estendida"
+    if re.search(r"\b(leito|teto alto)\b", chave):
+        return "leito"
+    return chave
+
+
+def linha_finame_aprovada(celula_modelo):
+    preenchimento = celula_modelo.fill
+    if preenchimento.fill_type != "solid":
+        return False
+
+    cor = preenchimento.fgColor
+    if cor.type == "rgb":
+        return str(cor.rgb or "").upper()[-6:] in {"92D050", "8DB4E2"}
+    if cor.type == "theme":
+        return cor.theme == 3 and abs(float(cor.tint or 0) - 0.6) < 0.01
+    return False
+
+
+def interpretar_planilha_finame(conteudo):
+    pasta_trabalho = load_workbook(
+        io.BytesIO(conteudo),
+        data_only=True,
+        read_only=True,
+    )
+    registros = []
+    cabecalhos_necessarios = {
+        "modelo": "modelo",
+        "classificacao fiscal": "classificacao_fiscal",
+        "codigo finame": "cod_finame",
+    }
+    try:
+        for planilha in pasta_trabalho.worksheets:
+            indice_colunas = None
+            linha_cabecalho = None
+            for indice_linha, linha in enumerate(
+                planilha.iter_rows(values_only=True),
+            ):
+                chaves_linha = [
+                    normalizar_chave_planilha(valor)
+                    for valor in linha
+                ]
+                if all(
+                    cabecalho in chaves_linha
+                    for cabecalho in cabecalhos_necessarios
+                ):
+                    indice_colunas = {
+                        destino: chaves_linha.index(cabecalho)
+                        for cabecalho, destino in cabecalhos_necessarios.items()
+                    }
+                    linha_cabecalho = indice_linha
+                    break
+
+            if indice_colunas is None:
+                continue
+
+            segmento_planilha = ""
+            for linha in planilha.iter_rows(
+                min_row=linha_cabecalho + 2,
+            ):
+                nome_linha = str(
+                    linha[indice_colunas["modelo"]].value or "",
+                ).strip()
+                chave_linha = normalizar_chave_planilha(nome_linha)
+                if "volksbus" in chave_linha:
+                    segmento_planilha = "Ônibus"
+                elif "caminh" in chave_linha or "truck" in chave_linha:
+                    segmento_planilha = "Caminhão"
+
+                if not linha_finame_aprovada(
+                    linha[indice_colunas["modelo"]],
+                ):
+                    continue
+
+                def valor_coluna(nome):
+                    indice = indice_colunas[nome]
+                    return (
+                        str(linha[indice].value or "").strip()
+                        if indice < len(linha)
+                        else ""
+                    )
+
+                nome_modelo = valor_coluna("modelo")
+                classificacao_fiscal = valor_coluna("classificacao_fiscal")
+                cod_finame = valor_coluna("cod_finame")
+                if not nome_modelo or not classificacao_fiscal or not cod_finame:
+                    continue
+                modelo_base, cabine = identificar_modelo_cabine_finame(
+                    nome_modelo,
+                )
+                registros.append({
+                    "modelo": nome_modelo,
+                    "modelo_base": modelo_base,
+                    "cabine": cabine,
+                    "segmento": segmento_planilha,
+                    "classificacao_fiscal": classificacao_fiscal,
+                    "cod_finame": cod_finame,
+                })
+
+        if not registros:
+            raise ValueError(
+                "A planilha de financiamento não contém linhas válidas "
+                "destacadas em verde ou azul."
+            )
+        return registros
+    finally:
+        pasta_trabalho.close()
+
+
+def carregar_tabela_finame_drive():
+    with CACHE_PLANILHAS_LOCK:
+        agora = time.time()
+        if (
+            CACHE_TABELA_FINAME["registros"] is not None
+            and agora - CACHE_TABELA_FINAME["timestamp"] < TEMPO_CACHE_DRIVE_SEGS
+        ):
+            return CACHE_TABELA_FINAME["registros"]
+
+        service = conectar_google_drive()
+        consulta_arquivo = (
+            "name = 'COD FINAME -10-03-26.xlsx' and trashed = false"
+        )
+        resposta = service.files().list(
+            q=consulta_arquivo,
+            fields="nextPageToken, files(id, name, mimeType, parents)",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        arquivos = resposta.get("files", [])
+        pagina = resposta.get("nextPageToken")
+        while pagina:
+            resposta = service.files().list(
+                q=consulta_arquivo,
+                fields="nextPageToken, files(id, name, mimeType, parents)",
+                pageSize=100,
+                pageToken=pagina,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            arquivos.extend(resposta.get("files", []))
+            pagina = resposta.get("nextPageToken")
+
+        nome_arquivo_finame = "COD FINAME -10-03-26.xlsx"
+        candidatos = [
+            arquivo
+            for arquivo in arquivos
+            if str(arquivo.get("name", "")).strip().casefold()
+            == nome_arquivo_finame.casefold()
+        ]
+        arquivos_modelos = []
+        pastas_verificadas = {}
+        for arquivo in candidatos:
+            for id_pasta in arquivo.get("parents", []):
+                if id_pasta not in pastas_verificadas:
+                    pastas_verificadas[id_pasta] = service.files().get(
+                        fileId=id_pasta,
+                        fields="id, name, mimeType",
+                        supportsAllDrives=True,
+                    ).execute()
+                pasta = pastas_verificadas[id_pasta]
+                if (
+                    pasta.get("mimeType") == "application/vnd.google-apps.folder"
+                    and str(pasta.get("name", "")).strip().casefold() == "modelos"
+                ):
+                    arquivos_modelos.append(arquivo)
+                    break
+
+        if len(arquivos_modelos) != 1:
+            raise FileNotFoundError(
+                "A planilha 'COD FINAME -10-03-26.xlsx' precisa existir uma única "
+                "vez dentro da pasta 'Modelos' do Google Drive."
+            )
+
+        arquivo_finame = arquivos_modelos[0]
+        if arquivo_finame.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+            conteudo = service.files().export(
+                fileId=arquivo_finame["id"],
+                mimeType=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            ).execute()
+        else:
+            conteudo, _ = baixar_arquivo_drive(
+                arquivo_finame["id"],
+                service=service,
+            )
+
+        registros = interpretar_planilha_finame(conteudo)
+        CACHE_TABELA_FINAME["registros"] = registros
+        CACHE_TABELA_FINAME["timestamp"] = agora
+        return registros
+
+
+def familia_modelo_finame(modelo):
+    modelo_base, _ = identificar_modelo_cabine_finame(modelo)
+    correspondencia = re.search(r"\b\d{1,2}\s+\d{3}\b", modelo_base)
+    return correspondencia.group(0) if correspondencia else ""
+
+
+def obter_candidatos_finame(modelo, cabine, registros, segmento=""):
+    modelo_base, cabine_no_modelo = identificar_modelo_cabine_finame(modelo)
+    segmento_escolhido = segmento_por_tipo_modelo(segmento)
+    candidatos = [
+        registro
+        for registro in registros
+        if registro["modelo_base"] == modelo_base
+        and (
+            not segmento_escolhido
+            or registro.get("segmento") == segmento_escolhido
+        )
+    ]
+    familia = familia_modelo_finame(modelo)
+    if familia and segmento_escolhido == "Ônibus":
+        candidatos_familia = [
+            registro
+            for registro in registros
+            if familia_modelo_finame(registro["modelo_base"]) == familia
+            and registro.get("segmento") == segmento_escolhido
+        ]
+        if candidatos_familia:
+            candidatos = candidatos_familia
+    elif not candidatos and familia:
+        candidatos = [
+            registro
+            for registro in registros
+            if familia_modelo_finame(registro["modelo_base"]) == familia
+            and (
+                not segmento_escolhido
+                or registro.get("segmento") == segmento_escolhido
+            )
+        ]
+
+    variantes_cabine = [
+        registro for registro in candidatos if registro["cabine"]
+    ]
+    if variantes_cabine:
+        cabine_escolhida = (
+            normalizar_cabine_finame(cabine)
+            or cabine_no_modelo
+        )
+        if not cabine_escolhida:
+            return []
+        candidatos = [
+            registro
+            for registro in variantes_cabine
+            if registro["cabine"] == cabine_escolhida
+        ]
+    else:
+        candidatos = [
+            registro for registro in candidatos if not registro["cabine"]
+        ]
+
+    registros_unicos = {}
+    for registro in candidatos:
+        chave = (
+            registro["classificacao_fiscal"],
+            registro["cod_finame"],
+        )
+        registros_unicos[chave] = registro
+    return list(registros_unicos.values())
+
+
+def rotulo_variante_finame(registro, modelo, candidatos):
+    rotulo = rotulo_variante_finame_sem_codigo(registro, modelo)
+    if sum(
+        rotulo_variante_finame_sem_codigo(candidato, modelo) == rotulo
+        for candidato in candidatos
+    ) > 1:
+        rotulo = f"{rotulo} — FINAME {registro['cod_finame']}"
+    return rotulo
+
+
+def rotulo_variante_finame_sem_codigo(registro, modelo):
+    familia = familia_modelo_finame(modelo)
+    modelo_finame_normalizado = normalizar_chave_planilha(registro["modelo"])
+    modelo_finame_normalizado = re.sub(
+        r"\bvolksbus\b|\beuro\s*6\b|\beuro6\b",
+        " ",
+        modelo_finame_normalizado,
+    )
+    modelo_finame_normalizado = re.sub(
+        r"\s+",
+        " ",
+        modelo_finame_normalizado,
+    ).strip()
+    rotulo = (
+        modelo_finame_normalizado[len(familia):]
+        if familia and modelo_finame_normalizado.startswith(familia)
+        else modelo_finame_normalizado
+    )
+    rotulo = re.sub(r"\s+", " ", rotulo).strip().upper()
+    return rotulo or "PADRÃO"
+
+
+def chave_variante_finame(registro):
+    return (
+        f"{registro['cod_finame']}|"
+        f"{registro['classificacao_fiscal']}"
+    )
+
+
+def encontrar_dados_finame(
+    modelo,
+    cabine,
+    registros,
+    variante_finame="",
+    segmento="",
+):
+    candidatos = obter_candidatos_finame(
+        modelo,
+        cabine,
+        registros,
+        segmento,
+    )
+    if variante_finame:
+        candidatos = [
+            registro
+            for registro in candidatos
+            if chave_variante_finame(registro) == variante_finame
+        ]
+    if len(candidatos) != 1:
+        return None
+    return candidatos[0]
 
 
 def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
@@ -7061,6 +7473,18 @@ def acessar_modulo(nome_modulo):
                 f"Detalhe: {html.escape(str(e))}"
             )
 
+        registros_finame_pedido = []
+        if not erro_pedido:
+            try:
+                registros_finame_pedido = carregar_tabela_finame_drive()
+            except Exception as e:
+                traceback.print_exc()
+                erro_pedido = (
+                    "Não foi possível carregar a tabela de código FINAME e "
+                    "classificação fiscal da pasta Modelos no Google Drive. "
+                    f"Detalhe: {html.escape(str(e))}"
+                )
+
         registros_opcoes_pedido = []
         registros_pm_pedido = []
         registros_rio_pedido = []
@@ -7231,18 +7655,7 @@ def acessar_modulo(nome_modulo):
                 continue
 
             tipo_modelo = str(registro_modelo.get("TIPO", "") or "").strip()
-            tipo_normalizado = (
-                unicodedata.normalize("NFKD", tipo_modelo)
-                .encode("ascii", "ignore")
-                .decode("ascii")
-                .casefold()
-            )
-            if "onibus" in tipo_normalizado or "bus" in tipo_normalizado:
-                segmento_modelo = "Ônibus"
-            elif "caminh" in tipo_normalizado or "truck" in tipo_normalizado:
-                segmento_modelo = "Caminhão"
-            else:
-                segmento_modelo = ""
+            segmento_modelo = segmento_por_tipo_modelo(tipo_modelo)
 
             dados_normalizados = [
                 (normalizar_chave_planilha(chave), str(valor or "").strip())
@@ -7300,12 +7713,6 @@ def acessar_modulo(nome_modulo):
                 ),
                 "segmento_ficha": obter_dado_modelo("SEGMENTO"),
                 "pbt": obter_dado_modelo("PBT HOMOLOGADO (KG)", "PBT"),
-                "entre_eixos": obter_dado_modelo(
-                    "ENTRE EIXO",
-                    "ENTRE EIXOS",
-                    "ENTRE EIXOS (MM)",
-                    "ENTRE-EIXOS",
-                ),
                 "cabine": obter_dado_modelo("CABINE"),
                 "motor": obter_dado_modelo("MOTOR"),
                 "potencia": obter_dado_modelo("POTENCIA", "POTÊNCIA"),
@@ -7350,7 +7757,7 @@ def acessar_modulo(nome_modulo):
             "potencia", "cmt",
             "informacoes_complementares", "garantia", "assistencia",
             "condicoes_pm", "modalidade_faturamento", "faturante",
-            "cnpj_faturante", "pagamento", "cod_finame", "pac",
+            "cnpj_faturante", "pagamento", "variante_finame", "cod_finame", "pac",
             "classificacao_fiscal", "local_entrega", "prazo_entrega",
             "detalhes", "validade", "validade_dias",
             "imagem_modelo_id",
@@ -7448,6 +7855,14 @@ def acessar_modulo(nome_modulo):
             (str(dias), f"{dias} dias")
             for dias in (5, 10, 15, 20, 25, 30)
         ]
+        opcoes_entre_eixos_pedido = [
+            (str(valor), str(valor))
+            for valor in (
+                2850, 3000, 3175, 3300, 3400, 3440, 3560, 3600,
+                3825, 3900, 4000, 4300, 4340, 4400, 4580, 4600,
+                4784, 4800, 5207, 5940, 6024, 6100, 6431,
+            )
+        ]
         if dados_pedido["validade_dias"] not in {
             valor for valor, _ in opcoes_validade_dias_pedido
         }:
@@ -7512,24 +7927,41 @@ def acessar_modulo(nome_modulo):
             if valor and all(valor != opcao[0] for opcao in opcoes):
                 opcoes.append((valor, valor))
 
-        if (
-            pedido_edicao
-            and dados_pedido["modelo"]
-            and not any(
-                item["modelo"] == dados_pedido["modelo"]
-                for item in modelos_pedido.values()
-            )
-        ):
-            segmento_salvo = (
-                dados_pedido["segmento"]
-                if dados_pedido["segmento"] in {"Caminhão", "Ônibus"}
-                else "Caminhão"
-            )
+        modelo_salvo_normalizado = normalizar_identidade_comercial(
+            dados_pedido["modelo"],
+        )
+        tipo_salvo = str(
+            pedido_edicao.get("TIPO", "") if pedido_edicao else "",
+        ).strip()
+        segmento_tipo_salvo = segmento_por_tipo_modelo(tipo_salvo)
+        segmento_salvo_pedido = segmento_por_tipo_modelo(
+            dados_pedido["segmento"],
+        )
+        modelo_inicial_pedido = localizar_modelo_salvo(
+            modelos_pedido.values(),
+            dados_pedido["modelo"],
+            dados_pedido["categoria"],
+            tipo_salvo,
+        )
+        if pedido_edicao and dados_pedido["modelo"] and not modelo_inicial_pedido:
+            segmento_salvo = segmento_salvo_pedido or segmento_tipo_salvo
+            if not segmento_salvo:
+                segmentos_modelo_salvo = {
+                    item["segmento_modelo"]
+                    for item in modelos_pedido.values()
+                    if normalizar_identidade_comercial(item["modelo"])
+                    == modelo_salvo_normalizado
+                    and item["segmento_modelo"] in {"Caminhão", "Ônibus"}
+                }
+                if len(segmentos_modelo_salvo) == 1:
+                    segmento_salvo = segmentos_modelo_salvo.pop()
+            if not segmento_salvo:
+                segmento_salvo = "Caminhão"
             id_modelo_salvo = f"salvo-{pedido_edicao_id}"
-            modelos_pedido[id_modelo_salvo] = {
+            modelo_inicial_pedido = {
                 "id": id_modelo_salvo,
                 "modelo": dados_pedido["modelo"],
-                "tipo": str(pedido_edicao.get("TIPO", "") or ""),
+                "tipo": tipo_salvo,
                 "segmento_modelo": segmento_salvo,
                 "categoria": str(pedido_edicao.get("CATEGORIA", "") or ""),
                 "ano_modelo": dados_pedido["ano_modelo"],
@@ -7551,26 +7983,103 @@ def acessar_modulo(nome_modulo):
                 "imagem": "",
                 "imagem_id": dados_pedido["imagem_modelo_id"],
             }
+            modelos_pedido[id_modelo_salvo] = modelo_inicial_pedido
         modelo_selecionado_pedido = dados_pedido["modelo_id"]
-        modelo_inicial_pedido = next(
-            (
-                item
-                for item in modelos_pedido.values()
-                if item["modelo"] == dados_pedido["modelo"]
-                and item["segmento_modelo"] in {"Caminhão", "Ônibus"}
-            ),
-            None,
+        if request.method != "POST" and modelo_inicial_pedido:
+            modelo_selecionado_pedido = modelo_inicial_pedido["id"]
+        segmento_pedido_atual = segmento_por_tipo_modelo(
+            dados_pedido["segmento"],
         )
-        if pedido_edicao and modelo_inicial_pedido:
-            modelo_selecionado_pedido = modelo_inicial_pedido["id"]
-        elif request.method != "POST" and modelo_inicial_pedido:
-            modelo_selecionado_pedido = modelo_inicial_pedido["id"]
-        if request.method != "POST" and dados_pedido["segmento"] not in {"Caminhão", "Ônibus"}:
+        if request.method != "POST" and not segmento_pedido_atual:
             dados_pedido["segmento"] = (
                 modelo_inicial_pedido["segmento_modelo"]
                 if modelo_inicial_pedido
                 else "Caminhão"
             )
+        elif (
+            request.method != "POST"
+            and modelo_inicial_pedido
+            and segmento_pedido_atual != modelo_inicial_pedido["segmento_modelo"]
+        ):
+            dados_pedido["segmento"] = modelo_inicial_pedido["segmento_modelo"]
+        elif request.method != "POST" and segmento_pedido_atual:
+            dados_pedido["segmento"] = segmento_pedido_atual
+
+        modelo_para_finame = modelos_pedido.get(modelo_selecionado_pedido)
+        candidatos_finame_pedido = (
+            obter_candidatos_finame(
+                modelo_para_finame["modelo"],
+                dados_pedido["cabine"],
+                registros_finame_pedido,
+                modelo_para_finame["segmento_modelo"],
+            )
+            if modelo_para_finame and registros_finame_pedido
+            else []
+        )
+        variante_finame_solicitada = dados_pedido["variante_finame"]
+        if (
+            not variante_finame_solicitada
+            and request.method != "POST"
+            and dados_pedido["cod_finame"]
+        ):
+            candidatos_salvos = [
+                registro
+                for registro in candidatos_finame_pedido
+                if registro["cod_finame"] == dados_pedido["cod_finame"]
+                and (
+                    not dados_pedido["classificacao_fiscal"]
+                    or registro["classificacao_fiscal"]
+                    == dados_pedido["classificacao_fiscal"]
+                )
+            ]
+            if len(candidatos_salvos) == 1:
+                variante_finame_solicitada = chave_variante_finame(
+                    candidatos_salvos[0],
+                )
+        if (
+            not variante_finame_solicitada
+            and len(candidatos_finame_pedido) == 1
+        ):
+            variante_finame_solicitada = chave_variante_finame(
+                candidatos_finame_pedido[0],
+            )
+        dados_finame_escolhidos = (
+            encontrar_dados_finame(
+                modelo_para_finame["modelo"],
+                dados_pedido["cabine"],
+                registros_finame_pedido,
+                variante_finame_solicitada,
+                modelo_para_finame["segmento_modelo"],
+            )
+            if modelo_para_finame and registros_finame_pedido
+            else None
+        )
+        dados_pedido["variante_finame"] = (
+            chave_variante_finame(dados_finame_escolhidos)
+            if dados_finame_escolhidos
+            else ""
+        )
+        dados_pedido["cod_finame"] = (
+            dados_finame_escolhidos["cod_finame"]
+            if dados_finame_escolhidos
+            else ""
+        )
+        dados_pedido["classificacao_fiscal"] = (
+            dados_finame_escolhidos["classificacao_fiscal"]
+            if dados_finame_escolhidos
+            else ""
+        )
+        opcoes_variantes_finame_pedido = [
+            (
+                chave_variante_finame(registro),
+                rotulo_variante_finame(
+                    registro,
+                    modelo_para_finame["modelo"],
+                    candidatos_finame_pedido,
+                ),
+            )
+            for registro in candidatos_finame_pedido
+        ] if modelo_para_finame else []
 
         if request.method == "POST" and not erro_pedido:
             if dados_pedido["faturante"]:
@@ -7632,6 +8141,10 @@ def acessar_modulo(nome_modulo):
                 erro_pedido = "O modelo selecionado não pertence ao segmento escolhido."
             elif not dados_pedido["ano_modelo"]:
                 erro_pedido = "Selecione o ano/modelo do veículo."
+            elif not dados_pedido["entre_eixos"]:
+                erro_pedido = "Selecione o entre-eixos do veículo."
+            elif len(candidatos_finame_pedido) > 1 and not dados_pedido["variante_finame"]:
+                erro_pedido = "Selecione a versão FINAME na lista ao lado da categoria."
             elif any((
                 dados_pedido["ano_modelo"]
                 and dados_pedido["ano_modelo"] not in dict(opcoes_ano_modelo_pedido),
@@ -7653,6 +8166,8 @@ def acessar_modulo(nome_modulo):
                 and dados_pedido["plano_manutencao"] not in dict(opcoes_plano_pedido),
                 dados_pedido["rio"]
                 and dados_pedido["rio"] not in dict(opcoes_rio_pedido),
+                dados_pedido["entre_eixos"]
+                and dados_pedido["entre_eixos"] not in dict(opcoes_entre_eixos_pedido),
             )):
                 erro_pedido = "Selecione opções válidas nas listas do formulário."
             elif (
@@ -7771,7 +8286,10 @@ def acessar_modulo(nome_modulo):
                 "quantidade",
                 "valor_unitario",
                 "ano_modelo",
-            }
+            } or (
+                nome == "variante_finame"
+                and len(opcoes_variantes_finame_pedido) > 1
+            )
             classe_rotulo = " class=\"obrigatorio\"" if obrigatorio else ""
             if opcoes is not None:
                 opcoes_html = ['<option value="">Selecione...</option>']
@@ -7848,6 +8366,11 @@ def acessar_modulo(nome_modulo):
             "Categoria",
             opcoes=opcoes_categoria_pedido,
         )
+        campo_variante_finame_html = campo_pedido(
+            "variante_finame",
+            "Versão FINAME",
+            opcoes=opcoes_variantes_finame_pedido,
+        )
         campos_tecnicos_ocultos_html = "".join(
             f'<input type="hidden" id="{nome}" name="{nome}" '
             f'value="{html.escape(dados_pedido.get(nome, ""), quote=True)}" '
@@ -7897,9 +8420,13 @@ def acessar_modulo(nome_modulo):
             campo_pedido("faturante", "Faturante", opcoes=opcoes_faturante_pedido),
             campo_pedido("cnpj_faturante", "CNPJ do faturante", readonly=True),
             campo_pedido("pagamento", "Pagamento", opcoes=opcoes_pagamento_pedido),
-            campo_pedido("cod_finame", "Código FINAME"),
+            campo_pedido("cod_finame", "Código FINAME", readonly=True),
             campo_pedido("pac", "PAC nº"),
-            campo_pedido("classificacao_fiscal", "Classificação fiscal"),
+            campo_pedido(
+                "classificacao_fiscal",
+                "Classificação fiscal",
+                readonly=True,
+            ),
             campo_pedido("local_entrega", "Entrega", opcoes=opcoes_entrega_pedido),
             campo_pedido(
                 "prazo_entrega",
@@ -8044,6 +8571,14 @@ def acessar_modulo(nome_modulo):
             cnpj_por_faturante_pedido,
             ensure_ascii=False,
         ).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+        entre_eixos_json = json.dumps(
+            [valor for valor, _ in opcoes_entre_eixos_pedido],
+            ensure_ascii=False,
+        )
+        tabela_finame_json = json.dumps(
+            registros_finame_pedido,
+            ensure_ascii=False,
+        ).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
         conteudo = render_template_string(
             """
             <style>
@@ -8069,6 +8604,8 @@ def acessar_modulo(nome_modulo):
               .pedido-segmento-opcao:hover{border-color:#002244}
               .pedido-segmento-opcao.ativo{background:#002244;border-color:#002244;color:#fff}
               .pedido-veiculo-selecao{margin-bottom:13px}
+              .pedido-categoria-finame{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}
+              .pedido-categoria-finame .pedido-campo{margin:0}
               .pedido-modelo-foto{display:grid;grid-template-columns:minmax(280px,36%) minmax(0,1fr);align-items:center;gap:18px;min-height:230px;padding:16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:9px}
               .pedido-modelo-foto img{display:none;width:100%;max-width:none;height:230px;object-fit:contain;background:#fff;border-radius:7px}
               .pedido-modelo-info{font-size:12px;color:#475569;line-height:1.55;background:#f8fafc}
@@ -8082,6 +8619,7 @@ def acessar_modulo(nome_modulo):
               .pedido-dados-tecnicos th,.pedido-dados-tecnicos td{padding:5px 6px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top;overflow-wrap:anywhere}
               .pedido-dados-tecnicos th{color:#64748b;font-size:9px;font-weight:700;text-transform:uppercase;line-height:1.25}
               .pedido-dados-tecnicos td{color:#1e293b;font-weight:700;line-height:1.35}
+              .pedido-entre-eixos-select{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:4px;padding:2px 4px;background:#fff;color:#1e293b;font:inherit;font-size:11px;font-weight:700}
               .pedido-acoes{display:flex;gap:9px;flex-wrap:wrap;margin:14px 0}
               .pedido-btn{border:0;border-radius:7px;padding:10px 14px;font-weight:800;font-size:12px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
               .pedido-btn-primario{background:#002244;color:white}
@@ -8145,7 +8683,7 @@ def acessar_modulo(nome_modulo):
               @media(max-width:720px){.pedido-grid{grid-template-columns:1fr 1fr}.pedido-modelo-foto,.pedido-doc-modelo{grid-template-columns:1fr;gap:12px;min-height:0;padding:12px}.pedido-modelo-foto img{height:210px}.pedido-doc-modelo img{height:190px}.pedido-doc{padding:18px}.pedido-doc-meta{grid-template-columns:1fr 1fr}}
               .pedido-doc-meta-vertical{grid-template-columns:minmax(0,1fr);gap:0}
               @media(max-width:480px){.pedido-modelo-foto img{height:190px}.pedido-doc-modelo img{height:170px}.pedido-modelo-identificacao{gap:6px}.pedido-modelo-identificacao-item{padding:7px}}
-              @media(max-width:480px){.pedido-grid{grid-template-columns:1fr}.pedido-campo-largo{grid-column:auto}}
+              @media(max-width:480px){.pedido-grid{grid-template-columns:1fr}.pedido-campo-largo{grid-column:auto}.pedido-categoria-finame{grid-template-columns:1fr}}
               {% if pode_imprimir %}
               @media print{
                 @page{size:A4 portrait;margin:20mm}
@@ -8220,7 +8758,10 @@ def acessar_modulo(nome_modulo):
                       <select id="modelo" name="modelo_id" required>
                         <option value="">Selecione primeiro o segmento...</option>
                       </select>
-                      {{ campo_categoria|safe }}
+                      <div class="pedido-categoria-finame">
+                        {{ campo_categoria|safe }}
+                        {{ campo_variante_finame|safe }}
+                      </div>
                       <a id="pedido-link-ficha" class="pedido-btn pedido-btn-secundario"
                          href="#" target="_blank" rel="noopener noreferrer"
                          style="display:none;margin-top:10px">Ficha Técnica</a>
@@ -8252,7 +8793,9 @@ def acessar_modulo(nome_modulo):
                   <div class="pedido-grid">
                     {{ campo_quantidade|safe }}{{ campo_valor|safe }}
                     {{ campos_faturamento|safe }}
+                    <div id="pedido-aviso-finame" class="pedido-alerta pedido-alerta-erro" role="status" style="display:none;grid-column:1/-1;margin:0"></div>
                   </div>
+                  <p style="font-size:11px;color:#64748b;margin:10px 0 0">Código FINAME e classificação fiscal usam somente linhas verdes e azuis da planilha no Google Drive. Se houver mais de uma versão, escolha-a na lista ao lado da categoria.</p>
                   <p style="font-size:11px;color:#64748b;margin:10px 0 0">O valor total da proposta é calculado automaticamente pela quantidade e pelo valor unitário.</p>
                 </section>
                 <div class="pedido-acoes">
@@ -8388,6 +8931,8 @@ def acessar_modulo(nome_modulo):
               (function(){
                 const modelos = {{ modelos_json|safe }};
                 const cnpjPorFaturante = {{ cnpj_por_faturante_json|safe }};
+                const opcoesEntreEixos = {{ entre_eixos_json|safe }};
+                const tabelaFiname = {{ tabela_finame_json|safe }};
                 const modeloSelect = document.getElementById('modelo');
                 const segmentoInput = document.getElementById('segmento');
                 const botoesSegmento = document.querySelectorAll('[data-segmento]');
@@ -8529,8 +9074,11 @@ def acessar_modulo(nome_modulo):
                   const dados=[];
                   camposTecnicosPedido.forEach(([rotulo,nome])=>{
                     const valor=valorCampo(nome);
-                    if(!valor) return;
-                    dados.push([rotulo,valor]);
+                    const seletorEntreEixos=
+                      nome==='entre_eixos' &&
+                      container.id==='pedido-dados-tecnicos-editor';
+                    if(!valor && !seletorEntreEixos) return;
+                    dados.push([rotulo,valor,nome]);
                   });
                   if(!dados.length) return;
                   const tabela=document.createElement('table');
@@ -8551,12 +9099,36 @@ def acessar_modulo(nome_modulo):
                   const corpo=document.createElement('tbody');
                   for(let indice=0;indice<dados.length;indice+=2){
                     const linha=document.createElement('tr');
-                    dados.slice(indice,indice+2).forEach(([rotulo,valor])=>{
+                    dados.slice(indice,indice+2).forEach(([rotulo,valor,nome])=>{
                       const titulo=document.createElement('th');
                       titulo.scope='row';
-                      titulo.textContent=rotulo;
+                      titulo.textContent=nome==='entre_eixos'
+                        ? rotulo+' *'
+                        : rotulo;
                       const conteudo=document.createElement('td');
-                      conteudo.textContent=valor;
+                      if(
+                        nome==='entre_eixos' &&
+                        container.id==='pedido-dados-tecnicos-editor'
+                      ){
+                        const seletor=document.createElement('select');
+                        seletor.className='pedido-entre-eixos-select';
+                        seletor.setAttribute('aria-label','Entre-eixos obrigatório');
+                        seletor.required=true;
+                        seletor.disabled={{ pedido_somente_leitura|tojson }};
+                        seletor.add(new Option('Selecione...',''));
+                        opcoesEntreEixos.forEach(opcao=>{
+                          seletor.add(new Option(opcao,opcao));
+                        });
+                        seletor.value=valor;
+                        seletor.addEventListener('change',()=>{
+                          const campoEntreEixos=campo('entre_eixos');
+                          if(campoEntreEixos) campoEntreEixos.value=seletor.value;
+                          sincronizarPreview();
+                        });
+                        conteudo.appendChild(seletor);
+                      }else{
+                        conteudo.textContent=valor;
+                      }
                       linha.append(titulo,conteudo);
                     });
                     if(dados.slice(indice,indice+2).length===1){
@@ -8609,7 +9181,18 @@ def acessar_modulo(nome_modulo):
                     botao.setAttribute('aria-pressed',String(selecionado));
                   });
                 }
-                function atualizarModelo(){
+                function limparCamposTecnicosModelo(){
+                  ['ano_modelo','tecnologia','tecnologia_motor',
+                    'sistema_injecao','segmento_ficha','cabine','motor',
+                    'potencia','transmissao','pbt','cmt','entre_eixos'
+                  ].forEach(nome=>{
+                    const el=campo(nome);
+                    if(el) el.value='';
+                  });
+                  const varianteFiname=campo('variante_finame');
+                  if(varianteFiname) varianteFiname.value='';
+                }
+                function atualizarModelo(modeloAlterado=false){
                   const m=modelos.find(item=>item.id===modeloSelect.value);
                   const img=document.getElementById('pedido-imagem-modelo');
                   const imgPrint=document.getElementById('pedido-imagem-impressao');
@@ -8617,6 +9200,7 @@ def acessar_modulo(nome_modulo):
                   const ficha=document.getElementById('pedido-link-ficha');
                   if(!m){
                     modeloTecnicoAplicado=null;
+                    limparCamposTecnicosModelo();
                     campo('modelo_nome').value='';
                     campo('segmento_ficha').value='';
                     campo('modelo_tipo').value='';
@@ -8630,6 +9214,8 @@ def acessar_modulo(nome_modulo):
                     document.getElementById('preview-tipo-modelo').textContent='—';
                     ficha.removeAttribute('href');
                     ficha.style.display='none';
+                    atualizarOpcoesVariantesFiname(null,false);
+                    atualizarCodigosFiname();
                     sincronizarPreview();
                     return;
                   }
@@ -8644,10 +9230,10 @@ def acessar_modulo(nome_modulo):
                     potencia:'potencia',
                     transmissao:'transmissao',
                     pbt:'pbt',
-                    entre_eixos:'entre_eixos',
                     cmt:'cmt'
                   };
-                  const trocarModelo=modeloTecnicoAplicado && modeloTecnicoAplicado!==m.id;
+                  const trocarModelo=modeloAlterado ||
+                    (modeloTecnicoAplicado && modeloTecnicoAplicado!==m.id);
                   Object.entries(camposTecnicos).forEach(([nome,chave])=>{
                     const el=campo(nome);
                     if(el && (trocarModelo || !el.value)) el.value=m[chave] || '';
@@ -8679,7 +9265,196 @@ def acessar_modulo(nome_modulo):
                     ficha.removeAttribute('href');
                     ficha.style.display='none';
                   }
+                  atualizarOpcoesVariantesFiname(m,!trocarModelo);
+                  atualizarCodigosFiname();
                   sincronizarPreview();
+                }
+                function normalizarChaveFiname(valor){
+                  return String(valor || '')
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g,'')
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g,' ')
+                    .trim();
+                }
+                function identificarModeloFiname(valor){
+                  let chave=normalizarChaveFiname(valor)
+                    .replace(/(\\d)hd\\b/g,'$1 hd');
+                  const correspondencia=chave.match(/\\b(?:cab(?:ine)?\\s+)?(estendida|estendido|leito)\\b/);
+                  const cabine=correspondencia
+                    ? (correspondencia[1]==='leito' ? 'leito' : 'estendida')
+                    : '';
+                  const varianteHd=/\\bhd\\b/.test(chave);
+                  const base=chave
+                    .replace(/\\b(?:cab(?:ine)?\\s+)?(?:estendida|estendido|leito)\\b/g,'')
+                    .replace(/\\b(?:meteor|ctm|hd|volksbus)\\b|\\beuro\\s*6\\b|\\beuro6\\b/g,'')
+                    .replace(/\\s+/g,' ')
+                    .trim();
+                  return {base:varianteHd ? (base+' hd').trim() : base,cabine};
+                }
+                function normalizarCabineFiname(valor){
+                  const chave=normalizarChaveFiname(valor);
+                  if(/\\b(estendida|estendido)\\b/.test(chave)) return 'estendida';
+                  if(/\\b(leito|teto alto)\\b/.test(chave)) return 'leito';
+                  return chave;
+                }
+                function familiaModeloFiname(valor){
+                  const base=identificarModeloFiname(valor).base;
+                  const correspondencia=base.match(/\\b\\d{1,2}\\s+\\d{3}\\b/);
+                  return correspondencia ? correspondencia[0] : '';
+                }
+                function obterCandidatosFiname(modelo,cabine,segmento=''){
+                  const identificado=identificarModeloFiname(modelo);
+                  const segmentoNormalizado=normalizarChaveFiname(segmento);
+                  const segmentoEscolhido=/onibus|bus/.test(segmentoNormalizado)
+                    ? 'Ônibus'
+                    : /caminh|truck/.test(segmentoNormalizado)
+                      ? 'Caminhão'
+                      : '';
+                  let candidatos=tabelaFiname.filter(
+                    item=>item.modelo_base===identificado.base &&
+                      (!segmentoEscolhido || item.segmento===segmentoEscolhido)
+                  );
+                  const familia=familiaModeloFiname(modelo);
+                  if(familia && segmentoEscolhido==='Ônibus'){
+                    const candidatosFamilia=tabelaFiname.filter(
+                      item=>familiaModeloFiname(item.modelo_base)===familia &&
+                        item.segmento===segmentoEscolhido
+                    );
+                    if(candidatosFamilia.length){
+                      candidatos=candidatosFamilia;
+                    }
+                  }else if(!candidatos.length && familia){
+                    candidatos=tabelaFiname.filter(
+                      item=>familiaModeloFiname(item.modelo_base)===familia &&
+                        (!segmentoEscolhido || item.segmento===segmentoEscolhido)
+                    );
+                  }
+                  const variantesCabine=candidatos.filter(item=>item.cabine);
+                  if(variantesCabine.length){
+                    const cabineEscolhida=
+                      normalizarCabineFiname(cabine) || identificado.cabine;
+                    candidatos=cabineEscolhida
+                      ? variantesCabine.filter(item=>item.cabine===cabineEscolhida)
+                      : [];
+                  }else{
+                    candidatos=candidatos.filter(item=>!item.cabine);
+                  }
+                  const unicos=new Map();
+                  candidatos.forEach(item=>{
+                    unicos.set(
+                      item.classificacao_fiscal+'|'+item.cod_finame,
+                      item,
+                    );
+                  });
+                  return Array.from(unicos.values());
+                }
+                function chaveVarianteFiname(item){
+                  return item.cod_finame+'|'+item.classificacao_fiscal;
+                }
+                function rotuloVarianteFiname(item,modelo,candidatos){
+                  const familia=familiaModeloFiname(modelo);
+                  const nomeNormalizado=normalizarChaveFiname(item.modelo)
+                    .replace(/\\bvolksbus\\b|\\beuro\\s*6\\b|\\beuro6\\b/g,' ')
+                    .replace(/\\s+/g,' ')
+                    .trim();
+                  let rotulo=familia && nomeNormalizado.startsWith(familia)
+                    ? nomeNormalizado.slice(familia.length).trim().toUpperCase()
+                    : item.modelo;
+                  rotulo=rotulo.replace(/\\s+/g,' ').trim();
+                  if(!rotulo) rotulo='PADRÃO';
+                  const rotuloNormalizado=normalizarChaveFiname(rotulo);
+                  if(candidatos.filter(candidato=>{
+                    const nome=normalizarChaveFiname(candidato.modelo)
+                      .replace(/\\bvolksbus\\b|\\beuro\\s*6\\b|\\beuro6\\b/g,' ')
+                      .replace(/\\s+/g,' ')
+                      .trim();
+                    let outro=familia && nome.startsWith(familia)
+                      ? nome.slice(familia.length).trim().toUpperCase()
+                      : candidato.modelo;
+                    outro=outro.replace(/\\s+/g,' ').trim() || 'PADRÃO';
+                    return normalizarChaveFiname(outro)===rotuloNormalizado;
+                  }).length>1){
+                    rotulo+=' — FINAME '+item.cod_finame;
+                  }
+                  return rotulo;
+                }
+                function atualizarOpcoesVariantesFiname(modelo,preservarEscolha=true){
+                  const seletor=campo('variante_finame');
+                  if(!seletor) return [];
+                  const codigoAnterior=preservarEscolha ? seletor.value : '';
+                  const candidatos=modelo
+                    ? obterCandidatosFiname(
+                      modelo.modelo,
+                      valorCampo('cabine'),
+                      modelo.segmento_modelo || modelo.tipo,
+                    )
+                    : [];
+                  const rotulo=seletor.closest('.pedido-campo')
+                    ?.querySelector('label');
+                  if(rotulo){
+                    rotulo.classList.toggle('obrigatorio',candidatos.length>1);
+                  }
+                  seletor.replaceChildren(new Option(
+                    !modelo
+                      ? 'Selecione um modelo...'
+                      : candidatos.length>1
+                        ? 'Selecione a versão...'
+                        : candidatos.length===1
+                          ? 'Versão selecionada automaticamente'
+                          : 'Nenhuma versão encontrada',
+                    '',
+                  ));
+                  candidatos.forEach(item=>{
+                    seletor.add(new Option(
+                      rotuloVarianteFiname(item,modelo.modelo,candidatos),
+                      chaveVarianteFiname(item),
+                    ));
+                  });
+                  const escolhido=candidatos.find(
+                    item=>chaveVarianteFiname(item)===codigoAnterior
+                  ) || (candidatos.length===1 ? candidatos[0] : null);
+                  seletor.value=escolhido ? chaveVarianteFiname(escolhido) : '';
+                  seletor.required=candidatos.length>1;
+                  return candidatos;
+                }
+                function atualizarCodigosFiname(){
+                  const campoCodigo=campo('cod_finame');
+                  const campoClassificacao=campo('classificacao_fiscal');
+                  const aviso=document.getElementById('pedido-aviso-finame');
+                  if(!campoCodigo || !campoClassificacao || !aviso) return;
+                  const modelo=modelos.find(item=>item.id===modeloSelect.value);
+                  campoCodigo.value='';
+                  campoClassificacao.value='';
+                  aviso.textContent='';
+                  aviso.style.display='none';
+                  if(!modelo) return;
+
+                  const candidatos=obterCandidatosFiname(
+                    modelo.modelo,
+                    valorCampo('cabine'),
+                    modelo.segmento_modelo || modelo.tipo,
+                  );
+                  const seletor=campo('variante_finame');
+                  const dados=candidatos.length===1
+                    ? candidatos[0]
+                    : candidatos.find(
+                      item=>chaveVarianteFiname(item)===seletor?.value
+                    );
+                  if(!dados){
+                    aviso.textContent=
+                      candidatos.length>1
+                        ? 'Escolha a versão do modelo para preencher o código FINAME e a classificação fiscal.'
+                        : 'Não foi possível localizar um código FINAME e uma classificação fiscal nas linhas verdes/azuis da planilha do Google Drive para este modelo e cabine. Confira os dados ou solicite a revisão do cadastro.';
+                    aviso.style.display='';
+                    return;
+                  }
+                  const chaveEscolhida=chaveVarianteFiname(dados);
+                  if(seletor && seletor.value!==chaveEscolhida){
+                    seletor.value=chaveEscolhida;
+                  }
+                  campoCodigo.value=dados.cod_finame;
+                  campoClassificacao.value=dados.classificacao_fiscal;
                 }
                 function sincronizarPreview(){
                   campos.forEach(el=>{
@@ -8757,22 +9532,39 @@ def acessar_modulo(nome_modulo):
                   if(valorUnitarioInput.value.trim()) formatarValorUnitario();
                 }
                 if(formularioPedido){
-                  formularioPedido.addEventListener('submit',()=>{
+                  formularioPedido.addEventListener('submit',evento=>{
                     formatarValorUnitario();
                     atualizarValidade();
+                    atualizarCodigosFiname();
+                    const variante=campo('variante_finame');
+                    if(variante && variante.required && !variante.value){
+                      evento.preventDefault();
+                      const aviso=document.getElementById('pedido-aviso-finame');
+                      if(aviso){
+                        aviso.textContent=
+                          'Selecione a versão FINAME para este modelo.';
+                        aviso.style.display='';
+                        aviso.scrollIntoView({behavior:'smooth',block:'center'});
+                      }
+                      variante.focus();
+                    }
                   });
                 }
                 campo('data_pedido').addEventListener('change',atualizarValidade);
                 campo('validade_dias').addEventListener('change',atualizarValidade);
-                modeloSelect.addEventListener('change',atualizarModelo);
+                modeloSelect.addEventListener('change',()=>atualizarModelo(true));
+                campo('cabine').addEventListener('change',()=>{
+                  const modelo=modelos.find(item=>item.id===modeloSelect.value);
+                  atualizarOpcoesVariantesFiname(modelo,true);
+                  atualizarCodigosFiname();
+                });
+                campo('variante_finame').addEventListener(
+                  'change',
+                  atualizarCodigosFiname,
+                );
                 botoesSegmento.forEach(botao=>botao.addEventListener('click',()=>{
                   segmentoInput.value=botao.dataset.segmento;
-                  ['ano_modelo','tecnologia','tecnologia_motor','segmento_ficha',
-                    'cabine','motor','potencia','transmissao',
-                    'pbt','entre_eixos','cmt'].forEach(nome=>{
-                    const el=campo(nome);
-                    if(el) el.value='';
-                  });
+                  limparCamposTecnicosModelo();
                   modeloTecnicoAplicado=null;
                   atualizarOpcoesModelos();
                   atualizarModelo();
@@ -8813,6 +9605,8 @@ def acessar_modulo(nome_modulo):
             segmento_selecionado=dados_pedido["segmento"],
             modelos_json=modelos_json,
             cnpj_por_faturante_json=cnpj_por_faturante_json,
+            entre_eixos_json=entre_eixos_json,
+            tabela_finame_json=tabela_finame_json,
             vendedor=vendedor_pedido,
             telefone_vendedor=telefone_vendedor,
             email_vendedor=email_vendedor,
@@ -8825,6 +9619,7 @@ def acessar_modulo(nome_modulo):
             campos_cliente=campos_cliente_html,
             campos_caminhao=campos_caminhao_html,
             campo_categoria=campo_categoria_html,
+            campo_variante_finame=campo_variante_finame_html,
             campo_observacoes_veiculo=campo_observacoes_veiculo_html,
             campos_tecnicos_ocultos=campos_tecnicos_ocultos_html,
             campos_modelo_pdf=campos_modelo_pdf_html,
@@ -12581,7 +13376,8 @@ def acessar_modulo(nome_modulo):
 
 @app.route("/api/limpar-cache", methods=["POST"])
 def limpar_cache():
-    global CACHE_IA, CACHE_PLANILHAS, CACHE_LOGIN_DADOS, CACHE_DRIVE, CACHE_PLANILHA_CLIENTE
+    global CACHE_IA, CACHE_PLANILHAS, CACHE_LOGIN_DADOS, CACHE_DRIVE
+    global CACHE_PLANILHA_CLIENTE, CACHE_TABELA_FINAME
     CACHE_IA["contexto_sistema"] = ""
     CACHE_IA["timestamp"] = 0
     CACHE_IA["registros"] = None
@@ -12591,6 +13387,7 @@ def limpar_cache():
     CACHE_LOGIN_DADOS = {"dados": {}, "timestamp": 0, "usuario": ""}
     CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
     CACHE_PLANILHA_CLIENTE = {"cliente": None, "timestamp": 0}
+    CACHE_TABELA_FINAME = {"registros": None, "timestamp": 0}
     if "CACHE_CAMPANHAS" in globals():
         CACHE_CAMPANHAS.clear()
 

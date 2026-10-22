@@ -429,7 +429,7 @@ def servir_comprovante_drive(file_id):
         abort(401)
 
     try:
-        service = conectar_google_drive()
+        service = conectar_google_drive(preferir_conta_servico=True)
         metadados = service.files().get(
             fileId=file_id, fields="mimeType", supportsAllDrives=True
         ).execute()
@@ -1738,8 +1738,10 @@ def obter_pasta_upload_pedidos(service):
     return pasta["id"]
 
 
-def baixar_arquivo_drive(file_id, service=None):
-    service = service or conectar_google_drive()
+def baixar_arquivo_drive(file_id, service=None, preferir_conta_servico=False):
+    service = service or conectar_google_drive(
+        preferir_conta_servico=preferir_conta_servico
+    )
     metadados = service.files().get(
         fileId=file_id,
         fields="mimeType",
@@ -2400,7 +2402,10 @@ def gerar_pdf_pedido(dados_pedido, modelo_pedido, imagem_drive_id=""):
 
     imagem_pdf = None
     if imagem_drive_id:
-        imagem_bytes, mime_imagem = baixar_arquivo_drive(imagem_drive_id)
+        imagem_bytes, mime_imagem = baixar_arquivo_drive(
+            imagem_drive_id,
+            preferir_conta_servico=True,
+        )
         if not mime_imagem.startswith("image/"):
             raise ValueError(
                 f"O arquivo do modelo {imagem_drive_id} não é uma imagem "

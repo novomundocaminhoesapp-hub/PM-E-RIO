@@ -103,6 +103,32 @@ def conectar_google_sheets():
     return planilha
 
 
+def erro_google_oauth_expirado(erro):
+    texto = str(erro).lower()
+    frases = (
+        "invalid_grant",
+        "token has been expired or revoked",
+        "token is invalid",
+        "refresh token is invalid",
+        "token is expired",
+        "refresh token has expired",
+        "unauthorized",
+    )
+    return any(frase in texto for frase in frases)
+
+
+def credenciais_google_drive_conta_servico():
+    if "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
+        return Credentials.from_service_account_info(
+            json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=escopos
+        )
+    if os.path.isfile("credenciais.json"):
+        return Credentials.from_service_account_file(
+            "credenciais.json", scopes=escopos
+        )
+    return None
+
+
 def obter_credenciais_oauth_drive():
     credenciais_oauth = os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS", "").strip()
     arquivo_oauth = os.environ.get("GOOGLE_DRIVE_OAUTH_CREDENTIALS_FILE", "").strip()
@@ -122,19 +148,47 @@ def obter_credenciais_oauth_drive():
     return None
 
 
-def conectar_google_drive(credenciais_oauth=None):
+def conectar_google_drive(credenciais_oauth=None, preferir_conta_servico=False):
+    if preferir_conta_servico:
+        credenciais = credenciais_google_drive_conta_servico()
+        if credenciais is None:
+            raise RuntimeError(
+                "A leitura da tabela FINAME requer uma conta de serviço. "
+                "Configure GOOGLE_CREDENTIALS ou disponibilize credenciais.json."
+            )
+        return build("drive", "v3", credentials=credenciais)
+
     credenciais_oauth = credenciais_oauth or obter_credenciais_oauth_drive()
     if credenciais_oauth is not None:
-        credenciais = credenciais_oauth
-    elif "GOOGLE_CREDENTIALS" in os.environ and os.environ["GOOGLE_CREDENTIALS"].strip():
-        credenciais = Credentials.from_service_account_info(
-            json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=escopos
-        )
-    else:
-        credenciais = Credentials.from_service_account_file(
+        try:
+            return build("drive", "v3", credentials=credenciais_oauth)
+        except Exception as erro:
+            if not erro_google_oauth_expirado(erro):
+                raise
+            print(
+                "Credenciais OAuth do Google Drive expiraram ou foram revogadas; "
+                "tentando fallback para conta de serviço."
+            )
+            credenciais_fallback = credenciais_google_drive_conta_servico()
+            if credenciais_fallback is not None:
+                return build("drive", "v3", credentials=credenciais_fallback)
+            raise RuntimeError(
+                "As credenciais OAuth do Google Drive expiraram ou foram revogadas. "
+                "Renove o token em oauth_render.json / GOOGLE_DRIVE_OAUTH_CREDENTIALS "
+                "ou configure GOOGLE_CREDENTIALS com uma conta de serviço válida."
+            ) from erro
+
+    credenciais_fallback = credenciais_google_drive_conta_servico()
+    if credenciais_fallback is not None:
+        return build("drive", "v3", credentials=credenciais_fallback)
+
+    return build(
+        "drive",
+        "v3",
+        credentials=Credentials.from_service_account_file(
             "credenciais.json", scopes=escopos
-        )
-    return build("drive", "v3", credentials=credenciais)
+        ),
+    )
 
 
 def salvar_comprovante_static(arquivo):
@@ -291,6 +345,16 @@ def url_comprovante_no_app(link):
     return f"/comprovante-drive/{file_id}" if file_id else ""
 
 
+def url_imagem_modelo(registro):
+    imagem = str(registro.get("IMG") or "").strip()
+    file_id = extrair_id_arquivo_drive(imagem)
+    if file_id:
+        return url_for("servir_imagem_modelo_drive", file_id=file_id), file_id
+    if re.match(r"^https?://", imagem, re.I):
+        return imagem, ""
+    return "", ""
+
+
 def migrar_comprovantes_static(aba_vendas, linhas=None):
     """Migra para o Drive links locais cujos arquivos ainda existem no servidor."""
     if linhas is None:
@@ -384,6 +448,40 @@ def servir_comprovante_drive(file_id):
     except Exception as erro:
         print(f"Erro ao carregar comprovante do Drive {file_id}: {erro}")
         abort(502, description="Não foi possível carregar o arquivo privado do Google Drive.")
+
+
+@app.route("/modelo-imagem/<file_id>")
+def servir_imagem_modelo_drive(file_id):
+    if not session.get("logado"):
+        abort(401)
+
+    try:
+        service = conectar_google_drive(preferir_conta_servico=True)
+        metadados = service.files().get(
+            fileId=file_id,
+            fields="mimeType",
+            supportsAllDrives=True,
+        ).execute()
+        mime_type = str(metadados.get("mimeType", "") or "")
+        if not mime_type.startswith("image/"):
+            abort(404)
+
+        resposta = service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+        )
+        conteudo = io.BytesIO()
+        downloader = MediaIoBaseDownload(conteudo, resposta)
+        concluido = False
+        while not concluido:
+            _, concluido = downloader.next_chunk()
+        conteudo.seek(0)
+        return send_file(conteudo, mimetype=mime_type, max_age=300)
+    except HTTPException:
+        raise
+    except Exception as erro:
+        print(f"Erro ao carregar imagem do modelo {file_id}: {erro}")
+        abort(502, description="Não foi possível carregar a imagem privada do modelo.")
 
 
 @app.route("/pedido-arquivo/<file_id>")
@@ -1811,81 +1909,90 @@ def carregar_tabela_finame_drive():
         ):
             return CACHE_TABELA_FINAME["registros"]
 
-        service = conectar_google_drive()
-        consulta_arquivo = (
-            "name = 'COD FINAME -10-03-26.xlsx' and trashed = false"
-        )
-        resposta = service.files().list(
-            q=consulta_arquivo,
-            fields="nextPageToken, files(id, name, mimeType, parents)",
-            pageSize=100,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute()
-        arquivos = resposta.get("files", [])
-        pagina = resposta.get("nextPageToken")
-        while pagina:
+        try:
+            service = conectar_google_drive(preferir_conta_servico=True)
+            consulta_arquivo = (
+                "name = 'COD FINAME -10-03-26.xlsx' and trashed = false"
+            )
             resposta = service.files().list(
                 q=consulta_arquivo,
                 fields="nextPageToken, files(id, name, mimeType, parents)",
                 pageSize=100,
-                pageToken=pagina,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             ).execute()
-            arquivos.extend(resposta.get("files", []))
+            arquivos = resposta.get("files", [])
             pagina = resposta.get("nextPageToken")
+            while pagina:
+                resposta = service.files().list(
+                    q=consulta_arquivo,
+                    fields="nextPageToken, files(id, name, mimeType, parents)",
+                    pageSize=100,
+                    pageToken=pagina,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+                arquivos.extend(resposta.get("files", []))
+                pagina = resposta.get("nextPageToken")
 
-        nome_arquivo_finame = "COD FINAME -10-03-26.xlsx"
-        candidatos = [
-            arquivo
-            for arquivo in arquivos
-            if str(arquivo.get("name", "")).strip().casefold()
-            == nome_arquivo_finame.casefold()
-        ]
-        arquivos_modelos = []
-        pastas_verificadas = {}
-        for arquivo in candidatos:
-            for id_pasta in arquivo.get("parents", []):
-                if id_pasta not in pastas_verificadas:
-                    pastas_verificadas[id_pasta] = service.files().get(
-                        fileId=id_pasta,
-                        fields="id, name, mimeType",
-                        supportsAllDrives=True,
-                    ).execute()
-                pasta = pastas_verificadas[id_pasta]
-                if (
-                    pasta.get("mimeType") == "application/vnd.google-apps.folder"
-                    and str(pasta.get("name", "")).strip().casefold() == "modelos"
-                ):
-                    arquivos_modelos.append(arquivo)
-                    break
+            nome_arquivo_finame = "COD FINAME -10-03-26.xlsx"
+            candidatos = [
+                arquivo
+                for arquivo in arquivos
+                if str(arquivo.get("name", "")).strip().casefold()
+                == nome_arquivo_finame.casefold()
+            ]
+            arquivos_modelos = []
+            pastas_verificadas = {}
+            for arquivo in candidatos:
+                for id_pasta in arquivo.get("parents", []):
+                    if id_pasta not in pastas_verificadas:
+                        pastas_verificadas[id_pasta] = service.files().get(
+                            fileId=id_pasta,
+                            fields="id, name, mimeType",
+                            supportsAllDrives=True,
+                        ).execute()
+                    pasta = pastas_verificadas[id_pasta]
+                    if (
+                        pasta.get("mimeType") == "application/vnd.google-apps.folder"
+                        and str(pasta.get("name", "")).strip().casefold() == "modelos"
+                    ):
+                        arquivos_modelos.append(arquivo)
+                        break
 
-        if len(arquivos_modelos) != 1:
-            raise FileNotFoundError(
-                "A planilha 'COD FINAME -10-03-26.xlsx' precisa existir uma única "
-                "vez dentro da pasta 'Modelos' do Google Drive."
-            )
+            if len(arquivos_modelos) != 1:
+                raise FileNotFoundError(
+                    "A planilha 'COD FINAME -10-03-26.xlsx' precisa existir uma única "
+                    "vez dentro da pasta 'Modelos' do Google Drive."
+                )
 
-        arquivo_finame = arquivos_modelos[0]
-        if arquivo_finame.get("mimeType") == "application/vnd.google-apps.spreadsheet":
-            conteudo = service.files().export(
-                fileId=arquivo_finame["id"],
-                mimeType=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-            ).execute()
-        else:
-            conteudo, _ = baixar_arquivo_drive(
-                arquivo_finame["id"],
-                service=service,
-            )
+            arquivo_finame = arquivos_modelos[0]
+            if arquivo_finame.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+                conteudo = service.files().export(
+                    fileId=arquivo_finame["id"],
+                    mimeType=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                ).execute()
+            else:
+                conteudo, _ = baixar_arquivo_drive(
+                    arquivo_finame["id"],
+                    service=service,
+                )
 
-        registros = interpretar_planilha_finame(conteudo)
-        CACHE_TABELA_FINAME["registros"] = registros
-        CACHE_TABELA_FINAME["timestamp"] = agora
-        return registros
+            registros = interpretar_planilha_finame(conteudo)
+            CACHE_TABELA_FINAME["registros"] = registros
+            CACHE_TABELA_FINAME["timestamp"] = agora
+            return registros
+        except Exception as erro:
+            if erro_google_oauth_expirado(erro):
+                raise RuntimeError(
+                    "A autenticação da conta de serviço para o Google Drive falhou. "
+                    "Verifique GOOGLE_CREDENTIALS e compartilhe a pasta Modelos "
+                    "com o e-mail client_email dessa conta."
+                ) from erro
+            raise
 
 
 def familia_modelo_finame(modelo):
@@ -7682,15 +7789,7 @@ def acessar_modulo(nome_modulo):
                         return valor
                 return ""
 
-            imagem_modelo = str(registro_modelo.get("IMG", "") or "").strip()
-            id_imagem = extrair_id_arquivo_drive(imagem_modelo)
-            if id_imagem:
-                imagem_modelo = url_for(
-                    "servir_comprovante_drive",
-                    file_id=id_imagem,
-                )
-            elif imagem_modelo and not re.match(r"^https?://", imagem_modelo, re.I):
-                imagem_modelo = ""
+            imagem_modelo, id_imagem = url_imagem_modelo(registro_modelo)
 
             link_ficha = str(registro_modelo.get("LINK", "") or "").strip()
             id_ficha = extrair_id_arquivo_drive(link_ficha)
@@ -13098,17 +13197,7 @@ def acessar_modulo(nome_modulo):
                                 + "\n\n"
                             )
 
-                        m_imagem = str(item_escolhido.get("IMG", "") or "").strip()
-                        id_imagem = extrair_id_arquivo_drive(m_imagem)
-                        if id_imagem:
-                            imagem_modelo_url = url_for(
-                                "servir_comprovante_drive",
-                                file_id=id_imagem,
-                            )
-                        elif re.match(r"^https?://", m_imagem, re.I):
-                            imagem_modelo_url = m_imagem
-                        else:
-                            imagem_modelo_url = ""
+                        imagem_modelo_url, _ = url_imagem_modelo(item_escolhido)
                         
                         m_link = str(item_escolhido.get("LINK", "")).strip()
                         if not m_link:

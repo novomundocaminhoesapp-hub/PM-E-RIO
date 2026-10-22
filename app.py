@@ -3148,7 +3148,7 @@ def importar_relatorios_drive_vendas():
     somente depois que todos os registros válidos forem gravados ou identificados como duplicados.
     """
     try:
-        service = conectar_google_drive()
+        service = conectar_google_drive(preferir_conta_servico=True)
         planilha = conectar_google_sheets()
         query_folder = "name = 'Rel_Vendas' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         folders_res = service.files().list(

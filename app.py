@@ -550,6 +550,7 @@ TEMPO_CACHE_ABAS = {
     "Vendas_PM": 600,
     "Negocios_PM": 600,
     "Informes": 600,
+    "Pedidos_feitos": 60,
 }
 CACHE_DRIVE = {"conteudo": {}, "mapa": {}, "timestamp": 0}
 TEMPO_CACHE_DRIVE_SEGS = 600
@@ -2720,11 +2721,14 @@ def subir_pdf_pedido_drive(pdf_bytes, nome_arquivo):
 
 def listar_pedidos_vendedor(planilha, email_vendedor, incluir_todos=False):
     try:
-        aba_pedidos = planilha.worksheet(ABA_PEDIDOS_FEITOS)
+        registros = obter_registros_com_cache(
+            planilha,
+            ABA_PEDIDOS_FEITOS,
+            falhar_em_erro=True,
+        )
     except gspread.exceptions.WorksheetNotFound:
         return []
 
-    registros = obter_registros_seguros(aba_pedidos)
     email_norm = str(email_vendedor or "").strip().casefold()
     if not email_norm and not incluir_todos:
         return []
@@ -2847,6 +2851,7 @@ def salvar_pedido_na_planilha(planilha, dados_pedido):
         if indice is not None:
             linha[indice] = valor
     aba_pedidos.append_row(linha, value_input_option="RAW")
+    invalidar_cache_ab_as(ABA_PEDIDOS_FEITOS)
 
 
 @app.route("/proposta-pdf-preview", methods=["POST"])
@@ -2972,6 +2977,7 @@ def atualizar_pedido_na_planilha(planilha, dados_pedido, id_pedido):
         [linha],
         value_input_option="RAW",
     )
+    invalidar_cache_ab_as(ABA_PEDIDOS_FEITOS)
 
 
 @app.route("/proposta/<pedido_id>/liberar", methods=["POST"])
@@ -7566,12 +7572,6 @@ def acessar_modulo(nome_modulo):
         email_vendedor = str(session.get("email_usuario", "") or "")
         try:
             planilha_pedidos = conectar_google_sheets()
-            try:
-                aba_pedidos = planilha_pedidos.worksheet(ABA_PEDIDOS_FEITOS)
-            except gspread.exceptions.WorksheetNotFound:
-                pass
-            else:
-                remover_colunas_obsoletas_pedidos(aba_pedidos)
             registros_modelos_pedido = obter_registros_com_cache(
                 planilha_pedidos,
                 "Modelos",

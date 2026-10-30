@@ -34,6 +34,13 @@ from openpyxl import load_workbook
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "troque-esta-chave-em-producao")
 
+
+@app.before_request
+def proteger_uploads_locais():
+    if request.path.startswith("/static/uploads/") and not session.get("logado"):
+        abort(401)
+
+
 MESES_PT = {
     1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
     5: "maio", 6: "junho", 7: "julho", 8: "agosto",
@@ -267,11 +274,33 @@ def encontrar_comprovante_venda_drive(arquivos, cliente, produtos=(), chassis=""
     return melhores_links.pop() if len(melhores_links) == 1 else ""
 
 
-def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_arquivo=None):
+def subir_comprovante_google_drive(
+    arquivo,
+    permitir_fallback_local=True,
+    nome_arquivo=None,
+    exigir_oauth_usuario=False,
+):
     """Envia comprovantes para a pasta de vendas no Drive."""
     try:
-        credenciais_oauth = obter_credenciais_oauth_drive()
-        service = conectar_google_drive(credenciais_oauth)
+        if exigir_oauth_usuario:
+            credenciais_oauth = obter_credenciais_oauth_drive()
+            if credenciais_oauth is None:
+                raise RuntimeError(
+                    "Credenciais OAuth do proprietário não configuradas. Gere uma nova "
+                    "autorização e configure GOOGLE_DRIVE_OAUTH_CREDENTIALS no Render."
+                )
+            usar_conta_servico = False
+            service = build("drive", "v3", credentials=credenciais_oauth)
+        else:
+            credenciais_conta_servico = credenciais_google_drive_conta_servico()
+            usar_conta_servico = credenciais_conta_servico is not None
+            credenciais_oauth = (
+                None if usar_conta_servico else obter_credenciais_oauth_drive()
+            )
+            service = conectar_google_drive(
+                credenciais_oauth,
+                preferir_conta_servico=usar_conta_servico,
+            )
         folder_id = os.environ.get("GOOGLE_DRIVE_UPLOAD_VENDAS_FOLDER_ID", "").strip()
         if not folder_id:
             resposta = service.files().list(
@@ -295,15 +324,22 @@ def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_a
         ).execute()
         if pasta_upload.get("mimeType") != "application/vnd.google-apps.folder":
             raise RuntimeError("O ID configurado para Upload_Vendas não é uma pasta do Google Drive.")
-        if (
-            not pasta_upload.get("driveId")
-            and credenciais_oauth is None
-        ):
-            raise RuntimeError(
-                "Upload_Vendas está no Meu Drive, mas o app está conectado apenas "
-                "por conta de serviço, que não tem cota própria para novos arquivos. "
-                "Configure OAuth de usuário ou mova a pasta para uma Unidade compartilhada."
-            )
+        if not pasta_upload.get("driveId") and usar_conta_servico:
+            credenciais_oauth = obter_credenciais_oauth_drive()
+            if credenciais_oauth is None:
+                raise RuntimeError(
+                    "Upload_Vendas está no Meu Drive, mas a conta de serviço não pode "
+                    "armazenar arquivos nessa unidade. Configure OAuth de usuário ou "
+                    "mova a pasta para uma Unidade compartilhada."
+                )
+            service = conectar_google_drive(credenciais_oauth)
+            pasta_upload = service.files().get(
+                fileId=folder_id,
+                fields="id, name, mimeType, driveId",
+                supportsAllDrives=True,
+            ).execute()
+            if pasta_upload.get("mimeType") != "application/vnd.google-apps.folder":
+                raise RuntimeError("O ID configurado para Upload_Vendas não é uma pasta do Google Drive.")
 
         nome_original = secure_filename(os.path.basename(str(arquivo.filename or "comprovante"))) or "comprovante"
         nome_arquivo = secure_filename(os.path.basename(str(nome_arquivo or ""))) or f"{time.time_ns()}_{nome_original}"
@@ -321,7 +357,7 @@ def subir_comprovante_google_drive(arquivo, permitir_fallback_local=True, nome_a
         ).execute()
         return enviado.get("webViewLink") or f"https://drive.google.com/open?id={enviado['id']}"
     except Exception as erro:
-        if not permitir_fallback_local:
+        if not permitir_fallback_local or exigir_oauth_usuario:
             raise
         print(f"Upload no Drive indisponível; salvando comprovante em static/uploads: {erro}")
         return salvar_comprovante_static(arquivo)
@@ -10831,7 +10867,7 @@ def acessar_modulo(nome_modulo):
                     
                     anexo_1_url = ""
                     falha_leitura_venda = False
-                    aviso_upload_comprovante = ""
+                    falha_upload_comprovante = False
                     if index_edicao:
                         try:
                             linha_atual = aba_vendas.row_values(int(index_edicao))
@@ -10877,29 +10913,23 @@ def acessar_modulo(nome_modulo):
                                     file_obj,
                                     permitir_fallback_local=False,
                                     nome_arquivo=nome_arquivo,
+                                    exigir_oauth_usuario=True,
                                 )
                             except Exception as erro_upload:
                                 print(f"Erro ao enviar comprovante para Upload_Vendas: {erro_upload}")
-                                erro_upload_texto = str(erro_upload).lower()
-                                if "invalid_grant" in erro_upload_texto or "token has been expired or revoked" in erro_upload_texto:
-                                    aviso_upload_comprovante = (
-                                        "O comprovante não foi enviado porque a autenticação OAuth do "
-                                        "Google Drive expirou ou foi revogada. Reconecte a conta do Drive."
-                                    )
-                                elif "storagequota" in erro_upload_texto or "storage quota" in erro_upload_texto or "quota" in erro_upload_texto:
-                                    aviso_upload_comprovante = (
-                                        "O comprovante não foi enviado por limite de armazenamento do "
-                                        "Google Drive; configure a autenticação OAuth da conta proprietária "
-                                        "ou use uma Unidade compartilhada para Upload_Vendas."
-                                    )
-                                else:
-                                    aviso_upload_comprovante = (
-                                        "O comprovante não foi enviado para Upload_Vendas. Confira se a "
-                                        "conta conectada ao Drive tem acesso de editor à pasta."
-                                        f"<br>Detalhe técnico: {html.escape(str(erro_upload)[:400])}"
-                                    )
+                                falha_upload_comprovante = True
+                                erro_msg = (
+                                    "O comprovante não foi enviado ao Google Drive e a venda não foi gravada. "
+                                    "Detalhe técnico: "
+                                    f"{html.escape(str(erro_upload)[:500])}"
+                                )
 
-                    if not falha_leitura_venda and cliente_v and (plano_v or rio_v or produto_legado):
+                    if (
+                        not falha_leitura_venda
+                        and not falha_upload_comprovante
+                        and cliente_v
+                        and (plano_v or rio_v or produto_legado)
+                    ):
                         cabecalhos_venda = aba_vendas.row_values(1)
                         dados_venda_linha = montar_linha_venda_pm({
                             "CLIENTE": cliente_v,
@@ -10925,15 +10955,7 @@ def acessar_modulo(nome_modulo):
                             aba_vendas.append_row(dados_venda_linha)
                             invalidar_cache_ab_as("Vendas_PM")
                             sucesso_msg = "Venda registrada com sucesso!"
-                        if aviso_upload_comprovante:
-                            detalhe_anexo = (
-                                "O Anexo 1 existente foi mantido."
-                                if index_edicao
-                                else "A venda foi registrada sem Anexo 1."
-                            )
-                            aviso_msg = f"{sucesso_msg} {aviso_upload_comprovante} {detalhe_anexo}"
-                            sucesso_msg = None
-                    elif not falha_leitura_venda:
+                    elif not falha_leitura_venda and not falha_upload_comprovante:
                         erro_msg = "Informe o cliente e ao menos um produto (Plano de Manutenção ou RIO)."
 
             linhas_vendas_brutas = obter_linhas_com_cache(
@@ -13470,6 +13492,9 @@ def acessar_modulo(nome_modulo):
 
 @app.route("/api/limpar-cache", methods=["POST"])
 def limpar_cache():
+    if not session.get("logado"):
+        return jsonify({"mensagem": "Sessão expirada. Faça login novamente."}), 401
+
     global CACHE_IA, CACHE_PLANILHAS, CACHE_LOGIN_DADOS, CACHE_DRIVE
     global CACHE_PLANILHA_CLIENTE, CACHE_TABELA_FINAME
     CACHE_IA["contexto_sistema"] = ""

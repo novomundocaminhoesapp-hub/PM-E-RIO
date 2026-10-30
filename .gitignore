@@ -1,3 +1,8 @@
 credenciais.json
+oauth_render.json
+oauth_user.json
+oauth_cliente.json
+Nova credencial.json
+static/uploads/
 __pycache__/
 .env

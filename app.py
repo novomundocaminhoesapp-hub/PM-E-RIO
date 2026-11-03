@@ -11,6 +11,7 @@ import html
 import io
 import mimetypes
 import threading
+from itertools import chain
 from google import genai
 
 from flask import Flask, abort, redirect, render_template_string, request, session, url_for, jsonify, send_file
@@ -3245,6 +3246,34 @@ def obter_conteudo_pastas_drive():
         # temporariamente indisponível.
         return {}, {}
 
+def iterar_linhas_relatorio_excel(conteudo, extensao):
+    """Itera pela primeira aba do relatório sem carregar a planilha inteira."""
+    if str(extensao).lower() == ".xls":
+        import xlrd
+
+        workbook = xlrd.open_workbook(file_contents=conteudo, on_demand=True)
+        try:
+            worksheet = workbook.sheet_by_index(0)
+            for indice in range(worksheet.nrows):
+                yield worksheet.row_values(indice), workbook.datemode
+        finally:
+            workbook.release_resources()
+        return
+
+    workbook = load_workbook(
+        io.BytesIO(conteudo),
+        read_only=True,
+        data_only=True,
+    )
+    try:
+        datemode = 1 if workbook.epoch.year == 1904 else 0
+        worksheet = workbook.worksheets[0]
+        for linha in worksheet.iter_rows(values_only=True):
+            yield linha, datemode
+    finally:
+        workbook.close()
+
+
 def importar_relatorios_drive_vendas():
     """
     Varre a pasta 'Rel_Vendas' no Google Drive ignorando arquivos já rotulados como [IMPORTADO],
@@ -3577,9 +3606,6 @@ def importar_relatorios_drive_vendas():
 
             return ""
 
-        import io
-        import pandas as pd
-
         importados_count = 0
         duplicados_count = 0
         arquivos_concluidos = 0
@@ -3612,40 +3638,61 @@ def importar_relatorios_drive_vendas():
                         fileId=file_id,
                         supportsAllDrives=True,
                     ).execute()
-                fh = io.BytesIO(conteudo_arquivo)
             except Exception as ex_download:
                 print(f"Erro ao baixar arquivo {file_name}: {ex_download}")
                 erros_importacao.append(f"{file_name}: falha no download")
                 continue
 
             try:
-                fh.seek(0)
-                engine_excel = "xlrd" if os.path.splitext(file_name)[1].lower() == ".xls" else None
-                df_rel = pd.read_excel(fh, engine=engine_excel)
+                extensao_leitura = (
+                    ".xlsx"
+                    if file_mime == "application/vnd.google-apps.spreadsheet"
+                    else os.path.splitext(file_name)[1].lower()
+                )
+                linhas_relatorio = iter(iterar_linhas_relatorio_excel(
+                    conteudo_arquivo,
+                    extensao_leitura,
+                ))
+                cabecalhos_relatorio, _ = next(linhas_relatorio)
+            except StopIteration:
+                erros_importacao.append(f"{file_name}: relatório sem registros")
+                continue
             except Exception as ex_excel:
                 print(f"Erro ao ler arquivo excel {file_name}: {ex_excel}")
                 erros_importacao.append(f"{file_name}: formato Excel inválido")
                 continue
 
-            if df_rel is None or df_rel.empty:
-                erros_importacao.append(f"{file_name}: relatório sem registros")
-                continue
-
             colunas_relatorio = {
-                normalizar_chave_planilha(coluna): coluna
-                for coluna in df_rel.columns
+                normalizar_chave_planilha(coluna): indice
+                for indice, coluna in enumerate(cabecalhos_relatorio)
             }
 
             def obter_valor_relatorio(linha, *nomes_coluna):
                 for nome_coluna in nomes_coluna:
-                    coluna = colunas_relatorio.get(normalizar_chave_planilha(nome_coluna))
-                    if coluna is None:
+                    indice = colunas_relatorio.get(normalizar_chave_planilha(nome_coluna))
+                    if indice is None or indice >= len(linha):
                         continue
-                    valor = linha.get(coluna)
-                    if pd.isna(valor) or str(valor).strip().lower() in {"", "nan", "none"}:
+                    valor = linha[indice]
+                    if valor is None or str(valor).strip().lower() in {"", "nan", "none"}:
                         continue
                     return valor
                 return None
+
+            def linhas_com_conteudo():
+                for linha, datemode in linhas_relatorio:
+                    if any(
+                        valor is not None
+                        and str(valor).strip().lower() not in {"", "nan", "none"}
+                        for valor in linha
+                    ):
+                        yield linha, datemode
+
+            linhas_dados = iter(linhas_com_conteudo())
+            try:
+                primeira_linha, primeiro_datemode = next(linhas_dados)
+            except StopIteration:
+                erros_importacao.append(f"{file_name}: relatório sem registros")
+                continue
 
             linhas_arquivo = []
             chaves_arquivo = set()
@@ -3653,7 +3700,10 @@ def importar_relatorios_drive_vendas():
             modelos_nao_cadastrados = []
             duplicados = 0
 
-            for _, row in df_rel.iterrows():
+            for row, datemode in chain(
+                ((primeira_linha, primeiro_datemode),),
+                linhas_dados,
+            ):
                 cliente_bruto = obter_valor_relatorio(row, "CLIENTE")
                 modelo_bruto = obter_valor_relatorio(row, "MODELO", "MODELO NA MARCA")
                 raw_data = obter_valor_relatorio(row, "DATA", "DATA DA VENDA")
@@ -3663,8 +3713,14 @@ def importar_relatorios_drive_vendas():
                     registros_invalidos += 1
                     continue
 
-                data_convertida = pd.to_datetime(raw_data, errors="coerce", dayfirst=True)
-                if pd.isna(data_convertida):
+                if isinstance(raw_data, (int, float)) and datemode == 1:
+                    try:
+                        data_convertida = datetime(1904, 1, 1) + timedelta(days=float(raw_data))
+                    except (OverflowError, TypeError, ValueError):
+                        data_convertida = None
+                else:
+                    data_convertida = parse_data_comissao(raw_data)
+                if data_convertida is None:
                     registros_invalidos += 1
                     continue
                 data_venda = data_convertida.strftime("%d/%m/%Y")

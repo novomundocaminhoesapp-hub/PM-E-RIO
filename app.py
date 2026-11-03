@@ -1233,22 +1233,84 @@ def detectar_produtos_comissao(produto, modelo, registro=None):
     return is_pm, is_rio
 
 
-def calcular_comissoes_venda(produto, modelo, quantidade, registro=None):
+def chave_comissao_rio(registro):
+    """Identifica RIOs do mesmo cliente e chassis para evitar comissão repetida."""
+    chassis = normalizar_chassi(
+        registro.get("CHASSIS", "")
+        or registro.get("CHASSI", "")
+        or registro.get("chassis", "")
+        or registro.get("chassi", "")
+    )
+    if not chassis:
+        return None
+    cliente = normalizar_identidade_comercial(
+        registro.get("CLIENTE", "") or registro.get("cliente", "")
+    )
+    return cliente, chassis
+
+
+def primeiras_comissoes_rio_por_chassi(registros):
+    """Localiza o primeiro registro de RIO com comissão por cliente/chassi."""
+    primeira_comissao = {}
+
+    for indice, registro in enumerate(registros):
+        plano, rio = separar_produto_venda(registro)
+        produto = str(registro.get("PRODUTO", "")).strip() or " / ".join(
+            valor for valor in (plano, rio) if valor
+        )
+        if not detectar_produtos_comissao(
+            produto,
+            registro.get("MODELO", ""),
+            registro,
+        )[1]:
+            continue
+
+        chave = chave_comissao_rio(registro)
+        if not chave:
+            continue
+
+        data_venda = parse_data_comissao(
+            registro.get("DATA DA VENDA")
+            or registro.get("DATA")
+            or registro.get("data")
+        )
+        indice_registro = registro.get("_index_planilha", indice)
+        ordem = (data_venda or datetime.max, indice)
+
+        atual = primeira_comissao.get(chave)
+        if atual is None or ordem < atual[0]:
+            primeira_comissao[chave] = (ordem, indice_registro)
+
+    return (
+        {registro[1] for registro in primeira_comissao.values()},
+        set(primeira_comissao),
+    )
+
+
+def calcular_comissoes_venda(
+    produto,
+    modelo,
+    quantidade,
+    registro=None,
+    qtd_rio_apm=None,
+    qtd_rio_vendedor=None,
+):
     """Calcula APM e vendedor para uma venda, em um único ponto do sistema."""
     qtd = parse_quantidade_comissao(quantidade)
     is_pm, is_rio = detectar_produtos_comissao(produto, modelo, registro)
+    qtd_rio_apm = qtd if qtd_rio_apm is None else qtd_rio_apm
+    qtd_rio_vendedor = qtd if qtd_rio_vendedor is None else qtd_rio_vendedor
 
     vendedor_pm_unit = COMISSAO_VENDEDOR_PM if is_pm else 0.0
-    vendedor_rio_unit = COMISSAO_VENDEDOR_RIO if is_rio else 0.0
 
     return {
         "qtd": qtd,
         "is_pm": is_pm,
         "is_rio": is_rio,
         "apm_pm": COMISSAO_APM_PM * qtd if is_pm else 0.0,
-        "apm_rio": COMISSAO_APM_RIO * qtd if is_rio else 0.0,
+        "apm_rio": COMISSAO_APM_RIO * qtd_rio_apm if is_rio else 0.0,
         "vendedor_pm": vendedor_pm_unit * qtd if is_pm else 0.0,
-        "vendedor_rio": vendedor_rio_unit * qtd if is_rio else 0.0,
+        "vendedor_rio": COMISSAO_VENDEDOR_RIO * qtd_rio_vendedor if is_rio else 0.0,
     }
 
 def criar_cliente_gemini():
@@ -6589,9 +6651,14 @@ def acessar_modulo(nome_modulo):
                 ("Plano de Manutenção / RIO", "PM", vendas_pm),
             )
 
+            (
+                primeiras_linhas_rio_comissao,
+                chaves_rio_comissao_vendas,
+            ) = primeiras_comissoes_rio_por_chassi(vendas_pm)
+
             vendas = []
             for solucao, origem, registros in fontes_vendas:
-                for r in registros:
+                for indice_venda, r in enumerate(registros):
                     vendedor = str(r.get("VENDEDOR", "")).strip()
                     dt = parse_data(r.get("DATA DA VENDA") or r.get("DATA"))
                     produto = str(r.get("PRODUTO", "")).strip()
@@ -6654,6 +6721,7 @@ def acessar_modulo(nome_modulo):
                         "data_txt": str(r.get("DATA DA VENDA", "")).strip(),
                         "anexo": str(r.get("ANEXO 1", "")).strip(),
                         "chave": chave,
+                        "indice_planilha": indice_venda,
                     })
 
             # Dedupe de registros idênticos
@@ -6676,6 +6744,9 @@ def acessar_modulo(nome_modulo):
             qtd_max = 0
             qtd_plus = 0
             qtd_rio = 0
+            qtd_rio_comissao = 0
+            qtd_rio_comissao_vendedor = 0
+            chaves_chassis_rio_pipeline = set()
             por_tipo_rio = {}
             vendas_por_consultor_mes = {}
 
@@ -6749,6 +6820,15 @@ def acessar_modulo(nome_modulo):
 
                 if tem_rio:
                     qtd_rio += qtd_venda
+                    chave_rio_comissao = chave_comissao_rio(v)
+                    if chave_rio_comissao:
+                        if v["indice_planilha"] in primeiras_linhas_rio_comissao:
+                            qtd_rio_comissao += 1
+                            qtd_rio_comissao_vendedor += 1
+                    else:
+                        qtd_rio_comissao += qtd_venda
+                        qtd_rio_comissao_vendedor += qtd_venda
+
                     tipos_catalogo = [
                         produto_rio
                         for produto_rio in catalogo_rio
@@ -6876,6 +6956,19 @@ def acessar_modulo(nome_modulo):
                 if chave_rio not in chaves_rio_vendas:
                     qtd_rio += 1
                     chaves_rio_vendas.add(chave_rio)
+                    chave_rio_comissao = chave_comissao_rio(n)
+                    if chave_rio_comissao:
+                        if (
+                            chave_rio_comissao not in chaves_rio_comissao_vendas
+                            and chave_rio_comissao not in chaves_chassis_rio_pipeline
+                        ):
+                            chaves_chassis_rio_pipeline.add(chave_rio_comissao)
+                            qtd_rio_comissao += 1
+                            qtd_rio_comissao_vendedor += 1
+                    else:
+                        qtd_rio_comissao += 1
+                        qtd_rio_comissao_vendedor += 1
+
                     dados_consultor = vendas_por_consultor_mes.setdefault(
                         norm(n.get("vendedor", "")),
                         {"nome": str(n.get("vendedor", "")).strip(), "meses": {}},
@@ -6935,9 +7028,11 @@ def acessar_modulo(nome_modulo):
                 )[0]
             )
             comissao_apm_pm = qtd_pm * COMISSAO_APM_PM
-            comissao_apm_rio = qtd_rio * COMISSAO_APM_RIO
+            comissao_apm_rio = qtd_rio_comissao * COMISSAO_APM_RIO
             comissao_vendedor_pm = qtd_pm * COMISSAO_VENDEDOR_PM
-            comissao_vendedor_rio = qtd_rio * COMISSAO_VENDEDOR_RIO
+            comissao_vendedor_rio = (
+                qtd_rio_comissao_vendedor * COMISSAO_VENDEDOR_RIO
+            )
             comissao_apm_total = comissao_apm_pm + comissao_apm_rio
             comissao_vendedor_total = comissao_vendedor_pm + comissao_vendedor_rio
 
@@ -10859,6 +10954,11 @@ def acessar_modulo(nome_modulo):
                     modelo_v = request.form.get("modelo", "").strip()
                     chassis_v = request.form.get("chassis", "").strip()
                     qtd_v = request.form.get("quantidade", "").strip()
+                    tem_rio_venda = detectar_produtos_comissao(
+                        produto_v,
+                        modelo_v,
+                        {"P. MANUTENÇÃO": plano_v, "RIO": rio_v},
+                    )[1]
                     vendedor_v = (
                         request.form.get("vendedor", "").strip()
                         if is_gestao_vendas else usuario_vendas
@@ -10868,6 +10968,12 @@ def acessar_modulo(nome_modulo):
                     anexo_1_url = ""
                     falha_leitura_venda = False
                     falha_upload_comprovante = False
+                    falha_validacao_venda = tem_rio_venda and not chassis_v
+                    if falha_validacao_venda:
+                        erro_msg = (
+                            "Informe o chassis para registrar uma venda de RIO "
+                            "e calcular a comissão corretamente."
+                        )
                     if index_edicao:
                         try:
                             linha_atual = aba_vendas.row_values(int(index_edicao))
@@ -10894,7 +11000,11 @@ def acessar_modulo(nome_modulo):
                                 "A edição não foi gravada para evitar perder o Anexo 1 existente."
                             )
 
-                    if not falha_leitura_venda and "anexo_1" in request.files:
+                    if (
+                        not falha_leitura_venda
+                        and not falha_validacao_venda
+                        and "anexo_1" in request.files
+                    ):
                         file_obj = request.files["anexo_1"]
                         if (
                             file_obj
@@ -10927,6 +11037,7 @@ def acessar_modulo(nome_modulo):
                     if (
                         not falha_leitura_venda
                         and not falha_upload_comprovante
+                        and not falha_validacao_venda
                         and cliente_v
                         and (plano_v or rio_v or produto_legado)
                     ):
@@ -10955,7 +11066,11 @@ def acessar_modulo(nome_modulo):
                             aba_vendas.append_row(dados_venda_linha)
                             invalidar_cache_ab_as("Vendas_PM")
                             sucesso_msg = "Venda registrada com sucesso!"
-                    elif not falha_leitura_venda and not falha_upload_comprovante:
+                    elif (
+                        not falha_leitura_venda
+                        and not falha_upload_comprovante
+                        and not falha_validacao_venda
+                    ):
                         erro_msg = "Informe o cliente e ao menos um produto (Plano de Manutenção ou RIO)."
 
             linhas_vendas_brutas = obter_linhas_com_cache(
@@ -11006,14 +11121,30 @@ def acessar_modulo(nome_modulo):
 
             titulo_relatorio_txt = f"RELATÓRIO DE VENDAS E COMISSÕES"
 
+            cab_v = (
+                [c.upper().strip() for c in linhas_vendas_brutas[0]]
+                if len(linhas_vendas_brutas) > 1
+                else []
+            )
+            registros_vendas_historico = []
+            for idx_l, linha_v in enumerate(linhas_vendas_brutas[1:], start=2):
+                dict_v = {"_index_planilha": idx_l}
+                for i, val in enumerate(linha_v):
+                    if i < len(cab_v) and cab_v[i]:
+                        dict_v[cab_v[i]] = val
+                registros_vendas_historico.append(dict_v)
+
+            (
+                primeiras_linhas_rio_comissao,
+                _,
+            ) = primeiras_comissoes_rio_por_chassi(
+                registros_vendas_historico
+            )
+
             registros_vendas_filtrados = []
-            if len(linhas_vendas_brutas) > 1:
-                cab_v = [c.upper().strip() for c in linhas_vendas_brutas[0]]
-                for idx_l, linha_v in enumerate(linhas_vendas_brutas[1:], start=2):
-                    dict_v = {"_index_planilha": idx_l}
-                    for i, val in enumerate(linha_v):
-                        if i < len(cab_v) and cab_v[i]:
-                            dict_v[cab_v[i]] = val
+            if registros_vendas_historico:
+                for dict_v in registros_vendas_historico:
+                    idx_l = dict_v["_index_planilha"]
 
                     if (
                         not is_gestao_vendas
@@ -11089,6 +11220,24 @@ def acessar_modulo(nome_modulo):
                     quantidade=qtd_str,
                     registro=reg,
                 )
+                qtd_rio_apm = None
+                qtd_rio_vendedor = None
+                chave_rio = chave_comissao_rio(reg) if calculo["is_rio"] else None
+                if chave_rio:
+                    qtd_rio_apm = (
+                        1 if idx_l in primeiras_linhas_rio_comissao else 0
+                    )
+                    qtd_rio_vendedor = qtd_rio_apm
+
+                    calculo = calcular_comissoes_venda(
+                        produto=prod,
+                        modelo=mod,
+                        quantidade=qtd_str,
+                        registro=reg,
+                        qtd_rio_apm=qtd_rio_apm,
+                        qtd_rio_vendedor=qtd_rio_vendedor,
+                    )
+
                 qtd_num = calculo["qtd"]
                 is_pm = calculo["is_pm"]
                 is_rio = calculo["is_rio"]
@@ -11110,10 +11259,14 @@ def acessar_modulo(nome_modulo):
                     total_qtd_pm_geral += qtd_num
                     dados_dashboard["produtos"]["PM"] += qtd_num
                 if is_rio:
-                    comissoes_por_estado[estado_v]["vendedores"][vend]["rio_qtd"] += qtd_num
+                    comissoes_por_estado[estado_v]["vendedores"][vend]["rio_qtd"] += (
+                        qtd_num if qtd_rio_vendedor is None else qtd_rio_vendedor
+                    )
                     comissoes_por_estado[estado_v]["vendedores"][vend]["rio_total"] += comissao_rio_item
                     comissoes_por_estado[estado_v]["total_rio"] += comissao_rio_item
-                    total_qtd_rio_geral += qtd_num
+                    total_qtd_rio_geral += (
+                        qtd_num if qtd_rio_apm is None else qtd_rio_apm
+                    )
                     dados_dashboard["produtos"]["RIO"] += qtd_num
 
                 comissoes_por_estado[estado_v]["total_geral"] += (comissao_pm_item + comissao_rio_item)
@@ -11221,7 +11374,7 @@ def acessar_modulo(nome_modulo):
                         <tr>
                             <th scope="row">{html.escape(str(v_nome))}</th>
                             <td><span>{d_v['pm_qtd']} un.</span><strong>R$ {formata_br(d_v['pm_total'])}</strong></td>
-                            <td><span>{d_v['rio_qtd']} un.</span><strong>R$ {formata_br(d_v['rio_total'])}</strong></td>
+                            <td><span>{d_v['rio_qtd']} base(s)</span><strong>R$ {formata_br(d_v['rio_total'])}</strong></td>
                             <td class="comissao-tabela-total"><strong>R$ {formata_br(tot_v)}</strong></td>
                         </tr>
                         """
@@ -11234,7 +11387,7 @@ def acessar_modulo(nome_modulo):
                                 <thead><tr>
                                     <th scope="col">Consultor</th>
                                     <th scope="col">Plano de Manutenção<small>Comissão: R$ {formata_br(COMISSAO_VENDEDOR_PM)} / un.</small></th>
-                                    <th scope="col">Telemetria RIO<small>Comissão: R$ {formata_br(COMISSAO_VENDEDOR_RIO)} / un.</small></th>
+                                    <th scope="col">Telemetria RIO<small>Comissão: R$ {formata_br(COMISSAO_VENDEDOR_RIO)} / chassi</small></th>
                                     <th scope="col">Total</th>
                                 </tr></thead>
                                 <tbody>{linhas_vendedores_html}</tbody>
@@ -11268,13 +11421,13 @@ def acessar_modulo(nome_modulo):
                         <thead><tr>
                             <th scope="col">Beneficiário</th>
                             <th scope="col">Plano de Manutenção<small>Comissão APM: R$ {formata_br(COMISSAO_APM_PM)} / un.</small></th>
-                            <th scope="col">Telemetria RIO<small>Comissão APM: R$ {formata_br(COMISSAO_APM_RIO)} / un.</small></th>
+                            <th scope="col">Telemetria RIO<small>Comissão APM: R$ {formata_br(COMISSAO_APM_RIO)} / chassi</small></th>
                             <th scope="col">Total</th>
                         </tr></thead>
                         <tbody><tr>
                             <th scope="row">APM</th>
                             <td><span>{total_qtd_pm_geral} un.</span><strong>R$ {formata_br(comissao_minha_pm)}</strong></td>
-                            <td><span>{total_qtd_rio_geral} un.</span><strong>R$ {formata_br(comissao_minha_rio)}</strong></td>
+                            <td><span>{total_qtd_rio_geral} base(s)</span><strong>R$ {formata_br(comissao_minha_rio)}</strong></td>
                             <td class="comissao-tabela-total"><strong>R$ {formata_br(comissao_minha_total)}</strong></td>
                         </tr></tbody>
                     </table>
@@ -11394,7 +11547,7 @@ def acessar_modulo(nome_modulo):
                                 </div>
                                 <div>
                                     <label>RIO</label>
-                                    <select name="rio">
+                                    <select name="rio" onchange="atualizarObrigatoriedadeChassiVenda()">
                                         <option value="">Nenhum</option>
                                         {opcoes_tipos_rio}
                                     </select>
@@ -11580,6 +11733,7 @@ def acessar_modulo(nome_modulo):
                     document.querySelector('[name="numero_contrato"]').value = contrato;
                     selecionarOpcaoVenda('plano_manutencao', plano);
                     selecionarOpcaoVenda('rio', rio);
+                    atualizarObrigatoriedadeChassiVenda();
                     document.querySelector('[name="data_venda"]').value = dataVenda;
                     selecionarOpcaoVenda('modelo', modelo);
                     document.querySelector('[name="quantidade"]').value = quantidade;
@@ -11637,6 +11791,14 @@ def acessar_modulo(nome_modulo):
                     select.value = valorSelecionado;
                 }}
 
+                function atualizarObrigatoriedadeChassiVenda() {{
+                    var campoRio = document.querySelector('[name="rio"]');
+                    var campoChassis = document.querySelector('[name="chassis"]');
+                    if (campoRio && campoChassis) {{
+                        campoChassis.required = Boolean(campoRio.value.trim());
+                    }}
+                }}
+
                 function cancelarEdicaoVenda() {{
                     document.getElementById('editVendaIndexInput').value = "";
                     document.getElementById('tituloFormVendaCard').innerText = "➕ Registrar Nova Venda / Comprovação";
@@ -11649,6 +11811,7 @@ def acessar_modulo(nome_modulo):
                     document.querySelector('[name="numero_contrato"]').value = "";
                     document.querySelector('[name="plano_manutencao"]').value = "";
                     document.querySelector('[name="rio"]').value = "";
+                    atualizarObrigatoriedadeChassiVenda();
                     document.querySelector('[name="modelo"]').value = "";
                     document.querySelector('[name="quantidade"]').value = "";
                     document.querySelector('[name="chassis"]').value = "";

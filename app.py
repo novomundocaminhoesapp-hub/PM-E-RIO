@@ -4097,7 +4097,7 @@ INTERVALOS_REVISAO_FAMILIA = {
 }
 
 
-def obter_intervalo_revisao(modelo, familia, grupo, intervalo_horas=None):
+def obter_valor_intervalo_revisao(modelo, familia, grupo):
     modelo_norm = normalizar_chave_manutencao(modelo)
     id_modelo = next(
         (
@@ -4115,7 +4115,11 @@ def obter_intervalo_revisao(modelo, familia, grupo, intervalo_horas=None):
         id_modelo,
         INTERVALOS_REVISAO_FAMILIA.get(familia, {}),
     )
-    intervalo = regras_modelo.get(normalizar_chave_manutencao(grupo))
+    return regras_modelo.get(normalizar_chave_manutencao(grupo))
+
+
+def obter_intervalo_revisao(modelo, familia, grupo, intervalo_horas=None):
+    intervalo = obter_valor_intervalo_revisao(modelo, familia, grupo)
     if normalizar_chave_manutencao(grupo) == "ESPECIAL" and intervalo is None:
         intervalo = intervalo_horas
     if intervalo is None:
@@ -4123,6 +4127,111 @@ def obter_intervalo_revisao(modelo, familia, grupo, intervalo_horas=None):
 
     unidade = "h" if normalizar_chave_manutencao(grupo) == "ESPECIAL" else "km"
     return f"A cada {intervalo:,.0f} {unidade}".replace(",", ".")
+
+
+MARCOS_REVISAO_VW_KM = (20000, 40000, 60000, 80000, 100000)
+COLUNAS_REVISAO_VW = (
+    ("V.REVISÃO L", 0, "L"),
+    ("V.REVISÃO MP1", 0, "MP1"),
+    ("V.REVISÃO L", 1, "L"),
+    ("V.REVISÃO MP2", 0, "MP2"),
+    ("V.REVISÃO L", 2, "L"),
+)
+
+
+def obter_custos_revisao_vw(registros, item_modelo):
+    def normalizar_id_modelo(valor):
+        numero = converter_numero(valor)
+        if numero is not None and numero.is_integer():
+            return str(int(numero))
+        return normalizar_chave_manutencao(valor)
+
+    id_modelo = normalizar_id_modelo(item_modelo.get("ID_MODELOS"))
+    nome_modelo = normalizar_chave_manutencao(
+        item_modelo.get("MODELO") or item_modelo.get("PRODUTO") or ""
+    )
+    registro_custo = None
+
+    if id_modelo:
+        registro_custo = next(
+            (
+                registro
+                for registro in registros
+                if normalizar_id_modelo(registro.get("ID_MODELOS")) == id_modelo
+            ),
+            None,
+        )
+    if registro_custo is None and nome_modelo:
+        registro_custo = next(
+            (
+                registro
+                for registro in registros
+                if normalizar_chave_manutencao(registro.get("MODELO")) == nome_modelo
+            ),
+            None,
+        )
+    if registro_custo is None:
+        return None
+
+    chaves = list(registro_custo.keys())
+    custos = []
+    for indice, (coluna_base, coluna_indice, tipo_revisao) in enumerate(COLUNAS_REVISAO_VW):
+        coluna = encontrar_coluna_por_indice(chaves, coluna_base, coluna_indice)
+        valor = converter_numero(registro_custo.get(coluna)) if coluna else None
+        custos.append({
+            "marco_km": MARCOS_REVISAO_VW_KM[indice],
+            "tipo": tipo_revisao,
+            "valor": valor if valor is not None and valor > 0 else None,
+        })
+    return custos
+
+
+def calcular_comparativo_revisoes_vw(item_modelo, registros_revisoes, registros_modelos=None):
+    modelo = str(item_modelo.get("MODELO") or item_modelo.get("PRODUTO") or "").strip()
+    familia = identificar_familia_modelo(modelo, registros_modelos)
+    km_mensal = converter_intervalo_manutencao(item_modelo.get("KM"))
+    periodo_meses = converter_numero(item_modelo.get("PERIODO"))
+    if (
+        not modelo
+        or km_mensal is None
+        or km_mensal <= 0
+        or periodo_meses is None
+        or periodo_meses <= 0
+        or not periodo_meses.is_integer()
+    ):
+        return None
+
+    grupo = identificar_grupo_manutencao(familia, km_mensal)
+    intervalo_km = obter_valor_intervalo_revisao(modelo, familia, grupo)
+    if not intervalo_km or normalizar_chave_manutencao(grupo) == "ESPECIAL":
+        return None
+
+    custos = obter_custos_revisao_vw(registros_revisoes, item_modelo)
+    km_contrato = km_mensal * periodo_meses
+    revisoes = []
+    km_revisao = intervalo_km
+    while km_revisao <= km_contrato:
+        ciclo = int((km_revisao - 1) // 100000)
+        inicio_ciclo = ciclo * 100000
+        km_no_ciclo = km_revisao - inicio_ciclo
+        marco = min(
+            MARCOS_REVISAO_VW_KM,
+            key=lambda km: (abs(km - km_no_ciclo), -km),
+        )
+        indice_custo = MARCOS_REVISAO_VW_KM.index(marco)
+        custo = custos[indice_custo] if custos else None
+        revisoes.append(custo["valor"] if custo else None)
+        km_revisao += intervalo_km
+
+    valores_conhecidos = [
+        valor for valor in revisoes
+        if valor is not None
+    ]
+    return {
+        "total_concessionaria": sum(valores_conhecidos),
+        "quantidade_revisoes": len(revisoes),
+        "completo": len(valores_conhecidos) == len(revisoes),
+    }
 
 
 def obter_top3_planos_melhor_preco(registros, registros_modelos=None):
@@ -12845,6 +12954,7 @@ def acessar_modulo(nome_modulo):
             planilha = conectar_google_sheets()
             dados_precos = obter_registros_com_cache(planilha, "PM_Precos")
             dados_modelos = obter_registros_com_cache(planilha, "Modelos")
+            dados_revisoes_vw = obter_registros_com_cache(planilha, "V_Revisao_VW")
 
             pilulas_valores = []
             for item in dados_precos:
@@ -12891,6 +13001,32 @@ def acessar_modulo(nome_modulo):
                         {"nome": "Plano MAX", "classe": "max", "km_col": "MAX_VALOR KM" if "MAX_VALOR KM" in item_escolhido else "KM_1", "mensal_col": "VALOR MENSAL_1" if "VALOR MENSAL_1" in item_escolhido else "", "total_col": "TOTAL CONTRATO_1" if "TOTAL CONTRATO_1" in item_escolhido else ""},
                         {"nome": "Plano PLUS", "classe": "plus", "km_col": "PLUS_VALOR KM" if "PLUS_VALOR KM" in item_escolhido else "KM_2", "mensal_col": "VALOR MENSAL_2" if "VALOR MENSAL_2" in item_escolhido else "", "total_col": "TOTAL CONTRATO_2" if "TOTAL CONTRATO_2" in item_escolhido else ""}
                     ]
+
+                    comparativo_revisoes_periodo = calcular_comparativo_revisoes_vw(
+                        item_escolhido,
+                        dados_revisoes_vw,
+                        dados_modelos,
+                    )
+                    if comparativo_revisoes_periodo:
+                        quantidade_revisoes = comparativo_revisoes_periodo[
+                            "quantidade_revisoes"
+                        ]
+                        texto_quantidade_revisoes = (
+                            "revisão" if quantidade_revisoes == 1 else "revisões"
+                        )
+                        total_revisoes_exibicao = (
+                            formatar_moeda(
+                                comparativo_revisoes_periodo["total_concessionaria"]
+                            )
+                            if comparativo_revisoes_periodo["completo"]
+                            else "Incompleto"
+                        )
+                        custo_revisoes_periodo = (
+                            f"{total_revisoes_exibicao} · "
+                            f"{quantidade_revisoes} {texto_quantidade_revisoes}"
+                        )
+                    else:
+                        custo_revisoes_periodo = "-"
 
                     cards_km_html = ""
                     for p in planos_km_info:
@@ -13036,6 +13172,10 @@ def acessar_modulo(nome_modulo):
                                     <div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;">
                                         <div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Período do Contrato</div>
                                         <div style="font-size: 15px; font-weight: 700; color: #1a202c;">{periodo_val} Meses</div>
+                                    </div>
+                                    <div style="flex: 1; background: #ffffff; padding: 8px 10px; border-radius: 6px; border: 1px solid #cbd5e0;">
+                                        <div class="detalhe-label" style="color: #2b6cb0; margin-bottom: 2px;">Custo concessionária ({periodo_val} meses)</div>
+                                        <div style="font-size: 15px; font-weight: 700; color: #1a202c;">{custo_revisoes_periodo}</div>
                                     </div>
                                 </div>
                             </div>
@@ -13693,7 +13833,7 @@ def acessar_modulo(nome_modulo):
         abas_cache_por_modulo = {
             "rio": ("RIO",),
             "pm": ("PM",),
-            "valores": ("PM_Precos",),
+            "valores": ("PM_Precos", "V_Revisao_VW"),
             "informes": ("Informes",),
             "argumentos": ("Argumentos",),
             "fichatecnica": ("Modelos",),
